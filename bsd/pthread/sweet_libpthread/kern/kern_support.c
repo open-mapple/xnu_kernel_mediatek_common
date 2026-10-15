@@ -813,7 +813,7 @@ workq_set_register_state(proc_t p, thread_t th,
 
 		int error = pthread_kern->thread_set_wq_state32(th, (thread_state_t)&state);
 		if (error != KERN_SUCCESS) {
-			panic(__func__ ": thread_set_wq_state failed: %d", error);
+			panic("%s: thread_set_wq_state failed: %d", __func__, error);
 		}
 	} else {
 		x86_thread_state64_t state64 = {
@@ -831,7 +831,7 @@ workq_set_register_state(proc_t p, thread_t th,
 
 		int error = pthread_kern->thread_set_wq_state64(th, (thread_state_t)&state64);
 		if (error != KERN_SUCCESS) {
-			panic(__func__ ": thread_set_wq_state failed: %d", error);
+			panic("%s: thread_set_wq_state failed: %d", __func__, error);
 		}
 	}
 #elif defined(__arm__) || defined(__arm64__)
@@ -851,7 +851,7 @@ workq_set_register_state(proc_t p, thread_t th,
 
 		int error = pthread_kern->thread_set_wq_state32(th, (thread_state_t)&state);
 		if (error != KERN_SUCCESS) {
-			panic(__func__ ": thread_set_wq_state failed: %d", error);
+			panic("%s: thread_set_wq_state failed: %d", __func__, error);
 		}
 	} else {
 #if defined(__arm64__)
@@ -869,7 +869,7 @@ workq_set_register_state(proc_t p, thread_t th,
 
 		int error = pthread_kern->thread_set_wq_state64(th, (thread_state_t)&state);
 		if (error != KERN_SUCCESS) {
-			panic(__func__ ": thread_set_wq_state failed: %d", error);
+			panic("%s: thread_set_wq_state failed: %d", __func__, error);
 		}
 #else /* defined(__arm64__) */
 		panic("Shouldn't have a 64-bit thread on a 32-bit kernel...");
@@ -899,7 +899,7 @@ workq_kevent(proc_t p, struct workq_thread_addrs *th_addrs,
 
 	// squash any errors into just empty output
 	if (ret != 0 || *kevent_count_out == -1) {
-		*kevent_list_out = NULL;
+		*kevent_list_out = 0;
 		*kevent_count_out = 0;
 		return ret;
 	}
@@ -940,7 +940,7 @@ workq_setup_thread(proc_t p, thread_t th, vm_map_t map, user_addr_t stackaddr,
 {
 	struct workq_thread_addrs th_addrs;
 	bool first_use = (setup_flags & WQ_SETUP_FIRST_USE);
-	user_addr_t kevent_list = NULL;
+	user_addr_t kevent_list = 0;
 	int kevent_count = 0;
 
 	workq_thread_get_addrs(map, stackaddr, &th_addrs);
@@ -973,7 +973,7 @@ workq_setup_thread(proc_t p, thread_t th, vm_map_t map, user_addr_t stackaddr,
 		kevent_count = WORKQ_EXIT_THREAD_NKEVENT;
 	} else if (upcall_flags & WQ_FLAG_THREAD_KEVENT) {
 		unsigned int flags = KEVENT_FLAG_STACK_DATA | KEVENT_FLAG_IMMEDIATE;
-		workq_kevent(p, &th_addrs, NULL, 0, flags, &kevent_list, &kevent_count);
+		workq_kevent(p, &th_addrs, 0, 0, flags, &kevent_list, &kevent_count);
 	}
 
 	workq_set_register_state(p, th, &th_addrs, kport,
@@ -993,7 +993,7 @@ workq_handle_stack_events(proc_t p, thread_t th, vm_map_t map,
 		user_addr_t events, int nevents, int upcall_flags)
 {
 	struct workq_thread_addrs th_addrs;
-	user_addr_t kevent_list = NULL;
+	user_addr_t kevent_list = 0;
 	int kevent_count = 0, error;
 	__assert_only kern_return_t kr;
 
