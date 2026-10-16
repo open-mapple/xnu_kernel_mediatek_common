@@ -26,7 +26,11 @@
 #define INNER_H__
 
 #include <string.h>
+#if defined(KERNEL)
+#include <machine/limits.h>
+#else
 #include <limits.h>
+#endif
 
 #include "config.h"
 #include "bearssl.h"
