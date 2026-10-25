@@ -1,6 +1,6 @@
 /*
  * The speakers' guard: what the samples go through on their way to the phone's two amplifiers
- * (bsd/dev/redwood_sound.c's feeder), in place of the protection Android has in the audio DSP.
+ * (bsd/dev/hakios.sound.c's feeder), in place of the protection Android has in the audio DSP.
  *
  * Under Android the DSP runs Awinic's algorithm (SKTune, "aw882xx_rx_switch") with each
  * speaker's calibration: it keeps the cone's excursion and the voice coil's temperature in
@@ -26,7 +26,7 @@
  *   peaks      no sample above 3 dB under full scale at Android's level: a limiter that turns
  *              the level down at the sample that would go over (so none does) and lets it come
  *              back with a time constant of 43 ms
- *   monitor    a further reduction that the amplifiers' watch asks for (redwood_speaker.c:
+ *   monitor    a further reduction that the amplifiers' watch asks for (hakios.speaker.c:
  *              Android's table for a cold amplifier, and a low battery)
  *
  * Before all that, a gain (sound_gain, at most 12 dB): iOS's own processing for the iPhone X's
@@ -40,12 +40,12 @@
  * back only that much later. Everything is integer arithmetic (the kernel's threads do no
  * floating point); fractions are in Q30 unless said otherwise.
  *
- * One caller at a time (the feeder); redwood_guard_attenuation() and redwood_guard_monitor() may
+ * One caller at a time (the feeder); hakios_guard_attenuation() and hakios_guard_monitor() may
  * be called from another thread.
  */
 #include <stdbool.h>
 #include <stdint.h>
-#include <sys/redwood_audio.h>
+#include <sys/hakios.audio.h>
 
 #define ONE                     (1ll << 30)
 #define FULL_SCALE              32768
@@ -79,14 +79,14 @@ static const int64_t hpf_a1 = -2107733822, hpf_a2 = 1034714513;
 static struct {
 	bool hpf;
 	uint64_t gain;                          /* the gain before everything, Q30 (1 to 4) */
-	volatile uint32_t attenuation;          /* the amplifiers' level under Android's, eighths of a dB; REDWOOD_GUARD_SILENT: off */
+	volatile uint32_t attenuation;          /* the amplifiers' level under Android's, eighths of a dB; HAKIOS_GUARD_SILENT: off */
 	volatile uint32_t monitor;              /* the monitor's reduction, eighths of a dB */
 	int64_t x1[2], x2[2], y1[2], y2[2];     /* the filter's past, in 1/256 of a sample */
 	uint64_t rms[2], fast[2], slow[2];      /* average powers at each speaker, Q30 of a full-scale square wave at Android's level */
 	uint64_t level;                         /* the power guard's and the monitor's gain at the end of the last block */
 	uint64_t envelope;                      /* the peak limiter's, 1/65536 of a sample */
-	struct redwood_guard_report report;
-} guard = { .hpf = true, .attenuation = REDWOOD_GUARD_SILENT, .gain = ONE, .level = ONE, .report = { .least_gain = ONE, .least_peak_gain = 65536 } };
+	struct hakios_guard_report report;
+} guard = { .hpf = true, .attenuation = HAKIOS_GUARD_SILENT, .gain = ONE, .level = ONE, .report = { .least_gain = ONE, .least_peak_gain = 65536 } };
 
 static int32_t work[2 * MAX_FRAMES];
 
@@ -133,21 +133,21 @@ headroom(uint64_t power, uint64_t limit)
 }
 
 void
-redwood_guard_configure(bool hpf, uint32_t gain)
+hakios_guard_configure(bool hpf, uint32_t gain)
 {
 	guard.hpf = hpf;
 	/* 10^(gain/160): one over the attenuation by as much */
-	guard.gain = (1ull << 60) / amplitude(gain > REDWOOD_GUARD_MAX_GAIN ? REDWOOD_GUARD_MAX_GAIN : gain);
+	guard.gain = (1ull << 60) / amplitude(gain > HAKIOS_GUARD_MAX_GAIN ? HAKIOS_GUARD_MAX_GAIN : gain);
 }
 
 void
-redwood_guard_attenuation(uint32_t below)
+hakios_guard_attenuation(uint32_t below)
 {
 	guard.attenuation = below;
 }
 
 void
-redwood_guard_monitor(uint32_t below)
+hakios_guard_monitor(uint32_t below)
 {
 	guard.monitor = below;
 }
@@ -156,8 +156,8 @@ static void
 block(int16_t *frames, uint32_t count)
 {
 	uint32_t attenuation = guard.attenuation;
-	struct redwood_guard_report *r = &guard.report;
-	uint64_t to_speaker = attenuation == REDWOOD_GUARD_SILENT ? 0 : amplitude(2 * attenuation);
+	struct hakios_guard_report *r = &guard.report;
+	uint64_t to_speaker = attenuation == HAKIOS_GUARD_SILENT ? 0 : amplitude(2 * attenuation);
 	uint64_t sum[2] = { 0, 0 }, g2 = ONE, g, start = guard.level, ceiling;
 	uint32_t binding = 0;
 
@@ -222,7 +222,7 @@ block(int16_t *frames, uint32_t count)
 
 	/* the peaks: no sample over the limit at the speaker (and none over full scale) */
 	ceiling = FULL_SCALE - 1;
-	if (attenuation != REDWOOD_GUARD_SILENT && attenuation < PEAK_LIMIT) {
+	if (attenuation != HAKIOS_GUARD_SILENT && attenuation < PEAK_LIMIT) {
 		ceiling = (uint64_t)FULL_SCALE * amplitude(PEAK_LIMIT - attenuation) >> 30;
 	}
 	for (uint32_t f = 0; f < count; f++) {
@@ -269,7 +269,7 @@ block(int16_t *frames, uint32_t count)
 }
 
 void
-redwood_guard_process(int16_t *frames, uint32_t count)
+hakios_guard_process(int16_t *frames, uint32_t count)
 {
 	while (count > 0) {
 		uint32_t n = count < MAX_FRAMES ? count : MAX_FRAMES;
@@ -282,15 +282,15 @@ redwood_guard_process(int16_t *frames, uint32_t count)
 
 /* What has happened since the last call (and the averages and the gain as they are now). */
 void
-redwood_guard_take_report(struct redwood_guard_report *report)
+hakios_guard_take_report(struct hakios_guard_report *report)
 {
 	*report = guard.report;
-	guard.report = (struct redwood_guard_report){ .least_gain = ONE, .least_peak_gain = 65536 };
+	guard.report = (struct hakios_guard_report){ .least_gain = ONE, .least_peak_gain = 65536 };
 }
 
 /* 10 log10 of a Q30 ratio, in tenths of a dB (for what is said) */
 int
-redwood_guard_decibels(uint64_t ratio)
+hakios_guard_decibels(uint64_t ratio)
 {
 	static const uint16_t fraction[17] = {
 		0, 5732, 11136, 16248, 21098, 25711, 30109, 34312, 38336, 42196, 45904, 49472, 52911, 56229, 59434, 62534, 65535,
