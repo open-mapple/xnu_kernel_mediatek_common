@@ -1,5 +1,5 @@
 /*
- * Redmi Note 10 Pro bootstrap console. No allocation, locks, ADT parsing or
+ * Bootstrap console (Redmi Note 11 Pro 4G / viva). No allocation, locks, ADT parsing or
  * per-CPU state: panic() can reach this before a current thread exists.
  * start.s maps the splash framebuffer VA=PA as Normal Non-Cacheable memory.
  * arm_vm_init installs a reserved kernel VA alias before removing TTBR0;
@@ -11,11 +11,11 @@
 #include <stdint.h>
 #include <kern/misc_protos.h>
 
-static volatile uint32_t *early_fb = (volatile uint32_t *)(uintptr_t)0x9c000000;
+static volatile uint32_t *early_fb = (volatile uint32_t *)(uintptr_t)SWEET_EARLY_FB_PHYS;
 #define EARLY_FB early_fb
 #define EARLY_WIDTH 1080u
-#define EARLY_HEIGHT 2400u
-#define EARLY_STRIDE (4320u / 4)
+#define EARLY_HEIGHT SWEET_EARLY_FB_ROWS
+#define EARLY_STRIDE (SWEET_EARLY_FB_ROWBYTES / 4)
 #define EARLY_SCALE 2u
 #define EARLY_CELL_W (8u * EARLY_SCALE)
 #define EARLY_CELL_H (16u * EARLY_SCALE)

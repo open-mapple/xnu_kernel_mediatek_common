@@ -515,10 +515,10 @@ LEXT(start_first_cpu)
 
 #if defined(SWEET)
 	/* Stage 0: white 64x32 band, no stack or page tables needed. */
-	MOV64	x0, (0x9c000000 + 2368 * 4320)
+	MOV64	x0, (0x7bc10000 + 2368 * 4352)	/* viva LK framebuffer, pitch 1088 px */
 	mov		w1, #-1
 	mov		x2, #32
-	mov		x4, #4320
+	mov		x4, #4352
 Lsweet_mark_row:
 	mov		x3, #64
 	mov		x5, x0
@@ -680,14 +680,14 @@ Lkernelcache_base_found:
 
 #if defined(SWEET)
 	/*
-	 * Splash framebuffer: one 32MB Normal-NC block in the EXISTING V=P
+	 * Splash framebuffer: one 32MB Device block in the EXISTING V=P
 	 * L2 table. Both framebuffer and RAM use L1 index 0; another call to
 	 * create_bootstrap_mapping would replace the RAM L2 table.
 	 * SWEET uses 16K pages and all bring-up RAM is below 4GB, so the first
 	 * V=P L2 page is bootstrap_pagetables + 2*PGBYTES.
 	 */
-	MOV64	x10, 0x9c000000
-	MOV64	x11, (ARM_TTE_TYPE_BLOCK | ARM_TTE_VALID | ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) | ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_WRITECOMB) | ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX)
+	MOV64	x10, 0x7a000000	/* 32MB block holding the viva framebuffer start */
+	MOV64	x11, (ARM_TTE_TYPE_BLOCK | ARM_TTE_VALID | ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) | ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_DISABLE) | ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX)
 	orr		x11, x11, x10
 	and		x12, x10, #(ARM_TT_L2_INDEX_MASK)
 	lsr		x12, x12, #(ARM_TT_L2_SHIFT)
