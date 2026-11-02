@@ -677,7 +677,6 @@ sweet_ufs_init(void)
 	sweet_keys_init();
 	sweet_touch_init();
 	sweet_usb_probe();
-	viva_usb_probe();
 	return 0;
 }
 
@@ -829,6 +828,12 @@ int sweet_ufs_rootdev(dev_t *dev);
 int
 sweet_ufs_rootdev(dev_t *dev)
 {
+	static bool viva_usb_done;
+	if (!viva_usb_done) {
+		/* before storage, so a UFS failure can still be read over USB */
+		viva_usb_done = true;
+		viva_usb_probe();
+	}
 	if (!su.ready) {
 		int error = sweet_ufs_init();
 		if (error) {
