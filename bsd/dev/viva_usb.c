@@ -205,6 +205,7 @@ static inline void clr32(vm_offset_t b, uint32_t o, uint32_t m) { wr32(b, o, rd3
 extern uint32_t sweet_log_copy(uint64_t *pos, char *out, uint32_t max);   /* bsd/dev/sweet_ufs.c */
 extern uint64_t sweet_log_position(void);
 extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
+extern int viva_pwrap_read(uint32_t addr, uint32_t *value);               /* iokit/Kernel/arm/VivaPwrap.cpp */
 
 static void
 vl_sleep_ms(unsigned ms)
@@ -484,6 +485,7 @@ vl_arg(char **p, uint64_t *v)
  *   peek PA [WORDS]   read 32-bit words of physical memory/MMIO (max 64)
  *   poke PA VALUE     write one 32-bit word, then read it back
  *   rewind [BYTES]    resend the log from BYTES back (default: whole ring)
+ *   pmic ADDR [N]     read N (max 32) 16-bit PMIC registers through pwrap (read only)
  *   panic [TEXT]      panic (to test the panic path)
  *   reboot            watchdog software reset (back through preloader/LK)
  * peek/poke have no guard: an address in a gated block can hang the bus.
@@ -531,6 +533,22 @@ vl_command(void)
 		a &= ~3ull;
 		ml_phys_write_word_64(a, (unsigned int)v);
 		vl_reply("%010llx <- %08x, reads %08x\n", a, (unsigned int)v, ml_phys_read_word_64(a));
+	} else if (IS("pmic") && vl_arg(&rest, &a)) {
+		uint64_t n = 1;
+		(void)vl_arg(&rest, &n);
+		n = MIN(MAX(n, 1ull), 32ull);
+		a &= ~1ull;
+		for (uint64_t i = 0; i < n; i++) {
+			uint32_t val = 0;
+			int err = viva_pwrap_read((uint32_t)(a + 2 * i), &val);
+			if (err) {
+				vl_reply("pmic 0x%04llx: error %d\n", a + 2 * i, err);
+				break;
+			}
+			vl_reply("%spmic 0x%04llx:", i % 8 ? "" : (i ? "\n" : ""), a + 2 * i);
+			vl_reply(" %04x", val);
+		}
+		vl_reply("\n");
 	} else if (IS("rewind")) {
 		uint64_t total = sweet_log_position(), back = UINT64_MAX;
 		(void)vl_arg(&rest, &back);
@@ -548,7 +566,7 @@ vl_command(void)
 			delay(5000);
 		}
 	} else if (IS("help")) {
-		vl_reply("ping | stat | peek PA [WORDS] | poke PA VALUE | rewind [BYTES] | panic [TEXT] | reboot\n");
+		vl_reply("ping | stat | peek PA [WORDS] | poke PA VALUE | pmic ADDR [N] | rewind [BYTES] | panic [TEXT] | reboot\n");
 	} else {
 		vl_reply("unknown command: %s (try help)\n", c);
 	}

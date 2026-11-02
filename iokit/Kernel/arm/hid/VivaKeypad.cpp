@@ -9,8 +9,10 @@
  * matrix position, 0 = pressed (Linux drivers/input/keyboard/mt6779-keypad.c).
  * The ADT property "keymap" lists <bit usage> pairs: bit number in MEM1..5
  * (MEM1 bit 0 = 0) and a HID consumer-page usage (0xe9 volume up, 0xea
- * volume down, 0x30 power). Changes of unmapped bits are only logged, which
- * is how the map of a new board is found.
+ * volume down, 0x30 power). Changes of unmapped bits are only logged (the
+ * first change of each), which is how the map of a new board is found. On
+ * viva one key shows up in 8 bits (0, 9, 34, 43, 68, 77, 102, 111 for
+ * volume down = kpd-hw-init-map index 0); only the first is mapped.
  *
  * Events are consumer-control keyboard events, the same usage pair and
  * event kind as SweetHIDButtons and Apple's own button services.
@@ -61,6 +63,7 @@ private:
 	uint32_t                fKeyUsage[KP_MAX_KEYS];
 	uint32_t                fNumKeys;
 	uint32_t                fInterrupts;
+	uint32_t                fLogged[KP_NUM_MEMS];   /* unmapped bits already logged */
 };
 
 OSDefineMetaClassAndStructors(VivaKeypad, IOHIDEventService);
@@ -157,9 +160,16 @@ VivaKeypad::scan(void)
 					usage = fKeyUsage[k];
 				}
 			}
-			IOLog("VIVA KP: bit %u %s (usage 0x%x, interrupt %u)\n", bit, down ? "down" : "up",
-			    (unsigned)usage, fInterrupts);
-			if (usage != 0) {
+			if (usage == 0) {
+				if (!(fLogged[m] & (1u << b))) {
+					fLogged[m] |= 1u << b;
+					IOLog("VIVA KP: unmapped bit %u %s (interrupt %u)\n", bit, down ? "down" : "up",
+					    fInterrupts);
+				}
+				continue;
+			}
+			IOLog("VIVA KP: key 0x%x %s\n", (unsigned)usage, down ? "down" : "up");
+			{
 				IOHIDEvent *event = IOHIDEvent::keyboardEvent(mach_absolute_time(), kHIDPage_Consumer, usage, down);
 				if (event != NULL) {
 					dispatchEvent(event);
