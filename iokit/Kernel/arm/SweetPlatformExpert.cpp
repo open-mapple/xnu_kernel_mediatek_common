@@ -63,13 +63,14 @@ SweetPlatformExpert::processTopLevel(IORegistryEntry *root)
 
 	/*
 	 * No AppleARMIO driver publishes the /arm-io children: do it here so
-	 * built-in drivers (the display, AppleCLCD) can match them. The GIC is
-	 * driven by the platform code and gets no nub. The nubs hang off this
+	 * built-in drivers (the display, AppleCLCD) can match them. The GIC
+	 * nub is SweetGIC's, the SPI interrupt controller of the other nubs
+	 * (the platform code still owns timer and IPIs). The nubs hang off this
 	 * platform expert: IOPlatformDevice::compareName asks its provider.
 	 */
 	IORegistryEntry *armio = root->childFromPath("arm-io", gIODTPlane);
 	if (armio != NULL) {
-		createNubs(this, IODTFindMatchingEntries(armio, kIODTExclusive, "('gic')"));
+		createNubs(this, IODTFindMatchingEntries(armio, kIODTExclusive, NULL));
 		armio->release();
 	}
 }
