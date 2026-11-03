@@ -226,6 +226,7 @@ extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
 extern int viva_pwrap_read(uint32_t addr, uint32_t *value);               /* iokit/Kernel/arm/VivaPwrap.cpp */
 extern int viva_i2c_xfer(uint8_t addr, const uint8_t *wbuf, uint32_t wlen, uint8_t *rbuf, uint32_t rlen); /* VivaIO.cpp */
 extern void viva_gpu_link(const char *args, char *out, size_t outLen);       /* iokit/Kernel/arm/VivaGPU.cpp */
+extern void viva_disp_link(const char *args, char *out, size_t outLen);      /* iokit/Kernel/arm/SweetFramebuffer.cpp */
 
 static void
 vl_sleep_ms(unsigned ms)
@@ -898,6 +899,7 @@ vl_vivad_out(uint8_t *out, uint32_t max)
  *   push SIZE MODE FNV PATH  receive a file (raw OUT data follows; written to PATH.vivapush, renamed when
  *                     its FNV-1a matches; missing directories are created)
  *   pull PATH         send a file ('F' frames)
+ *   disp [ARGS]       display (SweetFramebuffer.cpp): status, regs (read only), scanout on|off
  *   run ARGS..        run a program through vivad (output as 'O' frames, "[ID] exit N" at the end)
  *   vivad TEXT        any other vivad command (ps, kill ID, tests)
  *   panic [TEXT]      panic (to test the panic path)
@@ -997,6 +999,10 @@ vl_command(void)
 		static char gpu_reply[3072];
 		viva_gpu_link(rest, gpu_reply, sizeof(gpu_reply));
 		vl_reply("%s", gpu_reply);
+	} else if (IS("disp")) {
+		static char disp_reply[3072];
+		viva_disp_link(rest, disp_reply, sizeof(disp_reply));
+		vl_reply("%s", disp_reply);
 	} else if (IS("push")) {
 		vl_push_start(rest);
 	} else if (IS("pull")) {
@@ -1031,7 +1037,7 @@ vl_command(void)
 			delay(5000);
 		}
 	} else if (IS("help")) {
-		vl_reply("ping | stat | peek PA [WORDS] | poke PA VALUE | pmic ADDR [N] | i2c DEV REG N | i2cw DEV REG B.. | gpu [status|mfg|on|off|regs|freq [MHz]|selftest [fault]|probe|publish] | push SIZE MODE FNV PATH | pull PATH | run ARGS.. | vivad ps|kill ID|tests | rewind [BYTES] | panic [TEXT] | reboot\n");
+		vl_reply("ping | stat | peek PA [WORDS] | poke PA VALUE | pmic ADDR [N] | i2c DEV REG N | i2cw DEV REG B.. | gpu [status|mfg|on|off|regs|freq [MHz]|selftest [fault]|probe|publish] | disp [regs|scanout on|off] | push SIZE MODE FNV PATH | pull PATH | run ARGS.. | vivad ps|kill ID|tests | rewind [BYTES] | panic [TEXT] | reboot\n");
 	} else {
 		vl_reply("unknown command: %s (try help)\n", c);
 	}

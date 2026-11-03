@@ -29,6 +29,17 @@
  * sends (count, mach_absolute_time, 0) as 32-bit halves to clients that
  * enabled it, through the port they registered (IOConnectSetNotificationPort).
  *
+ * viva direct scanout (boot-arg vivascanout=1, or "disp scanout on" on the
+ * USB link): LK leaves the MediaTek display pipe running in video mode, one
+ * OVL layer reading the panel memory. When a swap shows a single full-screen
+ * BGRA surface that is physically contiguous below 4 GiB (SweetSurface
+ * allocates display-sized surfaces that way when scanout is on), only that
+ * layer's address and pitch are changed to point at the surface (the
+ * centered 1080x2400 window of the 1125x2436 surface): no CPU copy. Anything
+ * else falls back to the copy with LK's address and pitch restored. The OVL
+ * shadow registers are bypassed on MT6781, so the switch is not tied to
+ * vblank yet (a frame may tear).
+ *
  * The panel memory itself is published as an IOSurface and returned as the
  * default framebuffer surface. The kernel text console keeps drawing over
  * the GUI by default: boot-arg sweetfb_noconsole=1 stops drawing it from
@@ -127,6 +138,26 @@ public:
 	bool          fPowerOff;      /* RequestPowerChange(0) */
 	uint32_t      fFadeStep;      /* fade-out steps done while off */
 
+	/* viva direct scanout (see the top) */
+	IOLock       *fScanLock;      /* scanout state: present() vs. the link command */
+	IOMemoryMap  *fDispMap[4];    /* OVL0, OVL0_2L, SMI larb0, larb1 */
+	vm_offset_t   fDisp[4];
+	int           fScanOvl;       /* OVL of LK's layer (0/1), -1 = not found */
+	uint32_t      fScanAddrReg, fScanPitchReg, fScanPitchMsbReg;
+	uint32_t      fLkAddr, fLkPitch, fLkPitchMsb;
+	char          fScanLayer[16];
+	bool          fScanOn;        /* allowed */
+	bool          fScanActive;    /* the layer points at fScanSurface */
+	SweetSurface *fScanSurface;
+	uint64_t      fScanFrames, fScanFallbacks;
+	const char   *fScanWhy;       /* last reason for falling back */
+
+	bool dispMap(void);
+	bool findLKLayer(char **out, char *end);
+	bool scanout(const uint8_t *rec);
+	void scanoutStop(void);
+	void dispCommand(const char *args, char *out, size_t len);
+
 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
 	void addClient(IOMobileFramebufferUserClient *client);
 	void removeClient(IOMobileFramebufferUserClient *client);
@@ -135,6 +166,8 @@ public:
 };
 
 OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+
+static AppleCLCD *gSweetFB;     /* for the USB link "disp" command */
 
 class IOMobileFramebufferUserClient : public IOUserClient {
 	OSDeclareDefaultStructors(IOMobileFramebufferUserClient);
@@ -205,6 +238,16 @@ AppleCLCD::start(IOService *provider)
 	uint32_t hz = 10;
 	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
 	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
+	fScanOvl = -1;
+	fScanLock = IOLockAlloc();
+	uint32_t scan = 0;
+	if (PE_parse_boot_argn("vivascanout", &scan, sizeof(scan)) && scan != 0) {
+		/* display-sized surfaces from now on contiguous; LK's layer is looked up at the first swap */
+		sweet_surface_scanout_w = fLogicalW;
+		sweet_surface_scanout_h = fLogicalH;
+		fScanOn = true;
+	}
+	gSweetFB = this;
 	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
 
 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
@@ -252,7 +295,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
 		sender->setTimeoutUS(SWEET_FB_VSYNC_US);
 		return;
 	}
-	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0;
+	bool flush = fb->fDirty && (fb->fScanOn || (count % fb->fFlushTicks) == 0);     /* scanout: every vsync */
 	uint8_t *rec = NULL;
 	if (flush) {
 		rec = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE);
@@ -385,6 +428,12 @@ AppleCLCD::present(const uint8_t *rec)
 	uint32_t mask = get32(rec, 0x104);
 
 
+	IOLockLock(fScanLock);
+	bool scanned = fScanOn && scanout(rec);
+	IOLockUnlock(fScanLock);
+	if (scanned) {
+		return;
+	}
 	if (!fConsolePaused) {
 		int quiet = 0;
 		fConsolePaused = true;
@@ -480,6 +529,284 @@ AppleCLCD::present(const uint8_t *rec)
 		}
 		s->release();
 	}
+}
+
+/* ---- viva direct scanout ---- */
+
+#define DISP_OVL0_PA            0x14005000ull
+#define DISP_OVL0_2L_PA         0x14006000ull
+#define SMI_LARB0_PA            0x14003000ull
+#define SMI_LARB1_PA            0x14004000ull
+#define OVL_EN                  0x00c   /* bit 0 enable, bit 22 BYPASS_SHADOW */
+#define OVL_ROI_SIZE            0x020
+#define OVL_SRC_CON             0x02c   /* bit n: layer n */
+#define OVL_L_CON(n)            (0x030 + 0x20 * (n))
+#define OVL_L_SRC_SIZE(n)       (0x038 + 0x20 * (n))
+#define OVL_L_OFFSET(n)         (0x03c + 0x20 * (n))
+#define OVL_L_PITCH_MSB(n)      (0x040 + 0x20 * (n))
+#define OVL_L_PITCH(n)          (0x044 + 0x20 * (n))
+#define OVL_L_ADDR(n)           (0xf40 + 0x20 * (n))
+#define OVL_DATAPATH_EXT_CON    0x324   /* bit k: ext layer k */
+#define OVL_EL_CON(k)           (0x330 + 0x20 * (k))
+#define OVL_EL_SRC_SIZE(k)      (0x338 + 0x20 * (k))
+#define OVL_EL_PITCH_MSB(k)     (0x340 + 0x20 * (k))
+#define OVL_EL_PITCH(k)         (0x344 + 0x20 * (k))
+#define OVL_EL_ADDR(k)          (0xfb0 + 4 * (k))
+#define LARB_NON_SEC_CON(p)     (0x380 + 4 * (p))       /* bit 0: port translated by the M4U (inferred) */
+
+
+static inline uint32_t
+disp_rd(vm_offset_t b, uint32_t o)
+{
+	return *(volatile uint32_t *)(b + o);
+}
+
+static inline void
+disp_wr(vm_offset_t b, uint32_t o, uint32_t v)
+{
+	*(volatile uint32_t *)(b + o) = v;
+}
+
+static void
+disp_say(char **p, char *end, const char *fmt, ...) __printflike(3, 4);
+
+static void
+disp_say(char **p, char *end, const char *fmt, ...)
+{
+	if (p == NULL || *p >= end - 1) {
+		return;
+	}
+	va_list ap;
+	va_start(ap, fmt);
+	int n = vsnprintf(*p, (size_t)(end - *p), fmt, ap);
+	va_end(ap);
+	if (n > 0) {
+		*p += MIN((size_t)n, (size_t)(end - *p - 1));
+	}
+}
+
+bool
+AppleCLCD::dispMap(void)
+{
+	static const uint64_t pa[4] = { DISP_OVL0_PA, DISP_OVL0_2L_PA, SMI_LARB0_PA, SMI_LARB1_PA };
+	for (int i = 0; i < 4; i++) {
+		if (fDispMap[i] != NULL) {
+			continue;
+		}
+		IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(pa[i], 0x1000, kIODirectionInOut);
+		fDispMap[i] = md != NULL ? md->map(kIOMapInhibitCache) : NULL;
+		OSSafeReleaseNULL(md);
+		if (fDispMap[i] == NULL) {
+			return false;
+		}
+		fDisp[i] = (vm_offset_t)fDispMap[i]->getVirtualAddress();
+	}
+	return true;
+}
+
+/*
+ * The enabled OVL layer that scans the panel memory (LK's three buffers): OVL0 layers 0-3, its ext layers
+ * 0-2, OVL0_2L layers 0-1. Read only.
+ */
+bool
+AppleCLCD::findLKLayer(char **out, char *end)
+{
+	uint64_t lo = fPhys, hi = fPhys + 3ull * fRowBytes * fHeight;
+	if (!dispMap()) {
+		disp_say(out, end, "display registers not mappable\n");
+		return false;
+	}
+	for (int o = 0; o < 2; o++) {
+		vm_offset_t b = fDisp[o];
+		if (!(disp_rd(b, OVL_EN) & 1)) {
+			continue;
+		}
+		for (int n = 0; n < (o ? 2 : 4); n++) {
+			uint32_t addr = disp_rd(b, OVL_L_ADDR(n));
+			if ((disp_rd(b, OVL_SRC_CON) & (1u << n)) && addr >= lo && addr < hi) {
+				fScanOvl = o;
+				fScanAddrReg = OVL_L_ADDR(n);
+				fScanPitchReg = OVL_L_PITCH(n);
+				fScanPitchMsbReg = OVL_L_PITCH_MSB(n);
+				snprintf(fScanLayer, sizeof(fScanLayer), "%s L%d", o ? "OVL0_2L" : "OVL0", n);
+			}
+		}
+		for (int k = 0; o == 0 && k < 3; k++) {
+			uint32_t addr = disp_rd(b, OVL_EL_ADDR(k));
+			if ((disp_rd(b, OVL_DATAPATH_EXT_CON) & (1u << k)) && addr >= lo && addr < hi) {
+				fScanOvl = o;
+				fScanAddrReg = OVL_EL_ADDR(k);
+				fScanPitchReg = OVL_EL_PITCH(k);
+				fScanPitchMsbReg = OVL_EL_PITCH_MSB(k);
+				snprintf(fScanLayer, sizeof(fScanLayer), "OVL0 EL%d", k);
+			}
+		}
+	}
+	if (fScanOvl < 0) {
+		disp_say(out, end, "no enabled OVL layer reads the panel memory 0x%llx..0x%llx\n", lo, hi);
+		return false;
+	}
+	vm_offset_t b = fDisp[fScanOvl];
+	fLkAddr = disp_rd(b, fScanAddrReg);
+	fLkPitch = disp_rd(b, fScanPitchReg);
+	fLkPitchMsb = disp_rd(b, fScanPitchMsbReg);
+	/* OVL0 reads through SMI larb0 ports 1-2, OVL0_2L through larb1 ports 0-1 */
+	vm_offset_t larb = fDisp[fScanOvl ? 3 : 2];
+	uint32_t p0 = disp_rd(larb, LARB_NON_SEC_CON(fScanOvl ? 0 : 1)), p1 = disp_rd(larb, LARB_NON_SEC_CON(fScanOvl ? 1 : 2));
+	disp_say(out, end, "LK layer %s: addr 0x%08x pitch 0x%08x (msb 0x%x), larb ports 0x%08x 0x%08x%s\n", fScanLayer,
+	    fLkAddr, fLkPitch, fLkPitchMsb, p0, p1, ((p0 | p1) & 1) ? " (bit 0 set: may go through the M4U!)" : "");
+	return true;
+}
+
+/* Point LK's layer at the swap's surface, if the swap is one full-screen contiguous BGRA surface. */
+bool
+AppleCLCD::scanout(const uint8_t *rec)
+{
+	uint32_t mask = get32(rec, 0x104), layers = 0, id = 0, idx = 0;
+	for (uint32_t l = 0; l < SWEET_FB_LAYERS; l++) {
+		if ((mask & (1u << l)) && get32(rec, 0x54 + 4 * l) != 0) {
+			layers++;
+			id = get32(rec, 0x54 + 4 * l);
+			idx = l;
+		}
+	}
+	const uint8_t *a = rec + 0x64 + 16 * idx, *b = rec + 0xc4 + 16 * idx;
+	SweetSurface *s = layers == 1 ? sweet_surface_copy(id) : NULL;
+	const char *why = NULL;
+	uint64_t pa = 0;
+	if (layers != 1) {
+		why = "not exactly one layer";
+	} else if (s == NULL || !s->contig) {
+		why = "surface not contiguous";
+	} else if (s->width != fLogicalW || s->height != fLogicalH || s->bytesPerElement != 4 ||
+	    s->pixelFormat != SWEET_FB_FORMAT_BGRA || s->bytesPerRow > 0xfffff) {
+		why = "not a full-screen BGRA surface";
+	} else if (get32(a, 0) != 0 || get32(a, 4) != 0 || get32(b, 0) != 0 || get32(b, 4) != 0 ||
+	    (get32(b, 8) != 0 && get32(b, 8) != fLogicalW) || (get32(b, 12) != 0 && get32(b, 12) != fLogicalH)) {
+		why = "layer not at the origin, full size";
+	} else {
+		IOByteCount len = 0;
+		pa = s->memory->getPhysicalSegment(0, &len, kIOMemoryMapperNone);
+		if (pa == 0 || len < s->allocSize || pa + s->allocSize > (1ull << 32)) {
+			why = "memory not one range below 4 GiB";
+		}
+	}
+	if (why == NULL && fScanOvl < 0 && !findLKLayer(NULL, NULL)) {
+		why = "LK's layer not found";
+	}
+	if (why != NULL) {
+		if (fScanWhy != why) {
+			IOLog("SWEET FB: scanout: copying (%s)\n", why);
+			fScanWhy = why;
+		}
+		OSSafeReleaseNULL(s);
+		scanoutStop();
+		fScanFallbacks++;
+		return false;
+	}
+	sweet_surface_before_device_read(s);    /* CPU-drawn pixels out of the caches */
+	uint32_t addr = (uint32_t)(pa + s->offset + (uint64_t)fOffY * s->bytesPerRow + (uint64_t)fOffX * 4);
+	vm_offset_t base = fDisp[fScanOvl];
+	disp_wr(base, fScanPitchMsbReg, (fLkPitchMsb & ~0xfu) | ((s->bytesPerRow >> 16) & 0xf));
+	disp_wr(base, fScanPitchReg, (fLkPitch & ~0xffffu) | (s->bytesPerRow & 0xffff));
+	disp_wr(base, fScanAddrReg, addr);
+	if (!fScanActive || fScanWhy != NULL) {
+		IOLog("SWEET FB: scanout: %s reads surface %u at 0x%08x (pitch %u)\n", fScanLayer, s->id, addr,
+		    s->bytesPerRow);
+		fScanWhy = NULL;
+	}
+	fScanActive = true;
+	SweetSurface *old = fScanSurface;
+	fScanSurface = s;                       /* keeps the memory alive while the OVL reads it */
+	OSSafeReleaseNULL(old);
+	fScanFrames++;
+	return true;
+}
+
+/* Back to LK's buffer (the CPU copy). */
+void
+AppleCLCD::scanoutStop(void)
+{
+	if (fScanActive && fScanOvl >= 0) {
+		vm_offset_t base = fDisp[fScanOvl];
+		disp_wr(base, fScanAddrReg, fLkAddr);
+		disp_wr(base, fScanPitchMsbReg, fLkPitchMsb);
+		disp_wr(base, fScanPitchReg, fLkPitch);
+	}
+	fScanActive = false;
+	OSSafeReleaseNULL(fScanSurface);
+}
+
+/* USB link "disp [regs|scanout on|off]". */
+void
+AppleCLCD::dispCommand(const char *args, char *out, size_t len)
+{
+	char *p = out, *end = out + len;
+	out[0] = 0;
+	while (*args == ' ') {
+		args++;
+	}
+	IOLockLock(fScanLock);
+	if (strncmp(args, "regs", 4) == 0) {
+		if (!dispMap()) {
+			disp_say(&p, end, "display registers not mappable\n");
+		} else {
+			for (int o = 0; o < 2; o++) {
+				vm_offset_t b = fDisp[o];
+				disp_say(&p, end, "%s: en 0x%08x roi 0x%08x src_con 0x%08x ext 0x%08x\n", o ? "OVL0_2L" : "OVL0",
+				    disp_rd(b, OVL_EN), disp_rd(b, OVL_ROI_SIZE), disp_rd(b, OVL_SRC_CON), disp_rd(b, OVL_DATAPATH_EXT_CON));
+				for (int n = 0; n < (o ? 2 : 4); n++) {
+					disp_say(&p, end, "  L%d con 0x%08x size 0x%08x off 0x%08x pitch 0x%08x/0x%x addr 0x%08x\n", n,
+					    disp_rd(b, OVL_L_CON(n)), disp_rd(b, OVL_L_SRC_SIZE(n)), disp_rd(b, OVL_L_OFFSET(n)),
+					    disp_rd(b, OVL_L_PITCH(n)), disp_rd(b, OVL_L_PITCH_MSB(n)), disp_rd(b, OVL_L_ADDR(n)));
+				}
+				for (int k = 0; o == 0 && k < 3; k++) {
+					disp_say(&p, end, "  EL%d con 0x%08x size 0x%08x pitch 0x%08x addr 0x%08x\n", k,
+					    disp_rd(b, OVL_EL_CON(k)), disp_rd(b, OVL_EL_SRC_SIZE(k)), disp_rd(b, OVL_EL_PITCH(k)),
+					    disp_rd(b, OVL_EL_ADDR(k)));
+				}
+			}
+			disp_say(&p, end, "larb0 ports 0-3: 0x%08x 0x%08x 0x%08x 0x%08x | larb1 ports 0-3: 0x%08x 0x%08x 0x%08x 0x%08x\n",
+			    disp_rd(fDisp[2], LARB_NON_SEC_CON(0)), disp_rd(fDisp[2], LARB_NON_SEC_CON(1)),
+			    disp_rd(fDisp[2], LARB_NON_SEC_CON(2)), disp_rd(fDisp[2], LARB_NON_SEC_CON(3)),
+			    disp_rd(fDisp[3], LARB_NON_SEC_CON(0)), disp_rd(fDisp[3], LARB_NON_SEC_CON(1)),
+			    disp_rd(fDisp[3], LARB_NON_SEC_CON(2)), disp_rd(fDisp[3], LARB_NON_SEC_CON(3)));
+			if (fScanOvl < 0) {
+				findLKLayer(&p, end);
+			}
+		}
+	} else if (strncmp(args, "scanout on", 10) == 0) {
+		if (fScanOvl >= 0 || findLKLayer(&p, end)) {
+			fScanOn = true;
+			sweet_surface_scanout_w = fLogicalW;
+			sweet_surface_scanout_h = fLogicalH;
+			fDirty = true;
+			disp_say(&p, end, "scanout on (surfaces created from now on can be scanned out; CA allocates its "
+			    "framebuffers at start: boot with vivascanout=1)\n");
+		}
+	} else if (strncmp(args, "scanout off", 11) == 0) {
+		fScanOn = false;
+		scanoutStop();
+		fDirty = true;
+		disp_say(&p, end, "scanout off: LK's buffer and the CPU copy again\n");
+	} else {
+		disp_say(&p, end, "display %ux%u (shown as %ux%u), scanout %s%s, layer %s, %llu frames scanned out, "
+		    "%llu copied%s%s\n", fWidth, fHeight, fLogicalW, fLogicalH, fScanOn ? "on" : "off",
+		    fScanActive ? " (active)" : "", fScanOvl >= 0 ? fScanLayer : "?", fScanFrames, fScanFallbacks,
+		    fScanWhy ? ", last reason: " : "", fScanWhy ? fScanWhy : "");
+		disp_say(&p, end, "usage: disp [regs|scanout on|scanout off]\n");
+	}
+	IOLockUnlock(fScanLock);
+}
+
+extern "C" void
+viva_disp_link(const char *args, char *out, size_t outLen)
+{
+	if (gSweetFB == NULL) {
+		snprintf(out, outLen, "disp: no AppleCLCD\n");
+		return;
+	}
+	gSweetFB->dispCommand(args, out, outLen);
 }
 
 bool

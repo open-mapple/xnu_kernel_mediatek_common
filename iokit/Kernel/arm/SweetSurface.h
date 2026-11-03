@@ -49,6 +49,7 @@ public:
 	volatile UInt32           gpuDirty;     /* a device wrote the memory since the CPU last dropped its lines */
 
 	OSDictionary             *values;       /* IOSurfaceSetValue (non-bulk), under the surface table lock */
+	bool                      contig;       /* physically contiguous below 4 GiB (scanout candidate) */
 
 	bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
 	void free() APPLE_KEXT_OVERRIDE;
@@ -78,6 +79,12 @@ SweetSurface *sweet_surface_create_physical(uint64_t phys, uint32_t width,
 uint64_t sweet_surface_before_device_read(SweetSurface *surface);
 uint64_t sweet_surface_before_cpu_access(SweetSurface *surface);
 void sweet_surface_device_wrote(SweetSurface *surface);
+
+/*
+ * Size of the surfaces the display may scan out directly (viva OVL, SweetFramebuffer.cpp; 0 = none): such
+ * 4-byte single-plane surfaces are allocated physically contiguous below 4 GiB when possible.
+ */
+extern uint32_t sweet_surface_scanout_w, sweet_surface_scanout_h;
 
 /* Send right for the surface in task (IOSurfaceLookupFromMachPort). */
 mach_port_name_t sweet_surface_port_in_task(SweetSurface *surface, task_t task);

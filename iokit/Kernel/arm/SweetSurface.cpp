@@ -97,6 +97,9 @@ static uint32_t      sweet_surface_users[SWEET_SURFACE_MAX_ID];
 static uint32_t      sweet_surface_next_id = 1;
 static uint32_t      sweet_surface_creates_logged;
 static uint64_t      sweet_surface_wired;       /* bytes of buffer surfaces */
+uint32_t             sweet_surface_scanout_w, sweet_surface_scanout_h;
+static uint64_t      sweet_surface_contig;      /* bytes of contiguous (scanout) surfaces */
+#define SWEET_SURFACE_CONTIG_MAX        (96ull << 20)
 #define SWEET_SURFACE_WIRED_MAX         (1536ull << 20)
 
 OSDefineMetaClassAndStructors(SweetSurface, OSObject);
@@ -106,6 +109,9 @@ SweetSurface::free()
 {
 	if (OSDynamicCast(IOBufferMemoryDescriptor, memory) != NULL) {
 		OSAddAtomic64(-(SInt64)allocSize, (volatile SInt64 *)&sweet_surface_wired);
+	}
+	if (contig) {
+		OSAddAtomic64(-(SInt64)allocSize, (volatile SInt64 *)&sweet_surface_contig);
 	}
 	OSSafeReleaseNULL(kernelMap);
 	OSSafeReleaseNULL(memory);
@@ -750,8 +756,21 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
 		IOBufferMemoryDescriptor *mem = NULL;
 		if ((uint64_t)OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_wired) +
 		    s->allocSize <= SWEET_SURFACE_WIRED_MAX) {
-			mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
-			    kIODirectionInOut | kIOMemoryKernelUserShared, s->allocSize, page_size);
+			if (sweet_surface_scanout_w != 0 && s->width == sweet_surface_scanout_w &&
+			    s->height == sweet_surface_scanout_h && s->bytesPerElement == 4 && s->planeCount == 0 &&
+			    sweet_surface_contig + s->allocSize <= SWEET_SURFACE_CONTIG_MAX) {
+				/* the display's DMA has no IOMMU here: one physical range below 4 GiB, 16 KiB aligned */
+				mem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task, kIODirectionInOut |
+				    kIOMemoryKernelUserShared | kIOMemoryPhysicallyContiguous, s->allocSize, 0x00000000ffffc000ull);
+				if (mem != NULL) {
+					OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_contig);
+					s->contig = true;
+				}
+			}
+			if (mem == NULL) {
+				mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
+				    kIODirectionInOut | kIOMemoryKernelUserShared, s->allocSize, page_size);
+			}
 		}
 		if (mem == NULL) {
 			OSAddAtomic64(-(SInt64)s->allocSize, (volatile SInt64 *)&sweet_surface_wired);
