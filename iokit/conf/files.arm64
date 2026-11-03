@@ -19,10 +19,12 @@ iokit/Kernel/arm/SweetGIC.cpp                                    optional iokitc
 iokit/Kernel/arm/VivaPwrap.cpp                                   optional iokitcpp
 iokit/Kernel/arm/VivaEINT.cpp                                    optional iokitcpp
 iokit/Kernel/arm/VivaPMIC.cpp                                    optional iokitcpp
+iokit/Kernel/arm/VivaIO.cpp                                      optional iokitcpp
 iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
 iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
 iokit/Kernel/arm/hid/VivaKeypad.cpp                              optional iokitcpp
 iokit/Kernel/arm/hid/VivaPMICKeys.cpp                            optional iokitcpp
+iokit/Kernel/arm/hid/VivaGT9896.cpp                              optional iokitcpp
 iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
 iokit/Kernel/arm/hid/IOHIDEventServiceQueue.cpp                  optional iokitcpp
 iokit/Kernel/arm/hid/IOHIDEventServiceUserClient.cpp             optional iokitcpp

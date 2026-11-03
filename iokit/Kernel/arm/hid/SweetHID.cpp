@@ -28,6 +28,7 @@
 #include "IOHIDKeys.h"
 #include "IOHIDPrivateKeys.h"
 #include "IOHIDUsageTables.h"
+#include "SweetHIDTouch.h"
 
 extern "C" uint64_t mach_absolute_time(void);
 
@@ -342,37 +343,6 @@ private:
 };
 OSDefineMetaClassAndStructors(SweetHIDButtons, IOHIDEventService);
 
-/*
- * Touch screen: digitizer collection events with finger children,
- * coordinates normalized to 0..1 like IOHIDEventDriver produces for
- * absolute digitizers.
- */
-#define SWEET_TOUCH_FINGERS 10
-/*
- * Contacts that start this close to a panel edge (pixels, ~3 mm) carry
- * kIOHIDDigitizerEventFromEdgeTip for their whole life, as Apple's touch
- * firmware reports them. UIKit derives UITouch's edge type from that bit
- * (_UIEventHIDTouchEdgeTypeForHIDEvent); without it there is no home or
- * app-switcher gesture.
- */
-#define SWEET_TOUCH_EDGE_PX 48
-class SweetHIDTouch : public IOHIDEventService {
-	OSDeclareDefaultStructors(SweetHIDTouch);
-public:
-	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
-	void touch(int finger, bool down, int x, int y);
-protected:
-	virtual UInt32 getPrimaryUsagePage() APPLE_KEXT_OVERRIDE { return kHIDPage_Digitizer; }
-	virtual UInt32 getPrimaryUsage() APPLE_KEXT_OVERRIDE { return kHIDUsage_Dig_TouchScreen; }
-	virtual UInt32 getProductID() APPLE_KEXT_OVERRIDE { return 2; }
-private:
-	IOLock *fLock;
-	int fLogicalW, fLogicalH, fOffX, fOffY;
-	bool fDown[SWEET_TOUCH_FINGERS];
-	bool fEdge[SWEET_TOUCH_FINGERS];
-	IOFixed fX[SWEET_TOUCH_FINGERS];
-	IOFixed fY[SWEET_TOUCH_FINGERS];
-};
 OSDefineMetaClassAndStructors(SweetHIDTouch, IOHIDEventService);
 
 static SweetHIDButtons *gSweetButtons;
@@ -428,6 +398,12 @@ SweetHIDButtons::testFired(OSObject *owner, IOTimerEventSource *sender)
 bool
 SweetHIDTouch::start(IOService *provider)
 {
+	/* The IOResources instance stands in for a touch backend; sweettouch=0 means there is none. */
+	uint32_t backend = 1;
+	PE_parse_boot_argn("sweettouch", &backend, sizeof(backend));
+	if (getMetaClass() == SweetHIDTouch::metaClass && backend == 0) {
+		return false;
+	}
 	fLock = IOLockAlloc();
 	if (!fLock || !IOHIDEventService::start(provider)) {
 		return false;
