@@ -120,6 +120,7 @@ SweetSurface::free()
 	OSSafeReleaseNULL(state);
 	OSSafeReleaseNULL(values);
 	OSSafeReleaseNULL(gpuFence);
+	OSSafeReleaseNULL(gpuPrev);
 	OSObject::free();
 }
 

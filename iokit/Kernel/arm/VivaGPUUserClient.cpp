@@ -129,8 +129,7 @@ VivaGPUUserClient::closeAll(void)
 			OSSafeReleaseNULL(fBOs[h]);
 		}
 		for (uint32_t h = 1; h < fSyncCap; h++) {
-			fGPU->fenceWake(fSyncobjs[h].fence);    /* its waiters see the syncobj gone */
-			OSSafeReleaseNULL(fSyncobjs[h].fence);
+			syncobjSet(h, NULL);            /* its waiters see the syncobj gone; a promise in it signals */
 			fSyncobjs[h].used = false;
 		}
 		OSSafeReleaseNULL(fVM);         /* jobs still running keep their own references */
@@ -201,6 +200,19 @@ bool
 VivaGPUUserClient::syncobjValid(uint32_t handle)
 {
 	return handle > 0 && handle < fSyncCap && fSyncobjs[handle].used;
+}
+
+void
+VivaGPUUserClient::syncobjSet(uint32_t handle, VivaGPUFence *f)
+{
+	VivaGPUFence *old = fSyncobjs[handle].fence;
+	fSyncobjs[handle].fence = f;
+	if (old != NULL && old != f) {
+		fGPU->resolvePromise(old, f);   /* K0i: a pending promise follows what replaced it */
+		fGPU->fenceWake(old);           /* its waiters re-check the syncobj */
+	}
+	fGPU->wakeWaiters();
+	OSSafeReleaseNULL(old);
 }
 
 /* ---- calls ---- */
@@ -295,6 +307,10 @@ VivaGPUUserClient::dispatch(uint32_t selector, void *arg)
 		return createBO((struct vgpu_create_bo *)arg);
 	case VGPU_SEL_SUBMIT:
 		return submit((struct vgpu_submit *)arg);
+	case VGPU_SEL_SUBMIT_BATCH:
+		return submitBatch((struct vgpu_submit_batch *)arg);
+	case VGPU_SEL_SURFACE_PROMISE:
+		return surfacePromise((struct vgpu_surface_promise *)arg);
 	case VGPU_SEL_SYNCOBJ_WAIT:
 		return syncobjWait((struct vgpu_syncobj_wait *)arg);
 	case VGPU_SEL_IMPORT_IOSURFACE:
@@ -326,12 +342,7 @@ VivaGPUUserClient::dispatch(uint32_t selector, void *arg)
 				}
 			}
 			for (uint32_t i = 0; i < a->count_handles; i++) {
-				Syncobj *s = &fSyncobjs[handles[i]];
-				fGPU->fenceWake(s->fence);      /* waiters of the old fence re-check the syncobj */
-				OSSafeReleaseNULL(s->fence);
-				if (signal) {
-					s->fence = VivaGPUFence::create(true);
-				}
+				syncobjSet(handles[i], signal ? VivaGPUFence::create(true) : NULL);
 			}
 			fGPU->wakeWaiters();
 			return kIOReturnSuccess;
@@ -392,8 +403,7 @@ VivaGPUUserClient::dispatch(uint32_t selector, void *arg)
 					break;
 				}
 				/* the BO's last job, else (an IOSurface) the last job on the surface in any connection */
-				VivaGPUFence *f = (b->busy != NULL && !b->busy->signalled) ? b->busy :
-				    OSDynamicCast(VivaGPUFence, b->surface->gpuFence);
+				VivaGPUFence *f = VivaGPUAccelerator::boBusyFence(b);
 				f->retain();
 				IOReturn r = fGPU->sleepOn(f, deadline);
 				f->release();
@@ -451,8 +461,7 @@ VivaGPUUserClient::dispatch(uint32_t selector, void *arg)
 			if (!syncobjValid(a->handle)) {
 				return kIOReturnBadArgument;
 			}
-			fGPU->fenceWake(fSyncobjs[a->handle].fence);
-			OSSafeReleaseNULL(fSyncobjs[a->handle].fence);
+			syncobjSet(a->handle, NULL);
 			fSyncobjs[a->handle].used = false;
 			return kIOReturnSuccess;
 		}
@@ -465,9 +474,7 @@ VivaGPUUserClient::dispatch(uint32_t selector, void *arg)
 			if (f != NULL) {
 				f->retain();
 			}
-			fGPU->fenceWake(fSyncobjs[a->dst].fence);
-			OSSafeReleaseNULL(fSyncobjs[a->dst].fence);
-			fSyncobjs[a->dst].fence = f;
+			syncobjSet(a->dst, f);          /* K0i: TRANSFER into a promise's syncobj resolves it */
 			return kIOReturnSuccess;
 		}
 		case VGPU_SEL_QUERY_BO_INFO: {
@@ -588,12 +595,69 @@ VivaGPUUserClient::createBO(struct vgpu_create_bo *a)
 	});
 }
 
+/* Gated: one SUBMIT, its arrays already read from the caller. */
 IOReturn
-VivaGPUUserClient::submit(struct vgpu_submit *a)
+VivaGPUUserClient::submitGated(struct vgpu_submit *a, const uint32_t *syncs, const uint32_t *handles)
 {
+	if (fVM == NULL) {
+		return kIOReturnNotOpen;
+	}
 	if (a->jc == 0 || a->jc < VGPU_VA_START || a->jc >= VGPU_VA_END) {
 		return kIOReturnBadArgument;
 	}
+	if (a->out_sync != 0 && !syncobjValid(a->out_sync)) {
+		return kIOReturnNotFound;
+	}
+	OSArray *deps = OSArray::withCapacity(a->in_sync_count ? a->in_sync_count : 1);
+	OSArray *bos = OSArray::withCapacity(a->bo_handle_count ? a->bo_handle_count : 1);
+	VivaGPUFence *fence = VivaGPUFence::create(false);
+	IOReturn r = (deps && bos && fence) ? kIOReturnSuccess : kIOReturnNoMemory;
+	for (uint32_t i = 0; r == kIOReturnSuccess && i < a->in_sync_count; i++) {
+		if (!syncobjValid(syncs[i])) {
+			r = kIOReturnNotFound;
+		} else if (fSyncobjs[syncs[i]].fence != NULL && !fSyncobjs[syncs[i]].fence->signalled) {
+			deps->setObject(fSyncobjs[syncs[i]].fence);
+		}
+	}
+	for (uint32_t i = 0; r == kIOReturnSuccess && i < a->bo_handle_count; i++) {
+		VivaGPUBO *b = bo(handles[i]);
+		if (b == NULL) {
+			r = kIOReturnNotFound;
+		} else {
+			bos->setObject(b);
+		}
+	}
+	/*
+	 * vivagpucache=2 (diagnosis): every CPU-maintained BO of the connection goes with the job, listed or
+	 * not, so a BO userspace forgot in bo_handles still gets its CPU writes cleaned before the job.
+	 */
+	for (uint32_t h = 1; r == kIOReturnSuccess && fGPU->cacheMode() == 2 && h < fBOCap; h++) {
+		VivaGPUBO *b = fBOs[h];
+		if (b != NULL && (b->cacheMaint || b->lazySurface) && bos->getNextIndexOfObject(b, 0) == (unsigned int)-1) {
+			bos->setObject(b);
+		}
+	}
+	uint64_t seq = 0;
+	if (r == kIOReturnSuccess) {
+		r = fGPU->submit(fVM, a->jc, a->requirements, deps, bos, fence, &seq);
+	}
+	if (r == kIOReturnSuccess) {
+		a->seq = (uint32_t)seq;
+		if (a->out_sync != 0) {
+			/* old fence's waiters re-check; a promise in the syncobj follows this job (K0i) */
+			fence->retain();
+			syncobjSet(a->out_sync, fence);
+		}
+	}
+	OSSafeReleaseNULL(deps);
+	OSSafeReleaseNULL(bos);
+	OSSafeReleaseNULL(fence);
+	return r;
+}
+
+IOReturn
+VivaGPUUserClient::submit(struct vgpu_submit *a)
+{
 	uint32_t *syncs = NULL, *handles = NULL;
 	size_t ssize = 0, hsize = 0;
 	IOReturn ret = copyinArray(a->in_syncs, a->in_sync_count, MAX_SYNCS, sizeof(uint32_t), (void **)&syncs, &ssize);
@@ -603,55 +667,7 @@ VivaGPUUserClient::submit(struct vgpu_submit *a)
 	}
 	if (ret == kIOReturnSuccess) {
 		ret = gated(VGPU_SEL_SUBMIT, ^IOReturn {
-			if (fVM == NULL) {
-				return kIOReturnNotOpen;
-			}
-			if (a->out_sync != 0 && !syncobjValid(a->out_sync)) {
-				return kIOReturnNotFound;
-			}
-			OSArray *deps = OSArray::withCapacity(a->in_sync_count ? a->in_sync_count : 1);
-			OSArray *bos = OSArray::withCapacity(a->bo_handle_count ? a->bo_handle_count : 1);
-			VivaGPUFence *fence = VivaGPUFence::create(false);
-			IOReturn r = (deps && bos && fence) ? kIOReturnSuccess : kIOReturnNoMemory;
-			for (uint32_t i = 0; r == kIOReturnSuccess && i < a->in_sync_count; i++) {
-				if (!syncobjValid(syncs[i])) {
-					r = kIOReturnNotFound;
-				} else if (fSyncobjs[syncs[i]].fence != NULL && !fSyncobjs[syncs[i]].fence->signalled) {
-					deps->setObject(fSyncobjs[syncs[i]].fence);
-				}
-			}
-			for (uint32_t i = 0; r == kIOReturnSuccess && i < a->bo_handle_count; i++) {
-				VivaGPUBO *b = bo(handles[i]);
-				if (b == NULL) {
-					r = kIOReturnNotFound;
-				} else {
-					bos->setObject(b);
-				}
-			}
-			/*
-			 * vivagpucache=2 (diagnosis): every CPU-maintained BO of the connection goes with the job, listed or
-			 * not, so a BO userspace forgot in bo_handles still gets its CPU writes cleaned before the job.
-			 */
-			for (uint32_t h = 1; r == kIOReturnSuccess && fGPU->cacheMode() == 2 && h < fBOCap; h++) {
-				VivaGPUBO *b = fBOs[h];
-				if (b != NULL && (b->cacheMaint || b->lazySurface) && bos->getNextIndexOfObject(b, 0) == (unsigned int)-1) {
-					bos->setObject(b);
-				}
-			}
-			if (r == kIOReturnSuccess) {
-				r = fGPU->submit(fVM, a->jc, a->requirements, deps, bos, fence);
-			}
-			if (r == kIOReturnSuccess && a->out_sync != 0) {
-				/* waiters of the old fence re-check the syncobj; WAIT_FOR_SUBMIT waiters are generic ones */
-				fGPU->fenceWake(fSyncobjs[a->out_sync].fence);
-				OSSafeReleaseNULL(fSyncobjs[a->out_sync].fence);
-				fSyncobjs[a->out_sync].fence = fence;
-				fence->retain();
-			}
-			OSSafeReleaseNULL(deps);
-			OSSafeReleaseNULL(bos);
-			OSSafeReleaseNULL(fence);
-			return r;
+			return submitGated(a, syncs, handles);
 		});
 	}
 	if (syncs != NULL) {
@@ -660,6 +676,113 @@ VivaGPUUserClient::submit(struct vgpu_submit *a)
 	if (handles != NULL) {
 		IOFreeData(handles, hsize);
 	}
+	return ret;
+}
+
+/*
+ * K0h: N submits, one call and one gate acquisition. Every array is read from the caller first (a bad pointer
+ * fails the whole call before anything is queued); then they are queued in order until one fails.
+ */
+#define MAX_BATCH 64
+IOReturn
+VivaGPUUserClient::submitBatch(struct vgpu_submit_batch *a)
+{
+	a->done = 0;
+	if (a->count == 0) {
+		return kIOReturnSuccess;
+	}
+	if (a->count > MAX_BATCH || a->stride != sizeof(struct vgpu_submit) || a->submits == 0) {
+		return kIOReturnBadArgument;
+	}
+	struct vgpu_submit *subs = NULL;
+	size_t subSize = 0;
+	IOReturn ret = copyinArray(a->submits, a->count, MAX_BATCH, sizeof(*subs), (void **)&subs, &subSize);
+	if (ret != kIOReturnSuccess) {
+		return ret;
+	}
+	uint32_t *syncs[MAX_BATCH] = { NULL }, *handles[MAX_BATCH] = { NULL };
+	size_t ssize[MAX_BATCH] = { 0 }, hsize[MAX_BATCH] = { 0 };
+	for (uint32_t i = 0; ret == kIOReturnSuccess && i < a->count; i++) {
+		ret = copyinArray(subs[i].in_syncs, subs[i].in_sync_count, MAX_SYNCS, sizeof(uint32_t), (void **)&syncs[i],
+		    &ssize[i]);
+		if (ret == kIOReturnSuccess) {
+			ret = copyinArray(subs[i].bo_handles, subs[i].bo_handle_count, MAX_BOS_PER_SUBMIT, sizeof(uint32_t),
+			    (void **)&handles[i], &hsize[i]);
+		}
+	}
+	__block uint32_t done = 0;
+	if (ret == kIOReturnSuccess) {
+		uint32_t *const *s = syncs, *const *h = handles;
+		ret = gated(VGPU_SEL_SUBMIT_BATCH, ^IOReturn {
+			for (uint32_t i = 0; i < a->count; i++) {
+				IOReturn r = submitGated(&subs[i], s[i], h[i]);
+				if (r != kIOReturnSuccess) {
+					return r;
+				}
+				done++;
+			}
+			return kIOReturnSuccess;
+		});
+	}
+	a->done = done;
+	if (done != 0 && copyout(subs, (user_addr_t)a->submits, done * sizeof(*subs)) != 0 && ret == kIOReturnSuccess) {
+		ret = kIOReturnBadArgument;     /* queued, but the seq numbers could not be written back */
+	}
+	for (uint32_t i = 0; i < a->count; i++) {
+		if (syncs[i] != NULL) {
+			IOFreeData(syncs[i], ssize[i]);
+		}
+		if (handles[i] != NULL) {
+			IOFreeData(handles[i], hsize[i]);
+		}
+	}
+	IOFreeData(subs, subSize);
+	return ret;
+}
+
+/* K0i: see struct vgpu_surface_promise. */
+#define MAX_PROMISE_SURFACES 16
+IOReturn
+VivaGPUUserClient::surfacePromise(struct vgpu_surface_promise *a)
+{
+	uint32_t *ids = NULL;
+	size_t isize = 0;
+	if (a->count == 0) {
+		return kIOReturnBadArgument;
+	}
+	IOReturn ret = copyinArray(a->surface_ids, a->count, MAX_PROMISE_SURFACES, sizeof(uint32_t), (void **)&ids, &isize);
+	if (ret != kIOReturnSuccess) {
+		return ret;
+	}
+	SweetSurface *surfaces[MAX_PROMISE_SURFACES] = { NULL };
+	for (uint32_t i = 0; ret == kIOReturnSuccess && i < a->count; i++) {
+		surfaces[i] = sweet_surface_copy(ids[i]);
+		if (surfaces[i] == NULL) {
+			ret = kIOReturnNotFound;
+		}
+	}
+	uint32_t timeoutMs = a->timeout_ms == 0 ? 1000 : MIN(a->timeout_ms, 5000u);
+	if (ret == kIOReturnSuccess) {
+		SweetSurface **list = surfaces;
+		ret = gated(VGPU_SEL_SURFACE_PROMISE, ^IOReturn {
+			if (fVM == NULL) {
+				return kIOReturnNotOpen;
+			}
+			if (!syncobjValid(a->syncobj)) {
+				return kIOReturnNotFound;
+			}
+			VivaGPUFence *p = fGPU->makePromise(fVM, timeoutMs, list, a->count);
+			if (p == NULL) {
+				return kIOReturnNoMemory;
+			}
+			syncobjSet(a->syncobj, p);      /* the reference moves into the syncobj */
+			return kIOReturnSuccess;
+		});
+	}
+	for (uint32_t i = 0; i < a->count; i++) {
+		OSSafeReleaseNULL(surfaces[i]);
+	}
+	IOFreeData(ids, isize);
 	return ret;
 }
 
@@ -889,6 +1012,16 @@ IOReturn
 VivaGPUUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options, IOMemoryDescriptor **memory)
 {
 	return fGPU->gate()->runActionBlock(^IOReturn {
+		if (type == VGPU_MAP_COMPLETION) {
+			/* K0h: the completion page, read-only for the process */
+			if (fVM == NULL || fVM->completionMD == NULL) {
+				return kIOReturnNotOpen;
+			}
+			fVM->completionMD->retain();
+			*options = kIOMapReadOnly;
+			*memory = fVM->completionMD;
+			return kIOReturnSuccess;
+		}
 		VivaGPUBO *b = bo(type);
 		if (b == NULL || b->memory == NULL || b->kind == kVivaBOHeap) {
 			return kIOReturnBadArgument;

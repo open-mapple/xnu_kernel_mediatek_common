@@ -400,8 +400,19 @@ VivaGPUFence::create(bool isSignalled)
 		f->error = kIOReturnSuccess;
 		f->signalAt = 0;
 		f->waiters = 0;
+		f->promise = false;
+		f->owner = NULL;
+		f->deadline = 0;
+		f->followers = NULL;
 	}
 	return f;
+}
+
+void
+VivaGPUFence::free(void)
+{
+	OSSafeReleaseNULL(followers);
+	OSObject::free();
 }
 
 /* ---- jobs ---- */
@@ -417,6 +428,8 @@ struct VivaGPUJob {
 	uint64_t      startMs;
 	uint32_t      flushId;  /* GPU_LATEST_FLUSH at submit (flush reduction) */
 	uint64_t      submitAt, startAt;        /* mach_absolute_time (latency accounting) */
+	uint64_t      seq;      /* K0h: number in its connection */
+	VivaGPUJob   *vmPrev, *vmNext;          /* the connection's unfinished jobs, in seq order */
 };
 
 /* ---- address spaces ---- */
@@ -439,11 +452,32 @@ VivaGPUVM::create(VivaGPUAccelerator *g)
 	vm->fPool = OSArray::withCapacity(4);
 	vm->fRangeCap = 64;
 	vm->fRanges = IONewZeroData(Range, vm->fRangeCap);
-	if (vm->fPool == NULL || vm->fRanges == NULL || (vm->rootPA = vm->newTable()) == 0) {
+	/* K0h completion page: one CPU page, mapped read-only by the process (VGPU_MAP_COMPLETION) */
+	vm->completionMD = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
+	    kIODirectionInOut | kIOMemoryKernelUserShared, page_size, page_size);
+	if (vm->completionMD != NULL) {
+		bzero(vm->completionMD->getBytesNoCopy(), page_size);
+		vm->completion = (struct vgpu_completion *)vm->completionMD->getBytesNoCopy();
+	}
+	if (vm->fPool == NULL || vm->fRanges == NULL || vm->completionMD == NULL || (vm->rootPA = vm->newTable()) == 0) {
 		vm->release();
 		return NULL;
 	}
 	return vm;
+}
+
+/* Gated: the completion page from seqNext/the oldest unfinished job (64-bit fields first, then the 32-bit ones). */
+void
+VivaGPUVM::seqUpdate(void)
+{
+	seqDone = jobHead != NULL ? jobHead->seq - 1 : seqNext;
+	if (completion == NULL) {
+		return;
+	}
+	completion->completed64 = seqDone;
+	completion->submitted64 = seqNext;
+	__atomic_store_n(&completion->submitted, (uint32_t)seqNext, __ATOMIC_RELEASE);
+	__atomic_store_n(&completion->completed, (uint32_t)seqDone, __ATOMIC_RELEASE);
 }
 
 void
@@ -462,6 +496,7 @@ VivaGPUVM::free(void)
 	if (inv != NULL) {
 		IODelete(inv, VivaGPUBO *, invCap);
 	}
+	OSSafeReleaseNULL(completionMD);
 	OSObject::free();
 }
 
@@ -982,6 +1017,7 @@ VivaGPUAccelerator::free(void)
 		IOSimpleLockFree(fCallLock);
 		fCallLock = NULL;
 	}
+	OSSafeReleaseNULL(fPromises);
 	if (fProbeLock != NULL) {
 		IOLockFree(fProbeLock);
 	}
@@ -2138,7 +2174,7 @@ VivaGPUAccelerator::findHeapBO(VivaGPUVM *vm, uint64_t va)
 
 IOReturn
 VivaGPUAccelerator::submit(VivaGPUVM *vm, uint64_t jc, uint32_t requirements, OSArray *deps, OSArray *bos,
-    VivaGPUFence *fence)
+    VivaGPUFence *fence, uint64_t *seqOut)
 {
 	if (!fPowered) {
 		return kIOReturnNotReady;
@@ -2178,12 +2214,24 @@ VivaGPUAccelerator::submit(VivaGPUVM *vm, uint64_t jc, uint32_t requirements, OS
 			bo->busy = fence;
 			if (bo->kind == kVivaBOSurface && bo->surface != NULL) {
 				SweetSurface *s = bo->surface;
-				addImplicitDep(deps, OSDynamicCast(VivaGPUFence, s->gpuFence), fence);
-				if (s->gpuFence != fence) {
-					fence->retain();
-					OSSafeReleaseNULL(s->gpuFence);
-					s->gpuFence = fence;
+				VivaGPUFence *last = OSDynamicCast(VivaGPUFence, s->gpuFence);
+				if (last != NULL && last->promise && !last->signalled) {
+					/*
+					 * K0i: a pending promise stays the surface's fence until it is resolved. Its owner's jobs
+					 * (the ones that will resolve it) wait for what came before it; anyone else's wait for it.
+					 */
+					addImplicitDep(deps, last->owner == vm ? OSDynamicCast(VivaGPUFence, s->gpuPrev) : last,
+					    fence);
 					s->gpuJobs++;
+				} else {
+					addImplicitDep(deps, last, fence);
+					if (s->gpuFence != fence) {
+						fence->retain();
+						OSSafeReleaseNULL(s->gpuFence);
+						OSSafeReleaseNULL(s->gpuPrev);
+						s->gpuFence = fence;
+						s->gpuJobs++;
+					}
 				}
 			}
 			uint64_t c0 = mach_absolute_time(), bytes = 0;
@@ -2204,6 +2252,19 @@ VivaGPUAccelerator::submit(VivaGPUVM *vm, uint64_t jc, uint32_t requirements, OS
 	job->fence = fence;
 	fence->retain();
 	job->submitAt = mach_absolute_time();
+	/* K0h: numbered in its connection, listed until it completes (completion page watermark) */
+	job->seq = ++vm->seqNext;
+	job->vmPrev = vm->jobTail;
+	if (vm->jobTail != NULL) {
+		vm->jobTail->vmNext = job;
+	} else {
+		vm->jobHead = job;
+	}
+	vm->jobTail = job;
+	vm->seqUpdate();
+	if (seqOut != NULL) {
+		*seqOut = job->seq;
+	}
 	uint32_t slot = (requirements & VGPU_JD_REQ_FS) ? 0 : 1;
 	if (fQueueTail[slot] != NULL) {
 		fQueueTail[slot]->next = job;
@@ -2237,13 +2298,26 @@ VivaGPUAccelerator::addImplicitDep(OSArray *deps, VivaGPUFence *f, VivaGPUFence 
 	}
 }
 
+VivaGPUFence *
+VivaGPUAccelerator::boBusyFence(VivaGPUBO *bo)
+{
+	if (bo->busy != NULL && !bo->busy->signalled) {
+		return bo->busy;
+	}
+	if (bo->kind != kVivaBOSurface || bo->surface == NULL) {
+		return NULL;
+	}
+	VivaGPUFence *f = OSDynamicCast(VivaGPUFence, bo->surface->gpuFence);
+	if (f != NULL && f->promise && !f->signalled && f->owner == bo->vm) {
+		f = OSDynamicCast(VivaGPUFence, bo->surface->gpuPrev);     /* our own promise: we resolve it */
+	}
+	return (f != NULL && !f->signalled) ? f : NULL;
+}
+
 bool
 VivaGPUAccelerator::boIdle(VivaGPUBO *bo)
 {
-	if (bo->busy != NULL && !bo->busy->signalled) {
-		return false;
-	}
-	return bo->kind != kVivaBOSurface || bo->surface == NULL || surfaceIdle(bo->surface, NULL);
+	return boBusyFence(bo) == NULL;
 }
 
 bool
@@ -2477,10 +2551,19 @@ VivaGPUAccelerator::completeJob(uint32_t slot, IOReturn error, uint32_t status, 
 		fDoneCacheNs += ns;
 		fDoneCacheBytes += bytes;
 	}
-	job->fence->signalled = true;
-	job->fence->error = error;
-	job->fence->signalAt = at;
-	fenceWake(job->fence);          /* K0g: only the threads waiting for this job (and the generic waiters) */
+	VivaGPUVM *vm = job->vm;
+	if (job->vmPrev != NULL) {
+		job->vmPrev->vmNext = job->vmNext;
+	} else if (vm->jobHead == job) {
+		vm->jobHead = job->vmNext;
+	}
+	if (job->vmNext != NULL) {
+		job->vmNext->vmPrev = job->vmPrev;
+	} else if (vm->jobTail == job) {
+		vm->jobTail = job->vmPrev;
+	}
+	vm->seqUpdate();                /* K0h: before the fence, so the page never lags what a wait already said */
+	signalFence(job->fence, error, at);     /* K0g: wakes only the threads waiting for this job (and the generic ones) */
 	OSSafeReleaseNULL(job->deps);
 	OSSafeReleaseNULL(job->bos);
 	OSSafeReleaseNULL(job->fence);
@@ -2932,7 +3015,7 @@ VivaGPUAccelerator::callStats(char **out, char *end)
 	static const char *const names[VGPU_SEL_COUNT] = {
 		"version", "param", "create_bo", "mmap_bo", "bo_offset", "gem_close", "submit", "wait_bo", "madvise",
 		"sync_create", "sync_destroy", "sync_wait", "sync_reset", "sync_signal", "import_surf", "sync_bo",
-		"bo_info", "ctx_create", "ctx_destroy", "sync_xfer", "import_user",
+		"bo_info", "ctx_create", "ctx_destroy", "sync_xfer", "import_user", "submit_batch", "surf_promise",
 	};
 	CallStat c[VGPU_SEL_COUNT];
 	IOInterruptState is = IOSimpleLockLockDisableInterrupt(fCallLock);
@@ -2951,6 +3034,8 @@ VivaGPUAccelerator::callStats(char **out, char *end)
 	}
 	say(out, end, "%s\nwaits: %llu sleeps (%llu woke with nothing done), %llu fence wakeups, %llu generic wakeups, %u generic "
 	    "waiters now\n", any ? "" : " none yet", fSleeps, fSleepsSpurious, fWakeFence, fWakeGeneric, fGenericWaiters);
+	say(out, end, "surface promises (K0i): %llu made, %u pending, %llu timed out\n", fPromisesMade,
+	    fPromises != NULL ? fPromises->getCount() : 0, fPromisesTimedOut);
 }
 
 /*
@@ -2997,12 +3082,18 @@ VivaGPUAccelerator::jobTimer(OSObject *owner, IOTimerEventSource *src __unused)
 		return;
 	}
 	self->fTimerArmed = false;
+	self->promiseTimeouts();
+	bool promises = self->fPromises != NULL && self->fPromises->getCount() != 0;
 	if (!self->fPowered) {
+		if (promises) {
+			self->fTimerArmed = true;
+			self->fTimer->setTimeoutMS(TIMER_MS);
+		}
 		return;
 	}
 	self->fastSync();
 	uint64_t now = nowMs();
-	bool busy = false;
+	bool busy = promises;
 	for (uint32_t slot = 0; slot < 2; slot++) {
 		VivaGPUJob *job = self->fRunning[slot];
 		if (job == NULL) {
@@ -3144,6 +3235,106 @@ VivaGPUAccelerator::fenceWake(VivaGPUFence *fence)
 		fGate->commandWakeup(fence, false);
 	}
 	wakeWaiters();
+}
+
+void
+VivaGPUAccelerator::signalFence(VivaGPUFence *fence, IOReturn error, uint64_t at)
+{
+	if (fence == NULL || fence->signalled) {
+		return;
+	}
+	fence->signalled = true;
+	fence->error = error;
+	fence->signalAt = at;
+	fenceWake(fence);
+	OSArray *followers = fence->followers;
+	fence->followers = NULL;
+	for (unsigned int i = 0; followers != NULL && i < followers->getCount(); i++) {
+		signalFence((VivaGPUFence *)followers->getObject(i), error, at);     /* promises resolved by it */
+	}
+	OSSafeReleaseNULL(followers);
+}
+
+/*
+ * K0i. A promise is a fence put on IOSurfaces before the jobs that write them exist (the Metal driver replays a
+ * command buffer after commit returns): readers (IOSurfaceLock, the display, other processes' jobs) wait for it
+ * instead of seeing the surface idle. It follows the fence that later replaces it in its syncobj.
+ */
+void
+VivaGPUAccelerator::resolvePromise(VivaGPUFence *p, VivaGPUFence *to)
+{
+	if (p == NULL || !p->promise || p->signalled || p == to) {
+		return;
+	}
+	if (to == NULL || to->signalled) {
+		signalFence(p, to != NULL ? to->error : kIOReturnSuccess, mach_absolute_time());
+		return;
+	}
+	if (to->followers == NULL) {
+		to->followers = OSArray::withCapacity(2);
+	}
+	if (to->followers == NULL || !to->followers->setObject(p)) {
+		signalFence(p, kIOReturnSuccess, mach_absolute_time());    /* no memory: never leave readers waiting */
+	}
+}
+
+VivaGPUFence *
+VivaGPUAccelerator::makePromise(VivaGPUVM *vm, uint32_t timeoutMs, SweetSurface **surfaces, uint32_t count)
+{
+	VivaGPUFence *p = VivaGPUFence::create(false);
+	if (p == NULL || (fPromises == NULL && (fPromises = OSArray::withCapacity(8)) == NULL) || !fPromises->setObject(p)) {
+		OSSafeReleaseNULL(p);
+		return NULL;
+	}
+	p->promise = true;
+	p->owner = vm;
+	clock_interval_to_deadline(timeoutMs, kMillisecondScale, &p->deadline);
+	for (uint32_t i = 0; i < count; i++) {
+		SweetSurface *s = surfaces[i];
+		VivaGPUFence *last = OSDynamicCast(VivaGPUFence, s->gpuFence);
+		if (last != NULL && last->promise && !last->signalled && last->owner == vm) {
+			/* an earlier promise of ours still pending: ours come after it, its predecessor stays the base */
+			last->retain();
+			OSSafeReleaseNULL(s->gpuPrev);
+			s->gpuPrev = last;
+		} else {
+			OSSafeReleaseNULL(s->gpuPrev);
+			s->gpuPrev = s->gpuFence;           /* the reference moves */
+			s->gpuFence = NULL;
+		}
+		OSSafeReleaseNULL(s->gpuFence);
+		p->retain();
+		s->gpuFence = p;
+		s->gpuJobs++;
+	}
+	fPromisesMade++;
+	if (!fTimerArmed) {
+		fTimerArmed = true;
+		fTimer->setTimeoutMS(TIMER_MS);
+	}
+	return p;
+}
+
+/* Gated (job timer): drop resolved promises, signal the ones past their deadline (their submit never came). */
+void
+VivaGPUAccelerator::promiseTimeouts(void)
+{
+	uint64_t now = mach_absolute_time();
+	for (unsigned int i = 0; fPromises != NULL && i < fPromises->getCount();) {
+		VivaGPUFence *p = (VivaGPUFence *)fPromises->getObject(i);
+		if (!p->signalled && now >= p->deadline) {
+			fPromisesTimedOut++;
+			if (fPromisesTimedOut <= 8) {
+				IOLog("VIVA GPU: surface promise not resolved in time, signalled (readers may see it unfinished)\n");
+			}
+			signalFence(p, kIOReturnTimeout, now);
+		}
+		if (p->signalled) {
+			fPromises->removeObject(i);
+		} else {
+			i++;
+		}
+	}
 }
 
 void

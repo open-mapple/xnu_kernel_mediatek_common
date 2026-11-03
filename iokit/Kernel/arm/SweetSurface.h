@@ -58,6 +58,11 @@ public:
 	 */
 	OSObject                 *gpuFence;
 	uint64_t                  gpuJobs;
+	/*
+	 * K0i: while gpuFence is a pending promise (SURFACE_PROMISE), the fence it replaced: the promise owner's own
+	 * jobs on the surface wait for this one, not for the promise they will resolve.
+	 */
+	OSObject                 *gpuPrev;
 
 	bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
 	void free() APPLE_KEXT_OVERRIDE;

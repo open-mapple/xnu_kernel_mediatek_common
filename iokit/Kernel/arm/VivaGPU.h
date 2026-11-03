@@ -50,6 +50,7 @@ enum { kVivaCacheClean, kVivaCacheFlush };
 void cacheBuffer(IOBufferMemoryDescriptor *md, uint64_t offset, uint64_t len, int op);
 class VivaGPUAccelerator;
 class VivaGPUBO;
+class VivaGPUVM;
 class SweetSurface;
 
 /* Metal of iOS 16 looks GPUs up with IOServiceMatching("IOAcceleratorES") (IOGPUFamily is not in this kernel). */
@@ -65,13 +66,21 @@ class VivaGPUFence : public OSObject {
 	OSDeclareDefaultStructors(VivaGPUFence);
 public:
 	static VivaGPUFence *create(bool signalled);
+	virtual void free(void) APPLE_KEXT_OVERRIDE;
 	bool     signalled;
 	IOReturn error;
 	uint64_t signalAt;      /* mach_absolute_time of the job's interrupt (0: signalled by hand or not yet) */
 	uint32_t waiters;       /* threads in sleepOn() for it (gated) */
+	/* K0i promise (SURFACE_PROMISE): signals when the fence it is linked to does, or at `deadline` */
+	bool       promise;
+	VivaGPUVM *owner;       /* connection that made it (compared only, not retained) */
+	uint64_t   deadline;    /* mach_absolute_time */
+	OSArray   *followers;   /* promises linked to this fence: signalled with it */
 };
 
 /* A GPU address space: AArch64 4K page tables plus the VA allocator for [VGPU_VA_START, VGPU_VA_END). */
+struct VivaGPUJob;
+
 class VivaGPUVM : public OSObject {
 	OSDeclareDefaultStructors(VivaGPUVM);
 public:
@@ -103,6 +112,15 @@ public:
 	int64_t    imported;            /* IOSurface / user memory mapped (not charged) */
 	uint32_t   bos;
 	VivaGPUVM *nextVM;              /* the accelerator's list of live VMs */
+	/*
+	 * K0h completion page: jobs numbered per connection (seq), unfinished ones in submit order (jobHead..jobTail),
+	 * page->completed = the highest seq with every job up to it finished.
+	 */
+	uint64_t   seqNext, seqDone;
+	VivaGPUJob *jobHead, *jobTail;
+	IOBufferMemoryDescriptor *completionMD;
+	struct vgpu_completion   *completion;
+	void       seqUpdate(void);
 
 	/*
 	 * Lazy invalidation (vivagpulazy=1): CPU-maintained BOs the GPU used since the CPU last dropped their lines.
@@ -185,11 +203,24 @@ public:
 
 	/* Gated. */
 	IOReturn submit(VivaGPUVM *vm, uint64_t jc, uint32_t requirements, OSArray *deps, OSArray *bos,
-	    VivaGPUFence *fence);
+	    VivaGPUFence *fence, uint64_t *seqOut = NULL);
+	/* Gated: signal `fence` (once), wake its waiters, signal the promises linked to it. */
+	void signalFence(VivaGPUFence *fence, IOReturn error, uint64_t at);
+	/*
+	 * Gated, K0i: the pending promise `p` is resolved by `to` (signals when `to` does; NULL or already signalled:
+	 * now). makePromise: a new pending promise of `vm` (timeout ms), set as the last fence of the surfaces.
+	 */
+	void resolvePromise(VivaGPUFence *p, VivaGPUFence *to);
+	VivaGPUFence *makePromise(VivaGPUVM *vm, uint32_t timeoutMs, SweetSurface **surfaces, uint32_t count);
 	/* Gated: sleep until the fence signals or the absolute deadline (0 = forever) passes. */
 	IOReturn waitFence(VivaGPUFence *fence, uint64_t deadline);
 	/* Gated: no pending job uses the BO (for an IOSurface: in any connection). */
 	static bool boIdle(VivaGPUBO *bo);
+	/*
+	 * Gated: the fence that ends GPU use of `bo` as seen by its connection: its last job, else (IOSurface) the
+	 * surface's last fence, or what came before the connection's own pending promise (K0i). NULL = idle.
+	 */
+	static VivaGPUFence *boBusyFence(VivaGPUBO *bo);
 	/* Gated: no pending job uses the surface (any connection); *jobs = jobs that used it so far. */
 	static bool surfaceIdle(SweetSurface *surface, uint64_t *jobs);
 	/*
@@ -388,6 +419,9 @@ private:
 	 * K0g. Wakeups (gated): fGenericWaiters threads in sleepUntil (fFenceEvent is only woken when there are some);
 	 * fence wakeups issued, generic wakeups issued, sleeps that ended with nothing changed (spurious).
 	 */
+	OSArray *fPromises;                 /* K0i: pending promises (their timeout, in jobTimer) */
+	uint64_t fPromisesMade, fPromisesTimedOut;
+	void promiseTimeouts(void);
 	uint32_t fGenericWaiters;
 	uint64_t fWakeFence, fWakeGeneric, fSleeps, fSleepsSpurious;
 	/* per selector: calls through the method / trap path, time from entry to return, time waiting for the gate */
@@ -462,6 +496,12 @@ private:
 	IOReturn gated(uint32_t selector, IOReturn (^block)(void));
 	IOReturn createBO(struct vgpu_create_bo *a);
 	IOReturn submit(struct vgpu_submit *a);
+	IOReturn submitBatch(struct vgpu_submit_batch *a);
+	IOReturn surfacePromise(struct vgpu_surface_promise *a);
+	/* gated part of a SUBMIT (syncs/handles already copied in) */
+	IOReturn submitGated(struct vgpu_submit *a, const uint32_t *syncs, const uint32_t *handles);
+	/* gated: the syncobj's fence becomes `f` (reference taken over): old waiters woken, a pending promise resolved */
+	void syncobjSet(uint32_t handle, VivaGPUFence *f);
 	IOReturn syncobjWait(struct vgpu_syncobj_wait *a);
 	IOReturn importSurface(struct vgpu_import_iosurface *a);
 	IOReturn importUser(struct vgpu_import_userptr *a);
