@@ -8,12 +8,14 @@
  * (drivers/soc/mediatek/mtk-pmic-wrap.c, pwrap_mt6781, viva-r-oss):
  *   wait WACS2_RDATA.FSM == IDLE, WACS2_CMD = (addr >> 1) << 16,
  *   wait FSM == WFVLDCLR, data = WACS2_RDATA[15:0], WACS2_VLDCLR = 1.
- * WACS2_CMD bit 31 would make it a PMIC *write*. This step is read-only:
- * there is no write path, and readPMIC() refuses anything that could set
- * bit 31. The regulators live in the same PMIC; writes come later, behind
- * an explicit register whitelist.
+ * A write is WACS2_CMD = 1 << 31 | (addr >> 1) << 16 | data. The regulators
+ * live in the same PMIC, so writePMIC() only accepts the interrupt enable
+ * SET/CLR and status registers of the PMIC interrupt groups (writeAllowed(),
+ * table in VivaPMIC.h); everything else is refused and logged.
  *
- * C entry point viva_pwrap_read() for the USB link's "pmic" command.
+ * The PMIC is a device-tree child (/arm-io/pwrap/pmic): published as a
+ * VivaDTNub, matched by VivaPMIC. C entry point viva_pwrap_read() for the
+ * USB link's "pmic" command (reads only).
  */
 #include <pexpert/arm64/board_config.h>
 
@@ -22,6 +24,9 @@
 #include <IOKit/IOService.h>
 #include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/IOLocks.h>
+#include <IOKit/IODeviceTreeSupport.h>
+
+#include "VivaPMIC.h"
 
 #define PWRAP_INIT_DONE0        0x090
 #define PWRAP_WACS2_EN          0x09c
@@ -43,24 +48,6 @@
 #define MT6358_PSC_TOP_INT_MASK_CON0 0x916
 #define MT6358_PSC_TOP_INT_STATUS0 0x91c
 #define MT6358_PSC_TOP_INT_RAW_STATUS0 0x91e
-
-class VivaPwrap : public IOService {
-	OSDeclareDefaultStructors(VivaPwrap);
-
-public:
-	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
-	IOReturn readPMIC(uint32_t addr, uint32_t *value);
-
-private:
-	bool waitFSM(uint32_t fsm);
-	inline uint32_t rd32(uint32_t off) { return *(volatile uint32_t *)(fRegs + off); }
-	inline void wr32(uint32_t off, uint32_t v) { *(volatile uint32_t *)(fRegs + off) = v; }
-
-	IOMemoryMap *fMap;
-	vm_offset_t  fRegs;
-	IOLock      *fLock;
-	uint32_t     fTimeouts;
-};
 
 OSDefineMetaClassAndStructors(VivaPwrap, IOService);
 
@@ -107,6 +94,7 @@ VivaPwrap::start(IOService *provider)
 
 	gVivaPwrap = this;
 	registerService();
+	VivaDTNub::publishChildren(this, provider);
 	return true;
 }
 
@@ -148,6 +136,79 @@ VivaPwrap::readPMIC(uint32_t addr, uint32_t *value)
 	}
 	IOLockUnlock(fLock);
 	return ret;
+}
+
+bool
+VivaPwrap::writeAllowed(uint32_t addr)
+{
+	for (unsigned int g = 0; g < kVivaPMICGroupCount; g++) {
+		const VivaPMICGroupRegs *r = &gVivaPMICGroups[g];
+		for (unsigned int n = 0; r->con0 != 0 && n < r->nregs; n++) {
+			uint32_t con = r->con0 + 6 * n;
+			if (addr == con + 2 || addr == con + 4 || addr == (uint32_t)(r->sta0 + 2 * n)) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+IOReturn
+VivaPwrap::writePMIC(uint32_t addr, uint32_t value)
+{
+	if (!writeAllowed(addr) || value > 0xffff) {
+		IOLog("VIVA PWRAP: refused PMIC write 0x%04x <- 0x%x\n", addr, value);
+		return kIOReturnNotPermitted;
+	}
+	IOReturn ret = kIOReturnTimeout;
+	IOLockLock(fLock);
+	if (WACS_FSM(rd32(PWRAP_WACS2_RDATA)) == WACS_FSM_WFVLDCLR) {
+		wr32(PWRAP_WACS2_VLDCLR, 1);
+	}
+	if (waitFSM(WACS_FSM_IDLE)) {
+		wr32(PWRAP_WACS2_CMD, 0x80000000u | ((addr >> 1) << 16) | value);
+		ret = kIOReturnSuccess;
+	}
+	IOLockUnlock(fLock);
+	return ret;
+}
+
+/* Device-tree children of the PMIC bus. */
+OSDefineMetaClassAndStructors(VivaDTNub, IOService);
+
+bool
+VivaDTNub::compareName(OSString *name, OSString **matched) const
+{
+	return IODTCompareNubName(this, name, matched);
+}
+
+void
+VivaDTNub::publishChildren(IOService *parent, IORegistryEntry *dtEntry)
+{
+	OSIterator *iter = dtEntry->getChildIterator(gIODTPlane);
+	if (iter == NULL) {
+		return;
+	}
+	OSArray *children = OSArray::withCapacity(4);
+	IORegistryEntry *child;
+	while (children && (child = (IORegistryEntry *)iter->getNextObject())) {
+		children->setObject(child);     /* init() below re-parents the entry: iterate a copy */
+	}
+	iter->release();
+	for (unsigned int i = 0; children && i < children->getCount(); i++) {
+		child = (IORegistryEntry *)children->getObject(i);
+		VivaDTNub *nub = new VivaDTNub;
+		if (nub == NULL) {
+			continue;
+		}
+		if (!nub->init(child, gIODTPlane) || !nub->attach(parent)) {
+			nub->release();
+			continue;
+		}
+		nub->registerService();
+		nub->release();
+	}
+	OSSafeReleaseNULL(children);
 }
 
 extern "C" int
