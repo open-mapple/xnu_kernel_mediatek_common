@@ -17,8 +17,8 @@
  * leniencies the userspace mock also has: an in-sync without a fence is no
  * dependency (DRM fails the submit), TRANSFER copies "no fence", and a
  * syncobj without a fence waits (times out) instead of failing with EINVAL.
- * Timeouts are absolute CLOCK_MONOTONIC nanoseconds (mach_continuous_time
- * on Darwin). WAIT_BO answers kIOReturnBusy (EBUSY) when the BO is still
+ * Timeouts are absolute CLOCK_MONOTONIC nanoseconds as userspace reads it
+ * (Darwin's Libc: calendar - boottime, viva_gpu_monotonic_ns; not Mach time). WAIT_BO answers kIOReturnBusy (EBUSY) when the BO is still
  * busy at the deadline, what Panfrost expects.
  */
 #include <pexpert/arm64/board_config.h>
@@ -50,8 +50,7 @@ OSDefineMetaClassAndStructors(VivaGPUUserClient, IOUserClient);
 static uint64_t
 deadlineFor(int64_t timeoutNs, bool *expired)
 {
-	uint64_t now;
-	absolutetime_to_nanoseconds(mach_continuous_time(), &now);
+	uint64_t now = viva_gpu_monotonic_ns();     /* the clock Mesa computed timeoutNs from */
 	*expired = false;
 	if (timeoutNs < 0 || (uint64_t)timeoutNs >= now + 365ull * 24 * 3600 * NSEC_PER_SEC) {
 		return 0;

@@ -315,6 +315,17 @@ nowMs(void)
 	return ns / NSEC_PER_MSEC;
 }
 
+uint64_t
+viva_gpu_monotonic_ns(void)
+{
+	clock_sec_t sec, bsec;
+	clock_usec_t usec, busec;
+	clock_get_calendar_microtime(&sec, &usec);
+	clock_get_boottime_microtime(&bsec, &busec);
+	int64_t us = ((int64_t)sec - (int64_t)bsec) * USEC_PER_SEC + ((int64_t)usec - (int64_t)busec);
+	return us > 0 ? (uint64_t)us * NSEC_PER_USEC : 0;
+}
+
 /*
  * CPU cache maintenance (to PoC) by kernel virtual address, always through a kernel mapping of the buffer.
  * (The "illegal PA 0x6860c000" panics that led here were 0x16860c000 truncated to 32 bits by XNU's
@@ -3072,6 +3083,11 @@ VivaGPUAccelerator::clocksDump(char **out, char *end)
 	}
 	say(out, end, "ap_pll_con3 0x%08x con4 0x%08x (CPU PLL hardware-control select bits)\n", rd32(fApmixed, PLL_AP_CON3),
 	    rd32(fApmixed, PLL_AP_CON4));
+	/* timeouts: userspace CLOCK_MONOTONIC (what deadlines use since 0120) vs Mach continuous time (before) */
+	uint64_t mono = viva_gpu_monotonic_ns(), cont;
+	absolutetime_to_nanoseconds(mach_continuous_time(), &cont);
+	say(out, end, "clocks: CLOCK_MONOTONIC (calendar - boottime) %llu ms, mach_continuous_time %llu ms, difference %lld ms\n",
+	    mono / NSEC_PER_MSEC, cont / NSEC_PER_MSEC, ((int64_t)cont - (int64_t)mono) / (int64_t)NSEC_PER_MSEC);
 }
 
 void

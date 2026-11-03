@@ -47,6 +47,12 @@ class VivaPwrap;
  * uses it runs, and dropping those dirty lines loses its writes (stale job descriptors: GPU faults, missing tiles).
  */
 enum { kVivaCacheClean, kVivaCacheFlush };
+/*
+ * Userspace's CLOCK_MONOTONIC in ns, the clock of every absolute timeout of the UAPI (Mesa: os_time_get_nano). On
+ * Darwin it is NOT mach_continuous_time: Libc computes it as gettimeofday - kern.boottime, so it follows the calendar
+ * (set by timed/NTP, slewed) and drifts from Mach time. Same formula here, from the same kernel values.
+ */
+uint64_t viva_gpu_monotonic_ns(void);
 void cacheBuffer(IOBufferMemoryDescriptor *md, uint64_t offset, uint64_t len, int op);
 class VivaGPUAccelerator;
 class VivaGPUBO;
