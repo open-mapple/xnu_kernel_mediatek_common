@@ -48,6 +48,8 @@ public:
 	volatile UInt32           cpuDirty;     /* the CPU may hold dirty lines (write lock since the last clean) */
 	volatile UInt32           gpuDirty;     /* a device wrote the memory since the CPU last dropped its lines */
 
+	OSDictionary             *values;       /* IOSurfaceSetValue (non-bulk), under the surface table lock */
+
 	bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
 	void free() APPLE_KEXT_OVERRIDE;
 
