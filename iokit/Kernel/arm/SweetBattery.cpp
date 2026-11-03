@@ -15,6 +15,8 @@
 /* bsd/dev/sweet_spmi.c */
 extern "C" int sweet_spmi_init(void);
 extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
+/* iokit/Kernel/arm/VivaBattery.cpp: viva's real battery driver will run */
+extern "C" bool viva_battery_present(void);
 
 class SweetBattery : public IOPMPowerSource {
 	OSDeclareDefaultStructors(SweetBattery);
@@ -259,6 +261,10 @@ SweetBattery::timerFired(OSObject *owner, IOTimerEventSource *sender)
 bool
 SweetBattery::start(IOService *provider)
 {
+	if (viva_battery_present()) {
+		IOLog("SWEET BATTERY: VivaBattery present, static source not published\n");
+		return false;
+	}
 	if (!IOPMPowerSource::start(provider)) {
 		return false;
 	}

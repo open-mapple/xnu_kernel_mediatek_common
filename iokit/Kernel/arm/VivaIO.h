@@ -4,10 +4,12 @@
  * VivaGPIO  (/arm-io/gpio, "mediatek,mt6781-gpio"): pin input/output for
  *           drivers; only the pins listed in the node's "output-pins" can be
  *           driven, everything else is refused.
- * VivaI2C   (/arm-io/i2c0, "mediatek,mt6781-i2c"): MediaTek I2C v2
- *           controller in FIFO mode (8 bytes per direction and transfer),
- *           interrupt driven; publishes its device-tree children as
- *           VivaDTNub nubs (property "i2c-address").
+ * VivaI2C   (/arm-io/i2c0, /arm-io/i2c3, "mediatek,mt6781-i2c"): MediaTek
+ *           I2C v2 controller in FIFO mode (8 bytes per direction and
+ *           transfer), interrupt driven; publishes its device-tree children
+ *           as VivaDTNub nubs (property "i2c-address"). "bus-id" = the SoC's
+ *           I2C number; optional reg 1 + "imp-cg-bit" = its IMP_IIC_WRAP
+ *           clock gate, opened at start if closed.
  */
 #ifndef _IOKIT_ARM_VIVAIO_H
 #define _IOKIT_ARM_VIVAIO_H
@@ -54,6 +56,9 @@ public:
 	 * Sleeps: not from interrupt context.
 	 */
 	IOReturn transfer(uint8_t addr, const uint8_t *wbuf, uint32_t wlen, uint8_t *rbuf, uint32_t rlen);
+	/* The started controller with this bus-id, waiting for it if needed (NULL after timeout). */
+	static VivaI2C *wait(uint32_t busId);
+	uint32_t busId(void) const { return fBusId; }
 
 private:
 	static void interruptOccurred(OSObject *owner, IOInterruptEventSource *src, int count);
@@ -68,7 +73,7 @@ private:
 	IOWorkLoop             *fWorkLoop;
 	IOCommandGate          *fGate;
 	IOInterruptEventSource *fInterrupt;
-	uint32_t                fSrcHz, fSpeedHz, fClockDiv;
+	uint32_t                fSrcHz, fSpeedHz, fClockDiv, fBusId;
 	uint16_t                fTiming, fLTiming, fHWTimeout, fExtConf;
 	volatile uint16_t       fIrqStat;
 	bool                    fDone;

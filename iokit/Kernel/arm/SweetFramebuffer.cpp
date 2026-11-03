@@ -256,6 +256,14 @@ public:
 OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
 
 static AppleCLCD *gSweetFB;     /* for the USB link "disp" command */
+static volatile uint32_t gSweetFbDutyCap;       /* sweet_fb_set_duty_cap (Low Power Mode); 0 = sweetfb_duty */
+
+/* Low Power Mode (VivaBattery.cpp): panel copies take at most `pct` % of one CPU (0 = sweetfb_duty again). */
+extern "C" void
+sweet_fb_set_duty_cap(uint32_t pct)
+{
+	gSweetFbDutyCap = pct > 100 ? 100 : pct;
+}
 
 class IOMobileFramebufferUserClient : public IOUserClient {
 	OSDeclareDefaultStructors(IOMobileFramebufferUserClient);
@@ -886,7 +894,8 @@ AppleCLCD::present(const uint8_t *rec, bool force, uint64_t jobs)
 	}
 	/* the next copy no sooner than its share of the CPU (sweetfb_duty) allows */
 	uint64_t t1 = mach_absolute_time(), ns;
-	fNextCopy = t1 + (t1 - t0) * (100 - fDuty) / fDuty;
+	uint32_t duty = gSweetFbDutyCap != 0 ? MIN(fDuty, gSweetFbDutyCap) : fDuty;   /* Low Power Mode */
+	fNextCopy = t1 + (t1 - t0) * (100 - duty) / duty;
 	absolutetime_to_nanoseconds(t1 - t0, &ns);
 	fCopies++;
 	fCopyNs += ns;

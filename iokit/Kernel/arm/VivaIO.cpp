@@ -145,7 +145,11 @@ VivaGPIO::getInput(uint32_t pin, bool *high)
 
 OSDefineMetaClassAndStructors(VivaI2C, IOService);
 
-static VivaI2C *gVivaI2C;
+#define VIVA_I2C_BUSES          8
+#define IMP_CG_STA              0xe00   /* clk-mt6781.c imp_cg_regs: 1 = gated */
+#define IMP_CG_CLR              0xe04
+
+static VivaI2C *gVivaI2C[VIVA_I2C_BUSES];
 
 static uint32_t
 dtU32(IOService *provider, const char *key, uint32_t dflt)
@@ -206,6 +210,26 @@ VivaI2C::start(IOService *provider)
 		return false;
 	}
 	fRegs = (vm_offset_t)fMap->getVirtualAddress();
+	fBusId = dtU32(provider, "bus-id", 0);
+	if (fBusId >= VIVA_I2C_BUSES) {
+		IOLog("VIVA I2C: bad bus-id %u\n", fBusId);
+		return false;
+	}
+	/* IMP_IIC_WRAP gate (reg 1): LK leaves the buses it used open; open ours if it did not */
+	uint32_t cgBit = dtU32(provider, "imp-cg-bit", 0xffffffff);
+	if (cgBit < 32) {
+		IOMemoryMap *cg = provider->mapDeviceMemoryWithIndex(1);
+		if (cg != NULL) {
+			volatile uint32_t *sta = (volatile uint32_t *)(cg->getVirtualAddress() + IMP_CG_STA);
+			uint32_t before = *sta;
+			if (before & (1u << cgBit)) {
+				*(volatile uint32_t *)(cg->getVirtualAddress() + IMP_CG_CLR) = 1u << cgBit;
+			}
+			IOLog("VIVA I2C: bus %u clock gate bit %u was %s, now 0x%08x\n", fBusId, cgBit,
+			    (before & (1u << cgBit)) ? "closed" : "open", *sta);
+			cg->release();
+		}
+	}
 	fClockDiv = dtU32(provider, "clock-div", 1);
 	fSrcHz = dtU32(provider, "source-clock", 0) / (fClockDiv ? fClockDiv : 1);
 	fSpeedHz = dtU32(provider, "clock-frequency", 400000);
@@ -233,22 +257,40 @@ VivaI2C::start(IOService *provider)
 	}
 	initHW();
 	fInterrupt->enable();
-	IOLog("VIVA I2C: %s, source %u Hz, %u Hz: timing 0x%04x ltiming 0x%04x hw_timeout 0x%04x\n",
-	    provider->getName(), fSrcHz, fSpeedHz, fTiming, fLTiming, fHWTimeout);
-	gVivaI2C = this;
+	IOLog("VIVA I2C: %s (bus %u), source %u Hz, %u Hz: timing 0x%04x ltiming 0x%04x hw_timeout 0x%04x\n",
+	    provider->getName(), fBusId, fSrcHz, fSpeedHz, fTiming, fLTiming, fHWTimeout);
+	gVivaI2C[fBusId] = this;
 	registerService();
 	VivaDTNub::publishChildren(this, provider);
 	return true;
 }
 
-/* USB link "i2c" commands (bsd/dev/viva_usb.c): one transaction on I2C0. */
+VivaI2C *
+VivaI2C::wait(uint32_t busId)
+{
+	if (busId >= VIVA_I2C_BUSES) {
+		return NULL;
+	}
+	for (int i = 0; i < 100 && gVivaI2C[busId] == NULL; i++) {
+		IOSleep(50);
+	}
+	return gVivaI2C[busId];
+}
+
+/* USB link "i2c"/"i2c8" commands (bsd/dev/viva_usb.c): one transaction on a bus. */
+extern "C" int
+viva_i2c_xfer_bus(uint32_t bus, uint8_t addr, const uint8_t *wbuf, uint32_t wlen, uint8_t *rbuf, uint32_t rlen)
+{
+	if (bus >= VIVA_I2C_BUSES || gVivaI2C[bus] == NULL) {
+		return -1;
+	}
+	return gVivaI2C[bus]->transfer(addr, wbuf, wlen, rbuf, rlen) == kIOReturnSuccess ? 0 : -2;
+}
+
 extern "C" int
 viva_i2c_xfer(uint8_t addr, const uint8_t *wbuf, uint32_t wlen, uint8_t *rbuf, uint32_t rlen)
 {
-	if (gVivaI2C == NULL) {
-		return -1;
-	}
-	return gVivaI2C->transfer(addr, wbuf, wlen, rbuf, rlen) == kIOReturnSuccess ? 0 : -2;
+	return viva_i2c_xfer_bus(0, addr, wbuf, wlen, rbuf, rlen);
 }
 
 void

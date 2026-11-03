@@ -269,6 +269,7 @@ enum { kMapMali, kMapMfgcfg, kMapSpm, kMapTopck, kMapApmixed, kMapInfra };
 
 static VivaGPUAccelerator *gVivaGPU;
 static uint32_t oppForMHz(uint32_t mhz);
+static volatile uint32_t gVivaGPUCapMHz;        /* viva_gpu_set_dvfs_cap (Low Power Mode, VivaBattery.cpp); 0 = none */
 
 static inline uint32_t rd32(vm_offset_t b, uint32_t o) { return *(volatile uint32_t *)(b + o); }
 static inline void wr32(vm_offset_t b, uint32_t o, uint32_t v) { *(volatile uint32_t *)(b + o) = v; }
@@ -3175,6 +3176,9 @@ VivaGPUAccelerator::dvfsSample(void)
 	fLoadPct = pct;
 	/* OPP indexes: 0 is the fastest; fOpp (vivagpufreq, "gpu freq") the slowest allowed, fDvfsFast the fastest */
 	uint32_t fast = MIN(fDvfsFast, fOpp), cur = fClockOpp, want = cur;
+	if (gVivaGPUCapMHz != 0) {
+		fast = MIN(MAX(fast, oppForMHz(gVivaGPUCapMHz)), fOpp);   /* Low Power Mode ceiling */
+	}
 	uint64_t msec = nowMs();
 	if (pct >= DVFS_UP_PCT) {
 		want = fast;
@@ -3700,6 +3704,13 @@ viva_gpu_surface_wait(SweetSurface *surface, uint32_t timeoutMs)
 		}
 		return kIOReturnSuccess;
 	});
+}
+
+/* Low Power Mode (VivaBattery.cpp): DVFS never goes above `mhz` (0 = vivagpufreqmax again); applied at the next sample. */
+extern "C" void
+viva_gpu_set_dvfs_cap(uint32_t mhz)
+{
+	gVivaGPUCapMHz = mhz;
 }
 
 extern "C" void

@@ -225,6 +225,8 @@ extern uint64_t sweet_log_position(void);
 extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
 extern int viva_pwrap_read(uint32_t addr, uint32_t *value);               /* iokit/Kernel/arm/VivaPwrap.cpp */
 extern int viva_i2c_xfer(uint8_t addr, const uint8_t *wbuf, uint32_t wlen, uint8_t *rbuf, uint32_t rlen); /* VivaIO.cpp */
+extern int viva_i2c_xfer_bus(uint32_t bus, uint8_t addr, const uint8_t *wbuf, uint32_t wlen, uint8_t *rbuf, uint32_t rlen);
+extern void viva_battery_link(const char *args, char *out, size_t outLen);   /* iokit/Kernel/arm/VivaBattery.cpp */
 extern void viva_gpu_link(const char *args, char *out, size_t outLen);       /* iokit/Kernel/arm/VivaGPU.cpp */
 extern void viva_disp_link(const char *args, char *out, size_t outLen);      /* iokit/Kernel/arm/SweetFramebuffer.cpp */
 extern int sweet_console_muted;                                             /* osfmk/console/serial_console.c */
@@ -896,6 +898,9 @@ vl_vivad_out(uint8_t *out, uint32_t max)
  *   pmic ADDR [N]     read N (max 32) 16-bit PMIC registers through pwrap (read only)
  *   i2c DEV REG N     read N (max 64) bytes from 16-bit register REG of I2C0 device DEV
  *   i2cw DEV REG B..  write bytes (max 6) to register REG of I2C0 device DEV
+ *   i2c8 BUS DEV REG N     read N (max 64) bytes from 8-bit register REG of device DEV on I2C bus BUS
+ *   i2c8w BUS DEV REG B..  write bytes (max 7) to 8-bit register REG of device DEV on I2C bus BUS
+ *   bat [poll|lpm on|off]  battery (VivaBattery.cpp): gauge, charger registers, Low Power Mode
  *   gpu [ARGS]        Mali driver (VivaGPU.cpp): status, mfg, on, off, regs, freq, selftest [fault], probe, publish
  *   push SIZE MODE FNV PATH  receive a file (raw OUT data follows; written to PATH.vivapush, renamed when
  *                     its FNV-1a matches; missing directories are created)
@@ -912,7 +917,7 @@ static void
 vl_command(void)
 {
 	char *c = vl.cmd, *rest;
-	uint64_t a, v;
+	uint64_t a, v, b8;
 
 	vl.cmds++;
 	vl.reply_len = vl.reply_pos = 0;
@@ -997,6 +1002,36 @@ vl_command(void)
 				vl_reply("\n");
 			}
 		}
+	} else if ((IS("i2c8") || IS("i2c8w")) && vl_arg(&rest, &b8) && vl_arg(&rest, &a) && vl_arg(&rest, &v)) {
+		uint8_t w[8] = { (uint8_t)v }, r[8];
+		uint64_t n = 0, b;
+		if (len == 5) {
+			while (n < 7 && vl_arg(&rest, &b)) {
+				w[1 + n++] = (uint8_t)b;
+			}
+			int err = viva_i2c_xfer_bus((uint32_t)b8, (uint8_t)a, w, 1 + (uint32_t)n, NULL, 0);
+			vl_reply("i2c%llu 0x%02llx 0x%02llx <- %llu bytes: %s\n", b8, a, v, n, err ? "error" : "ok");
+		} else {
+			(void)vl_arg(&rest, &n);
+			n = MIN(MAX(n, 1ull), 64ull);
+			for (uint64_t off = 0; off < n; off += 8) {
+				uint32_t k = (uint32_t)MIN(8ull, n - off);
+				w[0] = (uint8_t)(v + off);
+				if (viva_i2c_xfer_bus((uint32_t)b8, (uint8_t)a, w, 1, r, k)) {
+					vl_reply("i2c%llu 0x%02llx 0x%02llx: error\n", b8, a, v + off);
+					break;
+				}
+				vl_reply("i2c%llu 0x%02llx 0x%02llx:", b8, a, v + off);
+				for (uint32_t i = 0; i < k; i++) {
+					vl_reply(" %02x", r[i]);
+				}
+				vl_reply("\n");
+			}
+		}
+	} else if (IS("bat")) {
+		static char bat_reply[4000];
+		viva_battery_link(rest, bat_reply, sizeof(bat_reply));
+		vl_reply("%s", bat_reply);
 	} else if (IS("gpu")) {
 		static char gpu_reply[4000];  /* vl.reply holds 4096 */
 		viva_gpu_link(rest, gpu_reply, sizeof(gpu_reply));
@@ -1049,7 +1084,7 @@ vl_command(void)
 			delay(5000);
 		}
 	} else if (IS("help")) {
-		vl_reply("ping | stat | peek PA [WORDS] | poke PA VALUE | pmic ADDR [N] | i2c DEV REG N | i2cw DEV REG B.. | gpu [status|mfg|on|off|regs|freq [MHz]|selftest [fault]|probe|publish] | disp [regs|scanout on|off] | push SIZE MODE FNV PATH | pull PATH | run ARGS.. | vivad ps|kill ID|tests | rewind [BYTES] | console [on|off] | panic [TEXT] | reboot\n");
+		vl_reply("ping | stat | peek PA [WORDS] | poke PA VALUE | pmic ADDR [N] | i2c DEV REG N | i2cw DEV REG B.. | i2c8[w] BUS DEV REG N|B.. | bat [poll|lpm on|off] | gpu [status|mfg|on|off|regs|freq [MHz]|selftest [fault]|probe|publish] | disp [regs|scanout on|off] | push SIZE MODE FNV PATH | pull PATH | run ARGS.. | vivad ps|kill ID|tests | rewind [BYTES] | console [on|off] | panic [TEXT] | reboot\n");
 	} else {
 		vl_reply("unknown command: %s (try help)\n", c);
 	}
