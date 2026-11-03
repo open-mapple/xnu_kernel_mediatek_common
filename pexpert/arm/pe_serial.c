@@ -758,9 +758,14 @@ fbcon_transmit_ready(void)
 	return 1;
 }
 
+extern int sweet_console_muted;         /* osfmk/console/serial_console.c: set once the GUI presents */
+
 static void
 fbcon_transmit_data(uint8_t c)
 {
+	if (sweet_console_muted && !panic_active()) {
+		return;                 /* kprintf comes straight here, not through the muted console */
+	}
 	if (c == '\r') {
 		fbcon_col = 0;
 		return;

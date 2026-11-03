@@ -227,6 +227,7 @@ extern int viva_pwrap_read(uint32_t addr, uint32_t *value);               /* iok
 extern int viva_i2c_xfer(uint8_t addr, const uint8_t *wbuf, uint32_t wlen, uint8_t *rbuf, uint32_t rlen); /* VivaIO.cpp */
 extern void viva_gpu_link(const char *args, char *out, size_t outLen);       /* iokit/Kernel/arm/VivaGPU.cpp */
 extern void viva_disp_link(const char *args, char *out, size_t outLen);      /* iokit/Kernel/arm/SweetFramebuffer.cpp */
+extern int sweet_console_muted;                                             /* osfmk/console/serial_console.c */
 
 static void
 vl_sleep_ms(unsigned ms)
@@ -902,6 +903,7 @@ vl_vivad_out(uint8_t *out, uint32_t max)
  *   disp [ARGS]       display (SweetFramebuffer.cpp): status, regs (read only), scanout on|off
  *   run ARGS..        run a program through vivad (output as 'O' frames, "[ID] exit N" at the end)
  *   vivad TEXT        any other vivad command (ps, kill ID, tests)
+ *   console [on|off]  kernel text on the screen (off from the GUI's first frame with sweetfb_noconsole=1)
  *   panic [TEXT]      panic (to test the panic path)
  *   reboot            watchdog software reset (back through preloader/LK)
  * peek/poke have no guard: an address in a gated block can hang the bus.
@@ -1025,6 +1027,16 @@ vl_command(void)
 		(void)vl_arg(&rest, &back);
 		vl.log_pos = back >= total ? 0 : total - back;
 		vl_reply("log rewound to %llu\n", vl.log_pos);
+	} else if (IS("console")) {
+		while (*rest == ' ') {
+			rest++;
+		}
+		if (strncmp(rest, "on", 2) == 0) {
+			sweet_console_muted = 0;
+		} else if (strncmp(rest, "off", 3) == 0) {
+			sweet_console_muted = 1;
+		}
+		vl_reply("screen console %s (the link log gets everything either way)\n", sweet_console_muted ? "off" : "on");
 	} else if (IS("panic")) {
 		while (*rest == ' ') {
 			rest++;
@@ -1037,7 +1049,7 @@ vl_command(void)
 			delay(5000);
 		}
 	} else if (IS("help")) {
-		vl_reply("ping | stat | peek PA [WORDS] | poke PA VALUE | pmic ADDR [N] | i2c DEV REG N | i2cw DEV REG B.. | gpu [status|mfg|on|off|regs|freq [MHz]|selftest [fault]|probe|publish] | disp [regs|scanout on|off] | push SIZE MODE FNV PATH | pull PATH | run ARGS.. | vivad ps|kill ID|tests | rewind [BYTES] | panic [TEXT] | reboot\n");
+		vl_reply("ping | stat | peek PA [WORDS] | poke PA VALUE | pmic ADDR [N] | i2c DEV REG N | i2cw DEV REG B.. | gpu [status|mfg|on|off|regs|freq [MHz]|selftest [fault]|probe|publish] | disp [regs|scanout on|off] | push SIZE MODE FNV PATH | pull PATH | run ARGS.. | vivad ps|kill ID|tests | rewind [BYTES] | console [on|off] | panic [TEXT] | reboot\n");
 	} else {
 		vl_reply("unknown command: %s (try help)\n", c);
 	}
