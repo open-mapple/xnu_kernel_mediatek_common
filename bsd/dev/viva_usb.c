@@ -207,6 +207,7 @@ extern uint64_t sweet_log_position(void);
 extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
 extern int viva_pwrap_read(uint32_t addr, uint32_t *value);               /* iokit/Kernel/arm/VivaPwrap.cpp */
 extern int viva_i2c_xfer(uint8_t addr, const uint8_t *wbuf, uint32_t wlen, uint8_t *rbuf, uint32_t rlen); /* VivaIO.cpp */
+extern void viva_gpu_link(const char *args, char *out, size_t outLen);       /* iokit/Kernel/arm/VivaGPU.cpp */
 
 static void
 vl_sleep_ms(unsigned ms)
@@ -489,6 +490,7 @@ vl_arg(char **p, uint64_t *v)
  *   pmic ADDR [N]     read N (max 32) 16-bit PMIC registers through pwrap (read only)
  *   i2c DEV REG N     read N (max 64) bytes from 16-bit register REG of I2C0 device DEV
  *   i2cw DEV REG B..  write bytes (max 6) to register REG of I2C0 device DEV
+ *   gpu [ARGS]        Mali driver (VivaGPU.cpp): status, mfg, on, off, regs, selftest [fault], publish
  *   panic [TEXT]      panic (to test the panic path)
  *   reboot            watchdog software reset (back through preloader/LK)
  * peek/poke have no guard: an address in a gated block can hang the bus.
@@ -580,6 +582,10 @@ vl_command(void)
 				vl_reply("\n");
 			}
 		}
+	} else if (IS("gpu")) {
+		static char gpu_reply[3072];
+		viva_gpu_link(rest, gpu_reply, sizeof(gpu_reply));
+		vl_reply("%s", gpu_reply);
 	} else if (IS("rewind")) {
 		uint64_t total = sweet_log_position(), back = UINT64_MAX;
 		(void)vl_arg(&rest, &back);
@@ -597,7 +603,7 @@ vl_command(void)
 			delay(5000);
 		}
 	} else if (IS("help")) {
-		vl_reply("ping | stat | peek PA [WORDS] | poke PA VALUE | pmic ADDR [N] | i2c DEV REG N | i2cw DEV REG B.. | rewind [BYTES] | panic [TEXT] | reboot\n");
+		vl_reply("ping | stat | peek PA [WORDS] | poke PA VALUE | pmic ADDR [N] | i2c DEV REG N | i2cw DEV REG B.. | gpu [status|mfg|on|off|regs|selftest [fault]|publish] | rewind [BYTES] | panic [TEXT] | reboot\n");
 	} else {
 		vl_reply("unknown command: %s (try help)\n", c);
 	}

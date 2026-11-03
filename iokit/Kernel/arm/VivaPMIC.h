@@ -33,6 +33,13 @@ public:
 	/* Only the PMIC interrupt enable/status registers (writeAllowed) can be written. */
 	IOReturn writePMIC(uint32_t addr, uint32_t value);
 	static bool writeAllowed(uint32_t addr);
+	/*
+	 * GPU rails only (VGPU, VSRAM_GPU: enable bit and VOSEL, with a voltage ceiling):
+	 * read-modify-write of the bits in `mask`, read back. Everything else is refused.
+	 */
+	IOReturn writeRegulator(uint32_t addr, uint32_t mask, uint32_t value);
+	/* The started instance, waiting for it if needed (NULL after timeout). */
+	static VivaPwrap *wait(void);
 
 private:
 	bool waitFSM(uint32_t fsm);

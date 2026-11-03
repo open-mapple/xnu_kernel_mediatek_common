@@ -11,7 +11,9 @@
  * A write is WACS2_CMD = 1 << 31 | (addr >> 1) << 16 | data. The regulators
  * live in the same PMIC, so writePMIC() only accepts the interrupt enable
  * SET/CLR and status registers of the PMIC interrupt groups (writeAllowed(),
- * table in VivaPMIC.h); everything else is refused and logged.
+ * table in VivaPMIC.h), and writeRegulator() only the GPU rails' enable
+ * and VOSEL fields under a voltage ceiling (VivaGPU.cpp); everything else
+ * is refused and logged.
  *
  * The PMIC is a device-tree child (/arm-io/pwrap/pmic): published as a
  * VivaDTNub, matched by VivaPMIC. C entry point viva_pwrap_read() for the
@@ -171,6 +173,67 @@ VivaPwrap::writePMIC(uint32_t addr, uint32_t value)
 	}
 	IOLockUnlock(fLock);
 	return ret;
+}
+
+/*
+ * GPU rails (mt6358 registers.h / mt6358-regulator.c, viva-r-oss). VOSEL = (uV - 500000) / 6250;
+ * ceilings 0.9 V (VGPU) and 1.0 V (VSRAM_GPU), the top of the mt6781 OPP table.
+ */
+static const struct {
+	uint16_t addr, mask, max;
+} gVivaRegulatorRegs[] = {
+	{ 0x1508, 0x0001, 0x01 },       /* BUCK_VGPU_CON0: RG_BUCK_VGPU_EN */
+	{ 0x1526, 0x007f, 0x40 },       /* BUCK_VGPU_ELR0: RG_BUCK_VGPU_VOSEL, <= 0.9 V */
+	{ 0x1bc8, 0x0001, 0x01 },       /* LDO_VSRAM_GPU_CON0: RG_LDO_VSRAM_GPU_EN */
+	{ 0x1bf4, 0x007f, 0x50 },       /* LDO_VSRAM_CON3: RG_LDO_VSRAM_GPU_VOSEL, <= 1.0 V */
+};
+
+IOReturn
+VivaPwrap::writeRegulator(uint32_t addr, uint32_t mask, uint32_t value)
+{
+	unsigned int i;
+	for (i = 0; i < sizeof(gVivaRegulatorRegs) / sizeof(gVivaRegulatorRegs[0]); i++) {
+		if (gVivaRegulatorRegs[i].addr == addr) {
+			break;
+		}
+	}
+	if (i == sizeof(gVivaRegulatorRegs) / sizeof(gVivaRegulatorRegs[0]) || mask == 0 ||
+	    (mask & ~gVivaRegulatorRegs[i].mask) || (value & ~mask) ||
+	    value / (mask & -mask) > gVivaRegulatorRegs[i].max) {
+		IOLog("VIVA PWRAP: refused regulator write 0x%04x mask 0x%x <- 0x%x\n", addr, mask, value);
+		return kIOReturnNotPermitted;
+	}
+	uint32_t old = 0, now = 0;
+	IOReturn ret = readPMIC(addr, &old);
+	if (ret != kIOReturnSuccess) {
+		return ret;
+	}
+	uint32_t v = (old & ~mask) | value;
+	IOLockLock(fLock);
+	ret = kIOReturnTimeout;
+	if (WACS_FSM(rd32(PWRAP_WACS2_RDATA)) == WACS_FSM_WFVLDCLR) {
+		wr32(PWRAP_WACS2_VLDCLR, 1);
+	}
+	if (waitFSM(WACS_FSM_IDLE)) {
+		wr32(PWRAP_WACS2_CMD, 0x80000000u | ((addr >> 1) << 16) | (v & 0xffff));
+		ret = waitFSM(WACS_FSM_IDLE) ? kIOReturnSuccess : kIOReturnTimeout;
+	}
+	IOLockUnlock(fLock);
+	if (ret == kIOReturnSuccess && (readPMIC(addr, &now) != kIOReturnSuccess || (now & mask) != value)) {
+		ret = kIOReturnIOError;
+	}
+	IOLog("VIVA PWRAP: regulator 0x%04x 0x%04x -> 0x%04x (reads 0x%04x) %s\n", addr, old, v, now,
+	    ret == kIOReturnSuccess ? "ok" : "FAILED");
+	return ret;
+}
+
+VivaPwrap *
+VivaPwrap::wait(void)
+{
+	for (int i = 0; i < 100 && gVivaPwrap == NULL; i++) {
+		IOSleep(50);
+	}
+	return gVivaPwrap;
 }
 
 /* Device-tree children of the PMIC bus. */

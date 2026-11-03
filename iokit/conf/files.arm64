@@ -20,6 +20,8 @@ iokit/Kernel/arm/VivaPwrap.cpp                                   optional iokitc
 iokit/Kernel/arm/VivaEINT.cpp                                    optional iokitcpp
 iokit/Kernel/arm/VivaPMIC.cpp                                    optional iokitcpp
 iokit/Kernel/arm/VivaIO.cpp                                      optional iokitcpp
+iokit/Kernel/arm/VivaGPU.cpp                                     optional iokitcpp
+iokit/Kernel/arm/VivaGPUUserClient.cpp                           optional iokitcpp
 iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
 iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
 iokit/Kernel/arm/hid/VivaKeypad.cpp                              optional iokitcpp
