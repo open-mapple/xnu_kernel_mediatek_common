@@ -234,6 +234,8 @@ private:
 
 	/* counters */
 	uint64_t fJobs, fJobFaults, fMmuFaults, fGpuFaults, fResets, fTimeouts, fHeapGrows;
+	uint64_t fFaultsNoReset;            /* chains killed by an MMU fault without a GPU reset */
+	bool     fWatchFragment;            /* since then no fragment chain completed: short timeout on JS0 */
 
 	/* unknown user clients and property reads, for "gpu probe" (fProbeLock) */
 	IOLock *fProbeLock;
