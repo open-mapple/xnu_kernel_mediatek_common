@@ -36,9 +36,23 @@
  * allocates display-sized surfaces that way when scanout is on), only that
  * layer's address and pitch are changed to point at the surface (the
  * centered 1080x2400 window of the 1125x2436 surface): no CPU copy. Anything
- * else falls back to the copy with LK's address and pitch restored. The OVL
- * shadow registers are bypassed on MT6781, so the switch is not tied to
- * vblank yet (a frame may tear).
+ * else falls back to the copy. The OVL shadow registers are bypassed on
+ * MT6781: a layer register write takes effect at once, so it is made at a
+ * frame end (below).
+ *
+ * viva double buffer (K0d, boot-arg sweetfb_flip, 1 default): the copy goes
+ * to the panel buffer the layer is not reading, LK's buffer (fPhys) or the
+ * next one in LK's memory (LK reserves three), and the layer is switched to
+ * it at the next frame end. The frame end is the OVL's frame-complete status
+ * bit (INTSTA bit 1, polled; the OVL interrupt itself stays unused). The
+ * vsync timer is phase-locked to it: each tick fires fLead before the
+ * predicted frame end and, when a switch is pending, polls the bit until it
+ * rises (the switch happens with interrupts off right then, only if the bit
+ * was seen within a few microseconds of rising). Without a usable frame end,
+ * with the kernel console on screen, a swap of the default surface or a
+ * frame that does not cover the whole panel, the copy goes to the buffer on
+ * screen as before (a frame may tear). A panic points the layer back at
+ * LK's buffer, where the console draws (sweet_fb_panic_hook).
  *
  * GPU-drawn frames (K0c): backboardd hands a surface to SwapEnd right after
  * committing its command buffer, without waiting for the GPU (on Apple the
@@ -59,6 +73,7 @@
 #include "SweetSurface.h"
 
 extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+extern "C" void (*sweet_fb_panic_hook)(void);   /* pexpert/arm/pe_serial.c */
 
 #if defined(SWEET)
 #include <IOKit/IOService.h>
@@ -71,6 +86,7 @@ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
 #include <IOKit/system.h>
 #include <pexpert/pexpert.h>
 #include <kern/clock.h>
+#include <machine/machine_routines.h>
 #include <sys/proc.h>
 
 enum {
@@ -171,17 +187,50 @@ public:
 	uint32_t      fLkAddr, fLkPitch, fLkPitchMsb;
 	char          fScanLayer[16];
 	bool          fScanOn;        /* allowed */
-	bool          fScanActive;    /* the layer points at fScanSurface */
-	SweetSurface *fScanSurface;
 	uint64_t      fScanFrames, fScanFallbacks;
 	const char   *fScanWhy;       /* last reason for falling back */
 
+	/* what LK's layer reads (fScanLock): now, and from the next frame end */
+	struct Target {
+		uint32_t      addr, pitch, pitchMsb;
+		int           buf;            /* panel buffer 0/1, -1 = an IOSurface (scanout) */
+		SweetSurface *surface;        /* retained while the layer may read it */
+	};
+	Target        fShown, fNext;
+	bool          fNextValid;
+	/* K0d double buffer and frame end (see the top) */
+	uintptr_t     fBufKVA[2];     /* 0 = LK's buffer (fPixels), 1 = the next one in LK's memory */
+	uint64_t      fBufPA[2];
+	IOMemoryMap  *fBuf1Map;
+	bool          fFlipAllowed;   /* sweetfb_flip */
+	bool          fFlipTried, fFlipReady;
+	const char   *fFlipWhy;       /* why there are no flips */
+	int           fVblankOvl;     /* OVL whose frame-complete bit is polled */
+	bool          fVblankInten;   /* its FME_CPL interrupt enable had to be set for the bit to latch */
+	uint64_t      fPeriod, fLastVblank, fLead, fSlack;    /* absolute time */
+	uint32_t      fTickFrames;    /* panel frames per vsync tick (about 60 Hz) */
+	uint32_t      fMisses;        /* consecutive pending switches without a frame end */
+	bool          fResync;        /* the phase is unsure: poll up to a whole frame at the next switch */
+	uint64_t      fFlips, fFlipMissed, fFlipUnsure, fFlipEarly, fInPlace, fPolls, fPollAbs;
+
 	bool dispMap(void);
 	bool findLKLayer(char **out, char *end);
+	bool layerReads(uint64_t lo, uint64_t hi);
 	bool scanout(const uint8_t *rec);
 	bool layersIdle(const uint8_t *rec, uint64_t *jobs);
 	void scanoutStop(void);
 	void dispCommand(const char *args, char *out, size_t len);
+	Target bufTarget(int buf);
+	void layerWrite(const Target &t);
+	void layerApply(const Target &t);
+	void show(const Target &t);
+	void dropNext(void);
+	bool flipSetup(char **out, char *end);
+	bool vblankCalibrate(char **out, char *end);
+	uint64_t vblankPoll(uint64_t budget, const Target *t, bool *applied);
+	void vblankSeen(uint64_t at);
+	void vblankTick(void);
+	void rearm(IOTimerEventSource *timer);
 
 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
 	void addClient(IOMobileFramebufferUserClient *client);
@@ -273,6 +322,20 @@ AppleCLCD::start(IOService *provider)
 	PE_parse_boot_argn("sweetfb_gpuwait", &fGpuWaitMax, sizeof(fGpuWaitMax));
 	fScanOvl = -1;
 	fScanLock = IOLockAlloc();
+	if (fScanLock == NULL) {
+		return false;
+	}
+	fShown.buf = 0;
+	fBufKVA[0] = fPixels;
+	fBufPA[0] = fPhys;
+	fVblankOvl = -1;
+	int flip = 1;
+	PE_parse_boot_argn("sweetfb_flip", &flip, sizeof(flip));
+	fFlipAllowed = flip != 0;
+	uint32_t us = 1000;
+	PE_parse_boot_argn("sweetfb_lead", &us, sizeof(us));        /* tick this long before the frame end */
+	nanoseconds_to_absolutetime((uint64_t)MIN(MAX(us, 200u), 4000u) * 1000, &fLead);
+	nanoseconds_to_absolutetime(20 * 1000, &fSlack);
 	uint32_t scan = 0;
 	if (PE_parse_boot_argn("vivascanout", &scan, sizeof(scan)) && scan != 0) {
 		/* display-sized surfaces from now on contiguous; LK's layer is looked up at the first swap */
@@ -296,6 +359,7 @@ void
 AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
 {
 	AppleCLCD *fb = (AppleCLCD *)owner;
+	fb->vblankTick();               /* first: a pending layer switch happens at this frame end */
 	uint64_t now = mach_absolute_time();
 	uint64_t count = ++fb->fVsyncCount;
 	uint64_t values[6] = {
@@ -318,14 +382,22 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
 		}
 		IOLockUnlock(fb->fLock);
 		if (step <= 6) {
+			/* the buffer on screen (a scanned-out surface: LK's buffer at once) */
+			IOLockLock(fb->fScanLock);
+			fb->dropNext();
+			if (fb->fShown.buf < 0) {
+				fb->layerApply(fb->bufTarget(0));
+			}
+			uintptr_t px = fb->fBufKVA[fb->fShown.buf];
+			IOLockUnlock(fb->fScanLock);
 			for (uint32_t y = 0; y < fb->fHeight; y++) {
-				volatile uint32_t *row = (volatile uint32_t *)(fb->fPixels + (uint64_t)y * fb->fRowBytes);
+				volatile uint32_t *row = (volatile uint32_t *)(px + (uint64_t)y * fb->fRowBytes);
 				for (uint32_t x = 0; x < fb->fWidth; x++) {
 					row[x] = step < 6 ? (row[x] >> 1) & 0x7f7f7f7f : 0;
 				}
 			}
 		}
-		sender->setTimeoutUS(SWEET_FB_VSYNC_US);
+		fb->rearm(sender);
 		return;
 	}
 	/* scanout or a frame held back for the GPU: every vsync */
@@ -375,7 +447,24 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
 	if (recs != NULL) {
 		IOFreeData(recs, SWEET_FB_QUEUE * SWEET_FB_SWAP_REC_SIZE);
 	}
-	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
+	fb->rearm(sender);
+}
+
+/* Next vsync tick: fLead before a predicted frame end, about 60 Hz (without frame ends: every 16.7 ms). */
+void
+AppleCLCD::rearm(IOTimerEventSource *timer)
+{
+	if (!fFlipReady) {
+		timer->setTimeoutUS(SWEET_FB_VSYNC_US);
+		return;
+	}
+	uint64_t now = mach_absolute_time(), step = fPeriod * fTickFrames, next = fLastVblank + step;
+	uint64_t min = 0;
+	nanoseconds_to_absolutetime(300 * 1000, &min);
+	if (next < now + fLead + min) {
+		next += ((now + fLead + min - next) / step + 1) * step;
+	}
+	timer->wakeAtTime(next - fLead);
 }
 
 void
@@ -575,9 +664,12 @@ AppleCLCD::present(const uint8_t *rec, bool force, uint64_t jobs)
 	uint64_t jobsAfter = 0;
 
 	IOLockLock(fScanLock);
-	bool scanned = fScanOn && scanout(rec);
-	IOLockUnlock(fScanLock);
-	if (scanned) {
+	if (fFlipAllowed && !fFlipTried) {
+		fFlipTried = true;              /* once: findLKLayer and the frame-end calibration (< 0.1 s) */
+		flipSetup(NULL, NULL);
+	}
+	if (fScanOn && scanout(rec)) {
+		IOLockUnlock(fScanLock);
 		fGpuTicks = 0;
 		return true;
 	}
@@ -592,6 +684,15 @@ AppleCLCD::present(const uint8_t *rec, bool force, uint64_t jobs)
 	}
 	uint64_t t0 = mach_absolute_time();
 
+	/* each enabled layer clipped to the panel first: which buffer to draw in depends on what the frame covers */
+	struct Blit {
+		SweetSurface *s;
+		uintptr_t     src;
+		int32_t       sx, sy, dx, dy, w, h;
+		uint32_t      bpe;
+	} blit[SWEET_FB_LAYERS];
+	uint32_t nblit = 0;
+	bool full = false, usesDefault = false;
 	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
 		uint32_t id = get32(rec, 0x54 + 4 * layer);
 		const uint8_t *a = rec + 0x64 + 16 * layer;
@@ -612,11 +713,11 @@ AppleCLCD::present(const uint8_t *rec, bool force, uint64_t jobs)
 			    get32(a, 12), dx, dy, w, h);
 		}
 		if (s == NULL || s == fSurface) {
+			usesDefault |= s != NULL;       /* drawn straight into LK's buffer */
 			OSSafeReleaseNULL(s);
 			continue;
 		}
 		uintptr_t src = s->kernelAddress();
-		sweet_surface_before_cpu_access(s);     /* the GPU may have drawn it: no stale CPU lines */
 		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
 		if (w <= 0 || h <= 0) {
 			w = (int32_t)s->width;
@@ -662,17 +763,46 @@ AppleCLCD::present(const uint8_t *rec, bool force, uint64_t jobs)
 		uint32_t fmt = s->pixelFormat;
 		bool convert = fmt == SWEET_FB_FORMAT_W30R || fmt == SWEET_FB_FORMAT_L10R ||
 		    ((fmt == SWEET_FB_FORMAT_W40A || fmt == SWEET_FB_FORMAT_W40M) && bpe == 8);
-		if (src != 0 && convert) {
-			for (int32_t y = 0; y < h; y++) {
-				sweet_fb_convert_row((uint32_t *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
-				    (const uint8_t *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * bpe),
-				    w, fmt);
-			}
-		} else if (src != 0 && bpe == 4) {
-			for (int32_t y = 0; y < h; y++) {
-				memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
-				    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
-				    (size_t)w * 4);
+		if (src != 0 && !convert && bpe != 4) {
+			src = 0;
+		}
+		if (src != 0 && dx == 0 && dy == 0 && w == (int32_t)fWidth && h == (int32_t)fHeight) {
+			full = true;
+		}
+		blit[nblit++] = { s, src, sx, sy, dx, dy, w, h, bpe };
+	}
+
+	/*
+	 * K0d: into the buffer not on screen when the frame covers the whole panel (switched at the next frame end),
+	 * else into the one on screen (LK's when the console or the default surface must be seen).
+	 */
+	int shownBuf = fShown.buf;
+	int buf;
+	if (!sweet_console_muted || usesDefault) {
+		buf = 0;
+	} else if (fFlipReady && full) {
+		buf = shownBuf == 0 ? 1 : 0;
+	} else {
+		buf = shownBuf >= 0 ? shownBuf : 0;
+	}
+	uintptr_t dst = fBufKVA[buf];
+	for (uint32_t i = 0; i < nblit; i++) {
+		Blit *bl = &blit[i];
+		SweetSurface *s = bl->s;
+		if (bl->src != 0) {
+			sweet_surface_before_cpu_access(s);     /* the GPU may have drawn it: no stale CPU lines */
+			uint32_t fmt = s->pixelFormat;
+			bool convert = fmt == SWEET_FB_FORMAT_W30R || fmt == SWEET_FB_FORMAT_L10R ||
+			    ((fmt == SWEET_FB_FORMAT_W40A || fmt == SWEET_FB_FORMAT_W40M) && bl->bpe == 8);
+			for (int32_t y = 0; y < bl->h; y++) {
+				uint32_t *to = (uint32_t *)(dst + (uint64_t)(bl->dy + y) * fRowBytes + (uint64_t)bl->dx * 4);
+				const uint8_t *from = (const uint8_t *)(bl->src + s->offset + (uint64_t)(bl->sy + y) * s->bytesPerRow +
+				    (uint64_t)bl->sx * bl->bpe);
+				if (convert) {
+					sweet_fb_convert_row(to, from, bl->w, fmt);
+				} else {
+					memcpy(to, from, (size_t)bl->w * 4);
+				}
 			}
 		}
 		s->release();
@@ -685,10 +815,18 @@ AppleCLCD::present(const uint8_t *rec, bool force, uint64_t jobs)
 	fCopyNs += ns;
 	/* a GPU job used a surface while it was copied (CoreAnimation reuses it): the copy may be mixed, redo it */
 	if (!force && (!layersIdle(rec, &jobsAfter) || jobsAfter != jobs)) {
+		IOLockUnlock(fScanLock);
 		fGpuTicks++;
 		fGpuRecopies++;
 		return false;
 	}
+	if (buf == shownBuf) {
+		dropNext();                     /* drawn in place: an older pending switch would go back in time */
+		fInPlace++;
+	} else {
+		show(bufTarget(buf));
+	}
+	IOLockUnlock(fScanLock);
 	fGpuTicks = 0;
 	return true;
 }
@@ -715,6 +853,10 @@ AppleCLCD::present(const uint8_t *rec, bool force, uint64_t jobs)
 #define OVL_EL_PITCH(k)         (0x344 + 0x20 * (k))
 #define OVL_EL_ADDR(k)          (0xfb0 + 4 * (k))
 #define LARB_NON_SEC_CON(p)     (0x380 + 4 * (p))       /* bit 0: port translated by the M4U (inferred) */
+#define OVL_INTEN               0x004
+#define OVL_INTSTA              0x008   /* write 0 to a bit to clear it */
+#define OVL_INT_FME_CPL         (1u << 1)       /* frame complete */
+#define OVL_ADDCON_DBG          0x244   /* [12:0] x, [28:16] y of the pixel being blended */
 
 
 static inline uint32_t
@@ -744,6 +886,19 @@ disp_say(char **p, char *end, const char *fmt, ...)
 	va_end(ap);
 	if (n > 0) {
 		*p += MIN((size_t)n, (size_t)(end - *p - 1));
+	}
+}
+
+/* A panic draws into LK's buffer: show it (any context; registers only). */
+static void
+sweet_fb_panic_show(void)
+{
+	AppleCLCD *fb = gSweetFB;
+	if (fb != NULL && fb->fScanOvl >= 0) {
+		vm_offset_t base = fb->fDisp[fb->fScanOvl];
+		disp_wr(base, fb->fScanPitchMsbReg, fb->fLkPitchMsb);
+		disp_wr(base, fb->fScanPitchReg, fb->fLkPitch);
+		disp_wr(base, fb->fScanAddrReg, fb->fLkAddr);
 	}
 }
 
@@ -812,6 +967,7 @@ AppleCLCD::findLKLayer(char **out, char *end)
 	fLkAddr = disp_rd(b, fScanAddrReg);
 	fLkPitch = disp_rd(b, fScanPitchReg);
 	fLkPitchMsb = disp_rd(b, fScanPitchMsbReg);
+	sweet_fb_panic_hook = sweet_fb_panic_show;      /* from now on the layer may read something else */
 	/* OVL0 reads through SMI larb0 ports 1-2, OVL0_2L through larb1 ports 0-1 */
 	vm_offset_t larb = fDisp[fScanOvl ? 3 : 2];
 	uint32_t p0 = disp_rd(larb, LARB_NON_SEC_CON(fScanOvl ? 0 : 1)), p1 = disp_rd(larb, LARB_NON_SEC_CON(fScanOvl ? 1 : 2));
@@ -862,44 +1018,338 @@ AppleCLCD::scanout(const uint8_t *rec)
 			fScanWhy = why;
 		}
 		OSSafeReleaseNULL(s);
-		scanoutStop();
+		if (!fFlipReady) {
+			scanoutStop();          /* LK's buffer at once; with flips the copy's buffer follows at a frame end */
+		}
 		fScanFallbacks++;
 		return false;
 	}
 	sweet_surface_before_device_read(s);    /* CPU-drawn pixels out of the caches */
-	uint32_t addr = (uint32_t)(pa + s->offset + (uint64_t)fOffY * s->bytesPerRow + (uint64_t)fOffX * 4);
-	vm_offset_t base = fDisp[fScanOvl];
-	disp_wr(base, fScanPitchMsbReg, (fLkPitchMsb & ~0xfu) | ((s->bytesPerRow >> 16) & 0xf));
-	disp_wr(base, fScanPitchReg, (fLkPitch & ~0xffffu) | (s->bytesPerRow & 0xffff));
-	disp_wr(base, fScanAddrReg, addr);
-	if (!fScanActive || fScanWhy != NULL) {
-		IOLog("SWEET FB: scanout: %s reads surface %u at 0x%08x (pitch %u)\n", fScanLayer, s->id, addr,
-		    s->bytesPerRow);
+	Target t;
+	t.addr = (uint32_t)(pa + s->offset + (uint64_t)fOffY * s->bytesPerRow + (uint64_t)fOffX * 4);
+	t.pitchMsb = (fLkPitchMsb & ~0xfu) | ((s->bytesPerRow >> 16) & 0xf);
+	t.pitch = (fLkPitch & ~0xffffu) | (s->bytesPerRow & 0xffff);
+	t.buf = -1;
+	t.surface = s;                          /* keeps the memory alive while the OVL reads it */
+	if (fShown.buf >= 0 || fScanWhy != NULL) {
+		IOLog("SWEET FB: scanout: %s reads surface %u at 0x%08x (pitch %u)%s\n", fScanLayer, s->id, t.addr,
+		    s->bytesPerRow, fFlipReady ? " from the next frame end" : "");
 		fScanWhy = NULL;
 	}
-	fScanActive = true;
-	SweetSurface *old = fScanSurface;
-	fScanSurface = s;                       /* keeps the memory alive while the OVL reads it */
-	OSSafeReleaseNULL(old);
+	show(t);
 	fScanFrames++;
 	return true;
 }
 
-/* Back to LK's buffer (the CPU copy). */
+/* Back to LK's buffer (the CPU copy), at once. */
 void
 AppleCLCD::scanoutStop(void)
 {
-	if (fScanActive && fScanOvl >= 0) {
-		vm_offset_t base = fDisp[fScanOvl];
-		disp_wr(base, fScanAddrReg, fLkAddr);
-		disp_wr(base, fScanPitchMsbReg, fLkPitchMsb);
-		disp_wr(base, fScanPitchReg, fLkPitch);
+	dropNext();
+	if (fShown.buf < 0) {
+		layerApply(bufTarget(0));
 	}
-	fScanActive = false;
-	OSSafeReleaseNULL(fScanSurface);
 }
 
-/* USB link "disp [regs|scanout on|off]". */
+/* ---- K0d: layer switches at the panel's frame end ---- */
+
+AppleCLCD::Target
+AppleCLCD::bufTarget(int buf)
+{
+	Target t;
+	t.addr = (uint32_t)fBufPA[buf];
+	t.pitch = fLkPitch;
+	t.pitchMsb = fLkPitchMsb;
+	t.buf = buf;
+	t.surface = NULL;
+	return t;
+}
+
+void
+AppleCLCD::layerWrite(const Target &t)
+{
+	if (fScanOvl < 0) {
+		return;                 /* LK's layer unknown: only its own buffer is ever shown */
+	}
+	vm_offset_t base = fDisp[fScanOvl];
+	disp_wr(base, fScanPitchMsbReg, t.pitchMsb);
+	disp_wr(base, fScanPitchReg, t.pitch);
+	disp_wr(base, fScanAddrReg, t.addr);
+}
+
+/* fScanLock: t is on the layer from now on (written already when written is true); takes t's surface reference. */
+void
+AppleCLCD::layerApply(const Target &t)
+{
+	layerWrite(t);
+	SweetSurface *old = fShown.surface;
+	fShown = t;
+	OSSafeReleaseNULL(old);
+}
+
+/* fScanLock: show t from the next frame end (with flips) or at once; takes t's surface reference. */
+void
+AppleCLCD::show(const Target &t)
+{
+	if (!fFlipReady) {
+		layerApply(t);
+		return;
+	}
+	dropNext();
+	fNext = t;
+	fNextValid = true;
+}
+
+void
+AppleCLCD::dropNext(void)
+{
+	if (fNextValid) {
+		OSSafeReleaseNULL(fNext.surface);
+		fNextValid = false;
+	}
+}
+
+/* Any enabled OVL layer (except LK's) reading [lo, hi). */
+bool
+AppleCLCD::layerReads(uint64_t lo, uint64_t hi)
+{
+	for (int o = 0; o < 2; o++) {
+		vm_offset_t b = fDisp[o];
+		if (!(disp_rd(b, OVL_EN) & 1)) {
+			continue;
+		}
+		for (int n = 0; n < (o ? 2 : 4); n++) {
+			uint32_t addr = disp_rd(b, OVL_L_ADDR(n));
+			if ((disp_rd(b, OVL_SRC_CON) & (1u << n)) && addr >= lo && addr < hi &&
+			    !(o == fScanOvl && OVL_L_ADDR(n) == fScanAddrReg)) {
+				return true;
+			}
+		}
+		for (int k = 0; o == 0 && k < 3; k++) {
+			uint32_t addr = disp_rd(b, OVL_EL_ADDR(k));
+			if ((disp_rd(b, OVL_DATAPATH_EXT_CON) & (1u << k)) && addr >= lo && addr < hi &&
+			    !(o == fScanOvl && OVL_EL_ADDR(k) == fScanAddrReg)) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+/*
+ * fScanLock. Double buffering: LK's layer must read LK's buffer (fPhys), LK's next buffer must be read by no other
+ * layer, and the OVL must report frame ends. Otherwise fFlipWhy says why and everything stays as before.
+ */
+bool
+AppleCLCD::flipSetup(char **out, char *end)
+{
+	fFlipReady = false;
+	dropNext();
+	uint64_t size = (uint64_t)fRowBytes * fHeight, pa1 = fPhys + size;
+	const char *why = NULL;
+	if (fScanOvl < 0 && !findLKLayer(out, end)) {
+		why = "LK's layer not found";
+	} else if (fLkAddr != fPhys) {
+		why = "LK's layer does not read the boot framebuffer";
+	} else if (pa1 + size > (1ull << 32)) {
+		why = "LK's next buffer above 4 GiB";
+	} else if (layerReads(pa1, pa1 + size)) {
+		why = "another OVL layer reads LK's next buffer";
+	} else {
+		if (fBuf1Map == NULL) {
+			IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(pa1, size, kIODirectionInOut);
+			fBuf1Map = md != NULL ? md->map(kIOMapWriteCombineCache) : NULL;
+			OSSafeReleaseNULL(md);
+		}
+		if (fBuf1Map == NULL) {
+			why = "LK's next buffer not mappable";
+		} else {
+			fBufKVA[1] = (uintptr_t)fBuf1Map->getVirtualAddress();
+			fBufPA[1] = pa1;
+			if (!vblankCalibrate(out, end)) {
+				why = "no frame-end status from the OVL";
+			}
+		}
+	}
+	fFlipWhy = why;
+	if (why != NULL) {
+		IOLog("SWEET FB: double buffer off (%s): copies go to the buffer on screen\n", why);
+		disp_say(out, end, "double buffer off: %s\n", why);
+		return false;
+	}
+	uint64_t ns;
+	absolutetime_to_nanoseconds(fPeriod, &ns);
+	IOLog("SWEET FB: double buffer: 0x%llx / 0x%llx, frame end from %s INTSTA%s, panel frame %llu us, vsync every %u "
+	    "frame(s)\n", fBufPA[0], fBufPA[1], fVblankOvl ? "OVL0_2L" : "OVL0", fVblankInten ? " (INTEN set)" : "",
+	    ns / 1000, fTickFrames);
+	disp_say(out, end, "double buffer on: 0x%llx / 0x%llx, frame %llu us\n", fBufPA[0], fBufPA[1], ns / 1000);
+	fMisses = 0;
+	fResync = false;
+	fFlipReady = true;
+	return true;
+}
+
+/*
+ * fScanLock. Three frame ends in a row on LK's OVL (or the other one, which runs in the same pipe), first with the
+ * status bit as LK left the interrupt enables, then with FME_CPL enabled (the OVL's GIC line has no handler: the GIC
+ * driver masks it if it ever fires). Busy for at most ~0.25 s, once.
+ */
+bool
+AppleCLCD::vblankCalibrate(char **out, char *end)
+{
+	uint64_t limit, lo, hi;
+	nanoseconds_to_absolutetime(40 * 1000 * 1000, &limit);
+	nanoseconds_to_absolutetime(4 * 1000 * 1000, &lo);
+	nanoseconds_to_absolutetime(40 * 1000 * 1000, &hi);
+	for (int k = 0; k < 2; k++) {
+		int o = k == 0 ? fScanOvl : 1 - fScanOvl;
+		vm_offset_t b = fDisp[o];
+		if (!(disp_rd(b, OVL_EN) & 1)) {
+			continue;
+		}
+		for (int inten = 0; inten < 2; inten++) {
+			uint32_t was = disp_rd(b, OVL_INTEN);
+			if (inten) {
+				if (was & OVL_INT_FME_CPL) {
+					break;
+				}
+				disp_wr(b, OVL_INTEN, was | OVL_INT_FME_CPL);
+			}
+			fVblankOvl = o;
+			uint64_t t[3] = { 0, 0, 0 };
+			bool applied;
+			for (int i = 0; i < 3; i++) {
+				t[i] = vblankPoll(limit, NULL, &applied);
+				if (t[i] == 0) {
+					break;
+				}
+			}
+			uint64_t p1 = t[1] - t[0], p2 = t[2] - t[1];
+			if (t[2] != 0 && p1 >= lo && p1 <= hi && (p1 > p2 ? p1 - p2 : p2 - p1) <= p1 / 10) {
+				fVblankInten = inten != 0;
+				fPeriod = (t[2] - t[0]) / 2;
+				fLastVblank = t[2];
+				uint64_t tick;
+				nanoseconds_to_absolutetime((uint64_t)SWEET_FB_VSYNC_US * 1000, &tick);
+				fTickFrames = (uint32_t)MAX((tick + fPeriod / 2) / fPeriod, 1ull);
+				return true;
+			}
+			disp_say(out, end, "%s INTSTA (INTEN %s): frame ends at +0 / +%llu / +%llu ticks: not usable\n",
+			    o ? "OVL0_2L" : "OVL0", inten ? "set" : "as LK left it", t[1] ? p1 : 0, t[2] ? p2 : 0);
+			if (inten) {
+				disp_wr(b, OVL_INTEN, was);
+			}
+		}
+	}
+	fVblankOvl = -1;
+	return false;
+}
+
+/*
+ * fScanLock. Busy-poll fVblankOvl's frame-complete bit for at most `budget` (absolute time), the bit cleared first
+ * (older frame ends are of no use). Returns when it rose, 0 = not within the budget. With t, the layer registers
+ * are written right then, interrupts off from reading the bit to the last write, unless the previous read was more
+ * than fSlack earlier (the poll was held up: the frame end may be long past, too late to switch safely).
+ */
+uint64_t
+AppleCLCD::vblankPoll(uint64_t budget, const Target *t, bool *applied)
+{
+	vm_offset_t b = fDisp[fVblankOvl];
+	*applied = false;
+	disp_wr(b, OVL_INTSTA, disp_rd(b, OVL_INTSTA) & ~OVL_INT_FME_CPL);
+	uint64_t t0 = mach_absolute_time(), prev = t0, now = t0, edge = 0;
+	while (now - t0 < budget) {
+		boolean_t was = ml_set_interrupts_enabled(FALSE);
+		uint32_t s = disp_rd(b, OVL_INTSTA);
+		now = mach_absolute_time();
+		if (s & OVL_INT_FME_CPL) {
+			if (t != NULL && now - prev <= fSlack) {
+				layerWrite(*t);
+				*applied = true;
+			}
+			ml_set_interrupts_enabled(was);
+			disp_wr(b, OVL_INTSTA, disp_rd(b, OVL_INTSTA) & ~OVL_INT_FME_CPL);
+			edge = now;
+			break;
+		}
+		ml_set_interrupts_enabled(was);
+		prev = now;
+	}
+	fPolls++;
+	fPollAbs += now - t0;
+	return edge;
+}
+
+/* A frame end seen at `at`: the phase, and the period refined (panel clocks drift a little from the calibration). */
+void
+AppleCLCD::vblankSeen(uint64_t at)
+{
+	if (fLastVblank != 0 && at > fLastVblank) {
+		uint64_t n = (at - fLastVblank + fPeriod / 2) / fPeriod;
+		if (n >= 1 && n <= 600) {
+			fPeriod = (fPeriod * 7 + (at - fLastVblank) / n) / 8;
+		}
+	}
+	fLastVblank = at;
+}
+
+/*
+ * Vsync tick (timer, before anything else): a pending switch happens at the predicted frame end, which is about
+ * fLead away. Too far (the timer was late, or early): next tick. After a miss the next try polls up to a whole
+ * frame to find the phase again; after 8 misses in a row double buffering stops.
+ */
+void
+AppleCLCD::vblankTick(void)
+{
+	IOLockLock(fScanLock);
+	if (!fFlipReady || !fNextValid) {
+		IOLockUnlock(fScanLock);
+		return;
+	}
+	uint64_t now = mach_absolute_time(), margin;
+	nanoseconds_to_absolutetime(500 * 1000, &margin);
+	uint64_t next = fLastVblank + fPeriod;
+	if (next < now) {
+		next += ((now - next) / fPeriod + 1) * fPeriod;
+	}
+	uint64_t budget;
+	if (fResync) {
+		budget = fPeriod + fPeriod / 4;
+	} else if (next - now <= fLead + margin) {
+		budget = next - now + margin;
+	} else {
+		fFlipEarly++;           /* not near a frame end now: the next tick is */
+		IOLockUnlock(fScanLock);
+		return;
+	}
+	bool applied = false;
+	uint64_t at = vblankPoll(budget, &fNext, &applied);
+	if (at != 0) {
+		vblankSeen(at);
+		fResync = false;
+		fMisses = 0;
+	}
+	if (applied) {
+		layerApply(fNext);      /* written at the frame end already: bookkeeping */
+		fNextValid = false;
+		fFlips++;
+	} else if (at != 0) {
+		fFlipUnsure++;          /* held up while polling: switch at the next frame end */
+	} else {
+		fFlipMissed++;
+		fResync = true;
+		if (++fMisses >= 8) {
+			fFlipReady = false;
+			fFlipWhy = "frame ends stopped";
+			IOLog("SWEET FB: double buffer off: no frame end in 8 tries\n");
+			layerApply(fNext);
+			fNextValid = false;
+		}
+	}
+	IOLockUnlock(fScanLock);
+}
+
+/* USB link "disp [regs|scanout on|off|flip on|off]". */
 void
 AppleCLCD::dispCommand(const char *args, char *out, size_t len)
 {
@@ -915,8 +1365,10 @@ AppleCLCD::dispCommand(const char *args, char *out, size_t len)
 		} else {
 			for (int o = 0; o < 2; o++) {
 				vm_offset_t b = fDisp[o];
-				disp_say(&p, end, "%s: en 0x%08x roi 0x%08x src_con 0x%08x ext 0x%08x\n", o ? "OVL0_2L" : "OVL0",
-				    disp_rd(b, OVL_EN), disp_rd(b, OVL_ROI_SIZE), disp_rd(b, OVL_SRC_CON), disp_rd(b, OVL_DATAPATH_EXT_CON));
+				disp_say(&p, end, "%s: en 0x%08x roi 0x%08x src_con 0x%08x ext 0x%08x inten 0x%08x intsta 0x%08x "
+				    "addcon_dbg 0x%08x\n", o ? "OVL0_2L" : "OVL0", disp_rd(b, OVL_EN), disp_rd(b, OVL_ROI_SIZE),
+				    disp_rd(b, OVL_SRC_CON), disp_rd(b, OVL_DATAPATH_EXT_CON), disp_rd(b, OVL_INTEN), disp_rd(b, OVL_INTSTA),
+				    disp_rd(b, OVL_ADDCON_DBG));
 				for (int n = 0; n < (o ? 2 : 4); n++) {
 					disp_say(&p, end, "  L%d con 0x%08x size 0x%08x off 0x%08x pitch 0x%08x/0x%x addr 0x%08x\n", n,
 					    disp_rd(b, OVL_L_CON(n)), disp_rd(b, OVL_L_SRC_SIZE(n)), disp_rd(b, OVL_L_OFFSET(n)),
@@ -951,16 +1403,40 @@ AppleCLCD::dispCommand(const char *args, char *out, size_t len)
 		scanoutStop();
 		fDirty = true;
 		disp_say(&p, end, "scanout off: LK's buffer and the CPU copy again\n");
+	} else if (strncmp(args, "flip on", 7) == 0) {
+		fFlipAllowed = fFlipTried = true;
+		if (fFlipReady || flipSetup(&p, end)) {
+			fDirty = true;
+			disp_say(&p, end, "double buffer on\n");
+		}
+	} else if (strncmp(args, "flip off", 8) == 0) {
+		fFlipAllowed = false;
+		fFlipReady = false;
+		fFlipWhy = "disp flip off";
+		dropNext();
+		if (fShown.buf == 1) {
+			layerApply(bufTarget(0));       /* redrawn at the next tick */
+		}
+		fDirty = true;
+		disp_say(&p, end, "double buffer off: copies go to LK's buffer on screen\n");
 	} else {
 		disp_say(&p, end, "display %ux%u (shown as %ux%u), scanout %s%s, layer %s, %llu frames scanned out, "
 		    "%llu copied%s%s\n", fWidth, fHeight, fLogicalW, fLogicalH, fScanOn ? "on" : "off",
-		    fScanActive ? " (active)" : "", fScanOvl >= 0 ? fScanLayer : "?", fScanFrames, fScanFallbacks,
+		    fShown.buf < 0 ? " (active)" : "", fScanOvl >= 0 ? fScanLayer : "?", fScanFrames, fScanFallbacks,
 		    fScanWhy ? ", last reason: " : "", fScanWhy ? fScanWhy : "");
 		disp_say(&p, end, "copies: %llu, avg %llu us, refresh %s%u\n", fCopies, fCopies ? fCopyNs / fCopies / 1000 : 0,
 		    fFlushTicks ? "every N vsyncs, N = " : "adaptive, CPU duty % = ", fFlushTicks ? fFlushTicks : fDuty);
 		disp_say(&p, end, "GPU sync (K0c): %llu vsyncs waited for the GPU, %llu copies redone, %llu frames shown anyway "
 		    "(sweetfb_gpuwait=%u)\n", fGpuWaits, fGpuRecopies, fGpuForced, fGpuWaitMax);
-		disp_say(&p, end, "usage: disp [regs|scanout on|scanout off]\n");
+		uint64_t pns = 0, polls = fPolls ? fPolls : 1, pollNs;
+		absolutetime_to_nanoseconds(fPeriod, &pns);
+		absolutetime_to_nanoseconds(fPollAbs / polls, &pollNs);
+		disp_say(&p, end, "double buffer (K0d) %s%s%s: on screen %s%d, frame %llu us, %llu switches at a frame end, %llu "
+		    "in place, %llu missed, %llu unsure, %llu deferred; poll avg %llu us\n", fFlipReady ? "on" : "off",
+		    fFlipWhy ? ": " : "", fFlipWhy ? fFlipWhy : "", fShown.buf < 0 ? "surface" : "buffer ",
+		    fShown.buf < 0 ? 0 : fShown.buf, pns / 1000, fFlips, fInPlace, fFlipMissed, fFlipUnsure, fFlipEarly,
+		    pollNs / 1000);
+		disp_say(&p, end, "usage: disp [regs|scanout on|scanout off|flip on|flip off]\n");
 	}
 	IOLockUnlock(fScanLock);
 }

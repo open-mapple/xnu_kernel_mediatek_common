@@ -759,12 +759,22 @@ fbcon_transmit_ready(void)
 }
 
 extern int sweet_console_muted;         /* osfmk/console/serial_console.c: set once the GUI presents */
+/*
+ * Set by AppleCLCD when the display may scan out something other than this framebuffer (its second buffer, an
+ * IOSurface): points the display back here, called once when a panic starts drawing.
+ */
+void (*sweet_fb_panic_hook)(void);
 
 static void
 fbcon_transmit_data(uint8_t c)
 {
 	if (sweet_console_muted && !panic_active()) {
 		return;                 /* kprintf comes straight here, not through the muted console */
+	}
+	if (sweet_fb_panic_hook != NULL && panic_active()) {
+		void (*hook)(void) = sweet_fb_panic_hook;
+		sweet_fb_panic_hook = NULL;
+		hook();
 	}
 	if (c == '\r') {
 		fbcon_col = 0;

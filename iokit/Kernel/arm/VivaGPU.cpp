@@ -23,7 +23,9 @@
  *   4 KiB, four per XNU page), bound to a hardware AS on demand (LRU);
  *   slot 0 fragment, slot 1 vertex/tiler/compute, one chain per slot on
  *   the hardware, FIFO per slot, a chain starts when its input fences have
- *   signalled; GPU caches cleaned and invalidated around every chain;
+ *   signalled (a queue head waiting only for chains on the hardware is
+ *   started by the job interrupt's filter, K0e); GPU caches cleaned and
+ *   invalidated around every chain;
  *   tiler heaps grow by 2 MiB on translation faults; any other fault fails
  *   the chain and disables its address space (never a panic); a chain that
  *   runs longer than 3 s is hard-stopped, a slot that ignores the stop
@@ -396,6 +398,7 @@ VivaGPUFence::create(bool isSignalled)
 	if (f != NULL) {
 		f->signalled = isSignalled;
 		f->error = kIOReturnSuccess;
+		f->signalAt = 0;
 	}
 	return f;
 }
@@ -412,6 +415,7 @@ struct VivaGPUJob {
 	VivaGPUFence *fence;
 	uint64_t      startMs;
 	uint32_t      flushId;  /* GPU_LATEST_FLUSH at submit (flush reduction) */
+	uint64_t      submitAt, startAt;        /* mach_absolute_time (latency accounting) */
 };
 
 /* ---- address spaces ---- */
@@ -849,6 +853,9 @@ VivaGPUAccelerator::start(IOService *provider)
 	flag = 1;
 	PE_parse_boot_argn("vivagpudvfs", &flag, sizeof(flag));
 	fDvfs = flag != 0;
+	flag = 1;
+	PE_parse_boot_argn("vivagpufastkick", &flag, sizeof(flag));
+	fFastKick = flag != 0;
 	uint32_t maxMhz = 950;
 	PE_parse_boot_argn("vivagpufreqmax", &maxMhz, sizeof(maxMhz));
 	fDvfsFast = oppForMHz(maxMhz);
@@ -864,8 +871,9 @@ VivaGPUAccelerator::start(IOService *provider)
 	fProbeMode = 1;
 	PE_parse_boot_argn("vivagpuprobe", &fProbeMode, sizeof(fProbeMode));
 	fProbeLock = IOLockAlloc();
+	fFastLock = IOSimpleLockAlloc();
 	fWorkLoop = IOWorkLoop::workLoop();
-	if (fWorkLoop == NULL || fProbeLock == NULL || !IOAcceleratorES::start(provider)) {
+	if (fWorkLoop == NULL || fProbeLock == NULL || fFastLock == NULL || !IOAcceleratorES::start(provider)) {
 		return false;
 	}
 	for (int i = 0; i < 6; i++) {
@@ -898,7 +906,13 @@ VivaGPUAccelerator::start(IOService *provider)
 		return false;
 	}
 	for (int i = 0; i < 3; i++) {
-		fIrq[i] = IOInterruptEventSource::interruptEventSource(this, actions[i], provider, i);
+		/* the job interrupt has a filter: K0e fast kick and the interrupt timestamps */
+		if (i == 2) {
+			fIrq[i] = IOFilterInterruptEventSource::filterInterruptEventSource(this, actions[i],
+			    &VivaGPUAccelerator::jobFilter, provider, i);
+		} else {
+			fIrq[i] = IOInterruptEventSource::interruptEventSource(this, actions[i], provider, i);
+		}
 		if (fIrq[i] == NULL || fWorkLoop->addEventSource(fIrq[i]) != kIOReturnSuccess) {
 			IOLog("VIVA GPU: no interrupt %d\n", i);
 			return false;
@@ -956,6 +970,10 @@ VivaGPUAccelerator::free(void)
 	}
 	if (fHeapList != NULL) {
 		IODelete(fHeapList, VivaGPUBO *, fHeapCap);
+	}
+	if (fFastLock != NULL) {
+		IOSimpleLockFree(fFastLock);
+		fFastLock = NULL;
 	}
 	if (fProbeLock != NULL) {
 		IOLockFree(fProbeLock);
@@ -1876,6 +1894,7 @@ VivaGPUAccelerator::powerOn(char **out, char *end)
 	}
 	IOLog("VIVA GPU: id 0x%08x cores 0x%llx l2 on\n", fGpuId, fShaderPresent);
 	fPowered = true;
+	fastLive(true);
 	for (int i = 0; i < 3; i++) {
 		fIrq[i]->enable();
 	}
@@ -1889,6 +1908,8 @@ VivaGPUAccelerator::powerOff(char **out, char *end)
 		mfgOff(out, end);
 		return;
 	}
+	fastSync();
+	fastLive(false);        /* the filter no longer touches the registers */
 	for (int i = 0; i < 3; i++) {
 		fIrq[i]->disable();
 	}
@@ -2175,6 +2196,7 @@ VivaGPUAccelerator::submit(VivaGPUVM *vm, uint64_t jc, uint32_t requirements, OS
 	}
 	job->fence = fence;
 	fence->retain();
+	job->submitAt = mach_absolute_time();
 	uint32_t slot = (requirements & VGPU_JD_REQ_FS) ? 0 : 1;
 	if (fQueueTail[slot] != NULL) {
 		fQueueTail[slot]->next = job;
@@ -2182,6 +2204,7 @@ VivaGPUAccelerator::submit(VivaGPUVM *vm, uint64_t jc, uint32_t requirements, OS
 		fQueue[slot] = job;
 	}
 	fQueueTail[slot] = job;
+	stateUpdate(job->submitAt);
 	kick();
 	uint64_t ns;
 	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
@@ -2287,6 +2310,7 @@ VivaGPUAccelerator::kick(void)
 	if (!fPowered) {
 		return;
 	}
+	fastSync();
 	for (uint32_t slot = 0; slot < 2; slot++) {
 		VivaGPUJob *job = fQueue[slot];
 		if (fRunning[slot] != NULL || job == NULL) {
@@ -2309,26 +2333,25 @@ VivaGPUAccelerator::kick(void)
 		job->next = NULL;
 		startJob(slot, job);
 	}
+	fastArm();
 }
 
+uint32_t
+VivaGPUAccelerator::jsConfig(VivaGPUJob *job)
+{
+	return (uint32_t)job->vm->asSlot | JS_CFG_THREAD_PRI(8) | JS_CFG_START_FLUSH_CLEAN_INV | JS_CFG_END_FLUSH_CLEAN_INV;
+}
+
+/* The job slot registers that start `job` on the idle `slot`: gated, or from the job interrupt filter. */
 void
-VivaGPUAccelerator::startJob(uint32_t slot, VivaGPUJob *job)
+VivaGPUAccelerator::jsWrite(uint32_t slot, VivaGPUJob *job, uint32_t config)
 {
 	uint32_t js = JS_BASE(slot);
-	if (fRunning[0] == NULL && fRunning[1] == NULL) {
-		fBusyStart = mach_absolute_time();      /* GPU busy from now (DVFS load) */
-	}
-	fRunning[slot] = job;
-	fStopDeadline[slot] = 0;
-	job->vm->running++;
-	job->startMs = nowMs();
-	fJobs++;
 	wr(js + JS_HEAD_NEXT_LO, (uint32_t)job->jc);
 	wr(js + JS_HEAD_NEXT_HI, (uint32_t)(job->jc >> 32));
 	wr(js + JS_AFFINITY_NEXT_LO, (uint32_t)fShaderPresent);
 	wr(js + JS_AFFINITY_NEXT_HI, (uint32_t)(fShaderPresent >> 32));
-	wr(js + JS_CONFIG_NEXT, (uint32_t)job->vm->asSlot | JS_CFG_THREAD_PRI(8) | JS_CFG_START_FLUSH_CLEAN_INV |
-	    JS_CFG_END_FLUSH_CLEAN_INV);
+	wr(js + JS_CONFIG_NEXT, config);
 	/*
 	 * Flush reduction (as Linux's panfrost on FLUSH_REDUCTION GPUs, every Valhall): the start-of-chain L2 clean +
 	 * invalidate is skipped when a flush happened after the job was submitted. Every chain ends with one, so
@@ -2338,6 +2361,39 @@ VivaGPUAccelerator::startJob(uint32_t slot, VivaGPUJob *job)
 		wr(js + JS_FLUSH_ID_NEXT, job->flushId);
 	}
 	wr(js + JS_COMMAND_NEXT, JS_CMD_START);
+}
+
+void
+VivaGPUAccelerator::startJob(uint32_t slot, VivaGPUJob *job)
+{
+	job->vm->running++;
+	jsWrite(slot, job, jsConfig(job));
+	jobStarted(slot, job, mach_absolute_time(), false);
+}
+
+/* Gated: `job` runs on `slot` since `at` (started here or by the filter; vm->running already counts it). */
+void
+VivaGPUAccelerator::jobStarted(uint32_t slot, VivaGPUJob *job, uint64_t at, bool fromFilter)
+{
+	if (fRunning[0] == NULL && fRunning[1] == NULL) {
+		fBusyStart = at;        /* GPU busy from now (DVFS load) */
+	}
+	fRunning[slot] = job;
+	fStopDeadline[slot] = 0;
+	job->startMs = nowMs();
+	job->startAt = at;
+	fJobs++;
+	/* start latency: from the moment it could run (submitted, every dependency signalled) */
+	uint64_t ready = job->submitAt;
+	for (unsigned int i = 0; job->deps != NULL && i < job->deps->getCount(); i++) {
+		ready = MAX(ready, ((VivaGPUFence *)job->deps->getObject(i))->signalAt);
+	}
+	uint32_t kind = ready == job->submitAt ? 0 : fromFilter ? 2 : 1;
+	uint64_t lat = at > ready ? at - ready : 0;
+	fLatN[kind]++;
+	fLatSum[kind] += lat;
+	fLatMax[kind] = MAX(fLatMax[kind], lat);
+	stateUpdate(at);
 	if (!fTimerArmed) {
 		fTimerArmed = true;
 		fTimer->setTimeoutMS(TIMER_MS);
@@ -2351,19 +2407,27 @@ VivaGPUAccelerator::startJob(uint32_t slot, VivaGPUJob *job)
 }
 
 void
-VivaGPUAccelerator::completeJob(uint32_t slot, IOReturn error, uint32_t status)
+VivaGPUAccelerator::completeJob(uint32_t slot, IOReturn error, uint32_t status, uint64_t at)
 {
 	VivaGPUJob *job = fRunning[slot];
 	if (job == NULL) {
 		return;
 	}
+	if (at == 0) {
+		at = mach_absolute_time();
+	}
 	fRunning[slot] = NULL;
 	fStopDeadline[slot] = 0;
 	job->vm->running--;
 	if (fRunning[0] == NULL && fRunning[1] == NULL && fBusyStart != 0) {
-		fBusyNs += mach_absolute_time() - fBusyStart;   /* absolute-time units */
+		fBusyNs += at > fBusyStart ? at - fBusyStart : 0;       /* absolute-time units */
 		fBusyStart = 0;
 	}
+	if (error == kIOReturnSuccess && at > job->startAt) {
+		fExecN++;
+		fExecSum += at - job->startAt;
+	}
+	stateUpdate(at);
 	if (error != kIOReturnSuccess) {
 		fJobFaults++;
 		if (fJobFaults <= 32) {
@@ -2406,6 +2470,7 @@ VivaGPUAccelerator::completeJob(uint32_t slot, IOReturn error, uint32_t status)
 	}
 	job->fence->signalled = true;
 	job->fence->error = error;
+	job->fence->signalAt = at;
 	OSSafeReleaseNULL(job->deps);
 	OSSafeReleaseNULL(job->bos);
 	OSSafeReleaseNULL(job->fence);
@@ -2442,6 +2507,8 @@ VivaGPUAccelerator::resetGPU(const char *why)
 	fResets++;
 	fWatchFragment = false;
 	IOLog("VIVA GPU: reset (%s)\n", why);
+	fastSync();             /* a job the filter started is one of the running ones */
+	fastLive(false);
 	wr(JOB_INT_MASK, 0);
 	wr(MMU_INT_MASK, 0);
 	softReset();            /* stop the GPU before the jobs' memory is released */
@@ -2462,6 +2529,7 @@ VivaGPUAccelerator::resetGPU(const char *why)
 		fPowered = false;
 		return;
 	}
+	fastLive(true);
 	kick();
 }
 
@@ -2490,6 +2558,7 @@ VivaGPUAccelerator::mmuInterrupt(OSObject *owner, IOInterruptEventSource *src __
 	if (self == NULL || !self->fPowered) {
 		return;
 	}
+	self->fastSync();       /* nothing armed while address spaces change (re-armed at the next kick) */
 	uint32_t stat = self->rd(MMU_INT_STAT);
 	for (uint32_t as = 0; as < self->fASCount; as++) {
 		uint32_t bits = stat & ((1u << as) | (1u << (16 + as)));
@@ -2546,6 +2615,7 @@ VivaGPUAccelerator::jobInterrupt(OSObject *owner, IOInterruptEventSource *src __
 	if (self == NULL || !self->fPowered) {
 		return;
 	}
+	self->fastSync();       /* the jobs the filter saw done, the ones it started */
 	uint32_t stat = self->rd(JOB_INT_STAT);
 	for (uint32_t slot = 0; slot < 3; slot++) {
 		uint32_t done = 1u << slot, fail = 1u << (16 + slot);
@@ -2587,6 +2657,223 @@ VivaGPUAccelerator::jobInterrupt(OSObject *owner, IOInterruptEventSource *src __
 	self->kick();
 }
 
+/*
+ * K0e. The job interrupt's filter, primary interrupt context (CPU 0, interrupts off). Clears the done bits it sees
+ * (the failures stay for the gated handler), notes when they came, and starts each armed job whose awaited slots
+ * are now all done. Always true when there was something: the source stays masked until the handler has run, so
+ * the filter runs at most once per handler run.
+ */
+bool
+VivaGPUAccelerator::jobFilter(OSObject *owner, IOFilterInterruptEventSource *src __unused)
+{
+	return ((VivaGPUAccelerator *)owner)->jobFilterRun();
+}
+
+bool
+VivaGPUAccelerator::jobFilterRun(void)
+{
+	IOSimpleLockLock(fFastLock);
+	if (!fFastOn) {
+		IOSimpleLockUnlock(fFastLock);
+		return true;            /* GPU off or resetting: the handler sorts it out */
+	}
+	uint32_t stat = rd(JOB_INT_STAT);
+	if (stat == 0) {
+		IOSimpleLockUnlock(fFastLock);
+		return false;
+	}
+	uint64_t now = mach_absolute_time();
+	for (uint32_t slot = 0; slot < 2; slot++) {
+		if (stat & (0x10001u << slot)) {
+			fIrqAt[slot] = now;
+		}
+	}
+	uint32_t done = stat & 3u & ~(stat >> 16);
+	if (done != 0) {
+		wr(JOB_INT_CLEAR, done);
+		fIrqDone |= done;
+	}
+	for (uint32_t slot = 0; slot < 2 && fFastKick; slot++) {
+		FastArm *a = &fArm[slot];
+		if (a->job != NULL && !a->started && (a->wait & ~fIrqDone) == 0) {
+			jsWrite(slot, a->job, a->config);
+			a->started = true;
+			a->startAt = mach_absolute_time();
+		}
+	}
+	IOSimpleLockUnlock(fFastLock);
+	return true;
+}
+
+/* Gated: filter on/off with the GPU's power (off: it must not read the registers; on: nothing left from before). */
+void
+VivaGPUAccelerator::fastLive(bool live)
+{
+	IOInterruptState is = IOSimpleLockLockDisableInterrupt(fFastLock);
+	fFastOn = live;
+	fIrqDone = 0;
+	bzero(fArm, sizeof(fArm));
+	IOSimpleLockUnlockEnableInterrupt(fFastLock, is);
+}
+
+/*
+ * Gated, before anything looks at fRunning/fQueue: complete the jobs the filter saw done (at the time it saw them),
+ * take over the jobs it started, release the reservation of those it did not. Nothing is armed afterwards (until
+ * fastArm), so the filter cannot start a job behind the gated code's back.
+ */
+void
+VivaGPUAccelerator::fastSync(void)
+{
+	FastArm arm[2];
+	uint64_t at[2];
+	IOInterruptState is = IOSimpleLockLockDisableInterrupt(fFastLock);
+	uint32_t done = fIrqDone;
+	fIrqDone = 0;
+	at[0] = fIrqAt[0];
+	at[1] = fIrqAt[1];
+	memcpy(arm, fArm, sizeof(arm));
+	bzero(fArm, sizeof(fArm));
+	IOSimpleLockUnlockEnableInterrupt(fFastLock, is);
+
+	if (done != 0) {
+		uint64_t now = mach_absolute_time(), first = (done & 1) ? at[0] : at[1];
+		if ((done & 3) == 3) {
+			first = MIN(at[0], at[1]);
+		}
+		uint64_t d = now > first ? now - first : 0;
+		fIrqN++;
+		fIrqSum += d;
+		fIrqMax = MAX(fIrqMax, d);
+	}
+	for (uint32_t slot = 0; slot < 2; slot++) {
+		if (done & (1u << slot)) {
+			if (slot == 0) {
+				fWatchFragment = false;
+			}
+			completeJob(slot, kIOReturnSuccess, 0x01, at[slot]);
+		}
+	}
+	for (uint32_t slot = 0; slot < 2; slot++) {
+		VivaGPUJob *job = arm[slot].job;
+		if (job == NULL) {
+			continue;
+		}
+		if (!arm[slot].started) {
+			job->vm->running--;             /* reservation of fastArm */
+			continue;
+		}
+		/* armed = head of its queue, and nothing dequeues without fastSync first */
+		fQueue[slot] = job->next;
+		if (fQueue[slot] == NULL) {
+			fQueueTail[slot] = NULL;
+		}
+		job->next = NULL;
+		fFastStarts++;
+		jobStarted(slot, job, arm[slot].startAt, true);
+	}
+}
+
+/*
+ * Gated, after kick: arm the head of each slot's queue when every dependency it still waits for is a job on the
+ * hardware (and its own slot frees up when that slot's job is done). Its address space is bound now and reserved
+ * (vm->running) so it is not given away before the filter starts it.
+ */
+void
+VivaGPUAccelerator::fastArm(void)
+{
+	if (!fFastKick || !fFastOn) {
+		return;
+	}
+	for (uint32_t slot = 0; slot < 2; slot++) {
+		VivaGPUJob *job = fQueue[slot];
+		if (job == NULL) {
+			continue;
+		}
+		uint32_t wait = fRunning[slot] != NULL ? 1u << slot : 0;
+		bool ok = true;
+		for (unsigned int i = 0; ok && job->deps != NULL && i < job->deps->getCount(); i++) {
+			VivaGPUFence *f = (VivaGPUFence *)job->deps->getObject(i);
+			if (f->signalled) {
+				continue;
+			}
+			if (fRunning[0] != NULL && f == fRunning[0]->fence) {
+				wait |= 1;
+			} else if (fRunning[1] != NULL && f == fRunning[1]->fence) {
+				wait |= 2;
+			} else {
+				ok = false;             /* waits for a queued job or a syncobj: the normal path */
+			}
+		}
+		if (!ok || wait == 0 || !asBind(job->vm)) {
+			continue;
+		}
+		job->vm->running++;
+		IOInterruptState is = IOSimpleLockLockDisableInterrupt(fFastLock);
+		fArm[slot].job = job;
+		fArm[slot].wait = wait;
+		fArm[slot].config = jsConfig(job);
+		fArm[slot].started = false;
+		fArm[slot].startAt = 0;
+		IOSimpleLockUnlockEnableInterrupt(fFastLock, is);
+		fFastArmed++;
+	}
+}
+
+/* Gated: something changed at `at`; the time since the last change goes to the state the GPU was in. */
+void
+VivaGPUAccelerator::stateUpdate(uint64_t at)
+{
+	if (fStatSince == 0) {
+		fStatSince = fStateSince = at;
+	}
+	if (at > fStateSince) {
+		fStateNs[fState] += at - fStateSince;
+		fStateSince = at;
+	}
+	fState = (fRunning[0] != NULL || fRunning[1] != NULL) ? kStateBusy :
+	    (fQueue[0] != NULL || fQueue[1] != NULL) ? kStateWaiting : kStateIdle;
+}
+
+void
+VivaGPUAccelerator::latencyReset(void)
+{
+	fStatSince = fStateSince = mach_absolute_time();
+	bzero(fStateNs, sizeof(fStateNs));
+	bzero(fLatN, sizeof(fLatN));
+	bzero(fLatSum, sizeof(fLatSum));
+	bzero(fLatMax, sizeof(fLatMax));
+	fExecN = fExecSum = fIrqN = fIrqSum = fIrqMax = fFastStarts = fFastArmed = 0;
+}
+
+static uint64_t
+absUs(uint64_t abs)
+{
+	uint64_t ns;
+	absolutetime_to_nanoseconds(abs, &ns);
+	return ns / 1000;
+}
+
+void
+VivaGPUAccelerator::latencyStats(char **out, char *end)
+{
+	stateUpdate(mach_absolute_time());
+	uint64_t total = fStateNs[kStateBusy] + fStateNs[kStateWaiting] + fStateNs[kStateIdle];
+	uint64_t t = total ? total : 1;
+	say(out, end, "timing over %llu ms: GPU busy %llu%%, waiting with jobs queued %llu%%, idle (nothing queued) "
+	    "%llu%%; job on the hardware avg %llu us (%llu jobs)\n", absUs(total) / 1000, fStateNs[kStateBusy] * 100 / t,
+	    fStateNs[kStateWaiting] * 100 / t, fStateNs[kStateIdle] * 100 / t,
+	    fExecN ? absUs(fExecSum / fExecN) : 0, fExecN);
+	static const char *const kind[3] = { "ready at submit", "after a dependency, work loop", "after a dependency, IRQ filter" };
+	say(out, end, "start latency (ready -> running):");
+	for (int i = 0; i < 3; i++) {
+		say(out, end, " %s avg %llu us max %llu (%llu)%s", kind[i], fLatN[i] ? absUs(fLatSum[i] / fLatN[i]) : 0,
+		    absUs(fLatMax[i]), fLatN[i], i < 2 ? ";" : "\n");
+	}
+	say(out, end, "IRQ -> handler avg %llu us max %llu (%llu); fast kick %s: %llu armed, %llu started by the filter "
+	    "(vivagpufastkick, gpu fastkick on|off; gpu lat reset)\n", fIrqN ? absUs(fIrqSum / fIrqN) : 0, absUs(fIrqMax),
+	    fIrqN, fFastKick ? "on" : "off", fFastArmed, fFastStarts);
+}
+
 void
 VivaGPUAccelerator::jobTimer(OSObject *owner, IOTimerEventSource *src __unused)
 {
@@ -2598,6 +2885,7 @@ VivaGPUAccelerator::jobTimer(OSObject *owner, IOTimerEventSource *src __unused)
 	if (!self->fPowered) {
 		return;
 	}
+	self->fastSync();
 	uint64_t now = nowMs();
 	bool busy = false;
 	for (uint32_t slot = 0; slot < 2; slot++) {
@@ -2910,6 +3198,22 @@ VivaGPUAccelerator::linkCommand(const char *args, char *out, size_t outLen)
 			say(o, end, "dvfs %s: %u..%u MHz (vivagpufreq..vivagpufreqmax), now %u MHz, load %u%%, %llu up %llu down\n",
 			    fDvfs ? "on" : "off", gVivaOpp[fOpp].khz / 1000, gVivaOpp[MIN(fDvfsFast, fOpp)].khz / 1000,
 			    gVivaOpp[fClockOpp].khz / 1000, fLoadPct, fDvfsUps, fDvfsDowns);
+		} else if (strncmp(args, "lat", 3) == 0) {
+			if (strncmp(args, "lat reset", 9) == 0) {
+				latencyReset();
+				say(o, end, "latency counters reset\n");
+			} else {
+				latencyStats(o, end);
+			}
+		} else if (strncmp(args, "fastkick", 8) == 0) {
+			if (strncmp(args, "fastkick on", 11) == 0) {
+				fFastKick = true;
+				kick();
+			} else if (strncmp(args, "fastkick off", 12) == 0) {
+				fFastKick = false;
+				fastSync();             /* drop what is armed */
+			}
+			say(o, end, "fast kick %s\n", fFastKick ? "on" : "off");
 		} else if (strncmp(args, "probe", 5) == 0) {
 			probeDump(o, end);
 		} else if (strncmp(args, "publish", 7) == 0) {
@@ -2961,7 +3265,9 @@ VivaGPUAccelerator::linkCommand(const char *args, char *out, size_t outLen)
 			say(o, end, "dvfs %s (%u..%u MHz, load %u%%, %llu up %llu down), flush reduction %s\n", fDvfs ? "on" : "off",
 			    gVivaOpp[fOpp].khz / 1000, gVivaOpp[MIN(fDvfsFast, fOpp)].khz / 1000, fLoadPct, fDvfsUps, fDvfsDowns,
 			    fFlushReduce ? "on" : "off");
-			say(o, end, "usage: gpu [status|mfg|on|off|regs|freq [MHz]|dvfs [on|off]|selftest [fault]|probe|publish]\n");
+			latencyStats(o, end);
+			say(o, end, "usage: gpu [status|mfg|on|off|regs|freq [MHz]|dvfs [on|off]|lat [reset]|fastkick [on|off]|"
+			    "selftest [fault]|probe|publish]\n");
 		}
 		return kIOReturnSuccess;
 	});

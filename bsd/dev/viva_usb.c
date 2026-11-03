@@ -998,11 +998,11 @@ vl_command(void)
 			}
 		}
 	} else if (IS("gpu")) {
-		static char gpu_reply[3072];
+		static char gpu_reply[4000];  /* vl.reply holds 4096 */
 		viva_gpu_link(rest, gpu_reply, sizeof(gpu_reply));
 		vl_reply("%s", gpu_reply);
 	} else if (IS("disp")) {
-		static char disp_reply[3072];
+		static char disp_reply[4000];
 		viva_disp_link(rest, disp_reply, sizeof(disp_reply));
 		vl_reply("%s", disp_reply);
 	} else if (IS("push")) {

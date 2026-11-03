@@ -17,7 +17,10 @@
  *
  * Locking: everything runs under the accelerator's work-loop gate (the
  * GPU, MMU and job interrupts, the job timer, user client calls, link
- * commands). Waits sleep on the gate with commandSleep().
+ * commands). Waits sleep on the gate with commandSleep(). The one exception
+ * is the job interrupt's filter (primary interrupt context, K0e fast kick):
+ * it only touches fArm/fIrqDone/fIrqAt and the job slot registers, under
+ * fFastLock (a spinlock taken with interrupts off on the gated side).
  */
 #ifndef _IOKIT_ARM_VIVAGPU_H
 #define _IOKIT_ARM_VIVAGPU_H
@@ -29,7 +32,9 @@
 #include <IOKit/IOWorkLoop.h>
 #include <IOKit/IOCommandGate.h>
 #include <IOKit/IOInterruptEventSource.h>
+#include <IOKit/IOFilterInterruptEventSource.h>
 #include <IOKit/IOTimerEventSource.h>
+#include <IOKit/IOLocks.h>
 
 #include "viva_gpu_uapi.h"
 
@@ -58,6 +63,7 @@ public:
 	static VivaGPUFence *create(bool signalled);
 	bool     signalled;
 	IOReturn error;
+	uint64_t signalAt;      /* mach_absolute_time of the job's interrupt (0: signalled by hand or not yet) */
 };
 
 /* A GPU address space: AArch64 4K page tables plus the VA allocator for [VGPU_VA_START, VGPU_VA_END). */
@@ -238,12 +244,26 @@ private:
 	void addImplicitDep(OSArray *deps, VivaGPUFence *f, VivaGPUFence *self);
 	void kick(void);
 	void startJob(uint32_t slot, VivaGPUJob *job);
-	void completeJob(uint32_t slot, IOReturn error, uint32_t status);
+	void jsWrite(uint32_t slot, VivaGPUJob *job, uint32_t config);
+	uint32_t jsConfig(VivaGPUJob *job);
+	void jobStarted(uint32_t slot, VivaGPUJob *job, uint64_t at, bool fromFilter);
+	void completeJob(uint32_t slot, IOReturn error, uint32_t status, uint64_t at = 0);
 	void failAll(IOReturn error);
 	void resetGPU(const char *why);
 	static void gpuInterrupt(OSObject *owner, IOInterruptEventSource *src, int count);
 	static void mmuInterrupt(OSObject *owner, IOInterruptEventSource *src, int count);
 	static void jobInterrupt(OSObject *owner, IOInterruptEventSource *src, int count);
+	static bool jobFilter(OSObject *owner, IOFilterInterruptEventSource *src);
+	bool jobFilterRun(void);
+	/* K0e fast kick (gated): take over what the filter did; arm the queue heads that wait only for running jobs */
+	void fastSync(void);
+	void fastArm(void);
+	void fastLive(bool live);
+	/* where the GPU's time goes: a job on the hardware, jobs queued but none running, nothing queued */
+	enum { kStateBusy, kStateWaiting, kStateIdle, kStateCount };
+	void stateUpdate(uint64_t at);
+	void latencyStats(char **out, char *end);
+	void latencyReset(void);
 	static void jobTimer(OSObject *owner, IOTimerEventSource *src);
 	static void dvfsTimer(OSObject *owner, IOTimerEventSource *src);
 	void dvfsSample(void);
@@ -319,6 +339,30 @@ public:
 private:
 	uint64_t fFaultsNoReset;            /* chains killed by an MMU fault without a GPU reset */
 	bool     fWatchFragment;            /* since then no fragment chain completed: short timeout on JS0 */
+
+	/*
+	 * K0e fast kick (vivagpufastkick, 1 default): the queue head of a slot whose unfinished dependencies are all
+	 * jobs on the hardware is "armed" (AS bound and reserved, JS_CONFIG ready). The job interrupt's filter
+	 * starts it the moment those jobs signal done, in primary interrupt context, instead of after the work-loop
+	 * thread wakes up; the gated handler then completes the finished jobs and takes the started one over.
+	 */
+	struct FastArm {
+		VivaGPUJob *job;
+		uint32_t    wait;                   /* slots whose running job must be done (bit n = slot n) */
+		uint32_t    config;
+		bool        started;
+		uint64_t    startAt;
+	};
+	IOSimpleLock *fFastLock;                /* fIrq[2] is the job interrupt's IOFilterInterruptEventSource */
+	FastArm       fArm[2];
+	uint32_t      fIrqDone;                 /* done bits the filter cleared, not handled yet */
+	uint64_t      fIrqAt[2];                /* when the filter saw each slot's interrupt */
+	bool          fFastKick, fFastOn;       /* boot-arg / link switch; GPU powered with interrupts set up */
+	/* latency accounting ("gpu lat"), mach_absolute_time units */
+	uint64_t fStatSince, fStateSince, fStateNs[kStateCount];
+	uint32_t fState;
+	uint64_t fLatN[3], fLatSum[3], fLatMax[3];  /* start - ready: ready at submit, after a dependency (work loop, filter) */
+	uint64_t fExecN, fExecSum, fIrqN, fIrqSum, fIrqMax, fFastStarts, fFastArmed;
 
 	/* unknown user clients and property reads, for "gpu probe" (fProbeLock) */
 	IOLock *fProbeLock;
