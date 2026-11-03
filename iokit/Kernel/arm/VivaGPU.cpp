@@ -37,6 +37,7 @@
 #include <pexpert/pexpert.h>
 #include <kern/clock.h>
 #include <machine/machine_routines.h>
+#include <sys/proc.h>
 
 #include "VivaGPU.h"
 #include "VivaPMIC.h"
@@ -737,8 +738,11 @@ VivaGPUAccelerator::start(IOService *provider)
 		return false;
 	}
 	fMode = mode;
+	fProbeMode = 1;
+	PE_parse_boot_argn("vivagpuprobe", &fProbeMode, sizeof(fProbeMode));
+	fProbeLock = IOLockAlloc();
 	fWorkLoop = IOWorkLoop::workLoop();
-	if (fWorkLoop == NULL || !IOAcceleratorES::start(provider)) {
+	if (fWorkLoop == NULL || fProbeLock == NULL || !IOAcceleratorES::start(provider)) {
 		return false;
 	}
 	for (int i = 0; i < 6; i++) {
@@ -824,6 +828,9 @@ VivaGPUAccelerator::free(void)
 	if (fHeapList != NULL) {
 		IODelete(fHeapList, VivaGPUBO *, fHeapCap);
 	}
+	if (fProbeLock != NULL) {
+		IOLockFree(fProbeLock);
+	}
 	OSSafeReleaseNULL(fWorkLoop);
 	IOAcceleratorES::free();
 }
@@ -832,7 +839,29 @@ IOReturn
 VivaGPUAccelerator::newUserClient(task_t owningTask, void *securityID, UInt32 type, IOUserClient **handler)
 {
 	if (type != VGPU_CLIENT_TYPE) {
-		return kIOReturnUnsupported;
+		char proc[20];
+		proc_selfname(proc, sizeof(proc));
+		probeNote(proc, type, ~0u, 0, 0);
+		IOLog("VIVA GPU: %s[%d] opens user client type 0x%x (not vgpu): %s\n", proc, proc_selfpid(), type,
+		    fProbeMode ? "probe client" : "refused");
+		if (!fProbeMode) {
+			return kIOReturnUnsupported;
+		}
+		VivaGPUProbeClient *probe = new VivaGPUProbeClient;
+		if (probe == NULL) {
+			return kIOReturnNoMemory;
+		}
+		if (!probe->initWithTask(owningTask, securityID, type) || !probe->attach(this)) {
+			probe->release();
+			return kIOReturnError;
+		}
+		if (!probe->start(this)) {
+			probe->detach(this);
+			probe->release();
+			return kIOReturnError;
+		}
+		*handler = probe;
+		return kIOReturnSuccess;
 	}
 	if (!fPowered) {
 		return kIOReturnNotReady;
@@ -862,6 +891,233 @@ VivaGPUAccelerator::chargeMemory(int64_t bytes)
 	}
 	fMemory += bytes;
 	return true;
+}
+
+/* ---- unknown user clients and property reads (K1: what IOGPU/QuartzCore/Metal ask for) ---- */
+
+#define PROBE_LOG_MAX   48      /* log lines per client; "gpu probe" keeps counting */
+/* selector tags in the probe table (high 16 bits) for calls that are not external methods */
+#define PROBE_TRAP      0x74720000u
+#define PROBE_MEMORY    0x6d650000u
+#define PROBE_NOTIFY    0x6e6f0000u
+
+/* One table line per (process, type, selector); selector ~0 = the open itself. */
+void
+VivaGPUAccelerator::probeNote(const char *proc, uint32_t type, uint32_t selector, uint32_t inSize, uint32_t outSize)
+{
+	IOLockLock(fProbeLock);
+	uint32_t i;
+	for (i = 0; i < fProbeCount; i++) {
+		ProbeEntry *e = &fProbe[i];
+		if (e->type == type && e->selector == selector && strncmp(e->proc, proc, sizeof(e->proc)) == 0) {
+			break;
+		}
+	}
+	if (i == fProbeCount) {
+		if (fProbeCount == kProbeMax) {
+			fProbeDropped++;
+			IOLockUnlock(fProbeLock);
+			return;
+		}
+		ProbeEntry *e = &fProbe[fProbeCount++];
+		bzero(e, sizeof(*e));
+		strlcpy(e->proc, proc, sizeof(e->proc));
+		e->type = type;
+		e->selector = selector;
+	}
+	fProbe[i].count++;
+	fProbe[i].inSize = inSize;
+	fProbe[i].outSize = outSize;
+	IOLockUnlock(fProbeLock);
+}
+
+void
+VivaGPUAccelerator::propertyRead(const char *key, bool found)
+{
+	char proc[20];
+	proc_selfname(proc, sizeof(proc));
+	IOLockLock(fProbeLock);
+	uint32_t i;
+	for (i = 0; i < fPropCount; i++) {
+		if (strncmp(fProps[i].key, key, sizeof(fProps[i].key) - 1) == 0 &&
+		    strncmp(fProps[i].proc, proc, sizeof(fProps[i].proc)) == 0) {
+			break;
+		}
+	}
+	bool first = i == fPropCount;
+	if (first) {
+		if (fPropCount == kPropMax) {
+			fPropDropped++;
+			IOLockUnlock(fProbeLock);
+			return;
+		}
+		bzero(&fProps[i], sizeof(fProps[i]));
+		strlcpy(fProps[i].proc, proc, sizeof(fProps[i].proc));
+		strlcpy(fProps[i].key, key, sizeof(fProps[i].key));
+		fPropCount++;
+	}
+	fProps[i].count++;
+	fProps[i].found = found;
+	IOLockUnlock(fProbeLock);
+	if (first) {
+		IOLog("VIVA GPU: %s[%d] reads property \"%s\": %s\n", proc, proc_selfpid(), key, found ? "found" : "MISSING");
+	}
+}
+
+void
+VivaGPUAccelerator::probeDump(char **out, char *end)
+{
+	IOLockLock(fProbeLock);
+	say(out, end, "unknown user clients (%u calls dropped, vivagpuprobe=%d):\n", fProbeDropped, fProbeMode);
+	for (uint32_t i = 0; i < fProbeCount; i++) {
+		ProbeEntry *e = &fProbe[i];
+		uint32_t tag = e->selector >> 16, n = e->selector & 0xffff;
+		if (e->selector == ~0u) {
+			say(out, end, "  %s type 0x%x: opened %u times\n", e->proc, e->type, e->count);
+		} else if (tag == (PROBE_NOTIFY >> 16) && n >= 0xfffe) {
+			say(out, end, "  %s type 0x%x %s: %u calls\n", e->proc, e->type, n == 0xffff ? "setProperties" :
+			    "connectClient", e->count);
+		} else {
+			say(out, end, "  %s type 0x%x %s %u: %u calls, last in %u out %u bytes\n", e->proc, e->type,
+			    tag == (PROBE_TRAP >> 16) ? "trap" : tag == (PROBE_MEMORY >> 16) ? "memory type" :
+			    tag == (PROBE_NOTIFY >> 16) ? "notification port type" : "sel", n, e->count, e->inSize,
+			    e->outSize);
+		}
+	}
+	say(out, end, "property reads (%u dropped):\n", fPropDropped);
+	for (uint32_t i = 0; i < fPropCount; i++) {
+		say(out, end, "  %s \"%s\" %s x%u\n", fProps[i].proc, fProps[i].key, fProps[i].found ? "found" : "MISSING",
+		    fProps[i].count);
+	}
+	IOLockUnlock(fProbeLock);
+}
+
+/* IOUserClient.cpp: registry property reads by userspace (key "*" = all properties). */
+extern "C" void
+viva_gpu_property_read(IORegistryEntry *entry, const char *key, bool found)
+{
+	VivaGPUAccelerator *gpu = gVivaGPU;
+	if (gpu != NULL && entry == gpu) {
+		gpu->propertyRead(key, found);
+	}
+}
+
+/* ---- probe user client ---- */
+
+OSDefineMetaClassAndStructors(VivaGPUProbeClient, IOUserClient);
+
+bool
+VivaGPUProbeClient::initWithTask(task_t owningTask, void *securityID, UInt32 type)
+{
+	if (!IOUserClient::initWithTask(owningTask, securityID, type)) {
+		return false;
+	}
+	fType = type;
+	fPid = proc_selfpid();
+	proc_selfname(fProc, sizeof(fProc));
+	return true;
+}
+
+bool
+VivaGPUProbeClient::start(IOService *provider)
+{
+	fGPU = OSDynamicCast(VivaGPUAccelerator, provider);
+	return fGPU != NULL && IOUserClient::start(provider);
+}
+
+void
+VivaGPUProbeClient::note(const char *what, uint32_t selector, uint32_t inSize, uint32_t outSize, const char *detail)
+{
+	fGPU->probeNote(fProc, fType, selector, inSize, outSize);
+	if (fLogged < PROBE_LOG_MAX) {
+		fLogged++;
+		IOLog("VIVA GPU: probe %s[%d] type 0x%x %s %u%s -> unsupported\n", fProc, fPid, fType, what,
+		    selector & 0xffff, detail);
+	}
+}
+
+IOReturn
+VivaGPUProbeClient::clientClose(void)
+{
+	if (fLogged < PROBE_LOG_MAX) {
+		IOLog("VIVA GPU: probe %s[%d] type 0x%x closed\n", fProc, fPid, fType);
+	}
+	terminate();
+	return kIOReturnSuccess;
+}
+
+IOReturn
+VivaGPUProbeClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
+    __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target, __unused void *reference)
+{
+	char detail[160];
+	char *p = detail, *end = detail + sizeof(detail);
+	uint32_t inSize = args->structureInputDescriptor ? (uint32_t)args->structureInputDescriptor->getLength() :
+	    args->structureInputSize;
+	uint32_t outSize = args->structureOutputDescriptor ? (uint32_t)args->structureOutputDescriptor->getLength() :
+	    args->structureOutputSize;
+	detail[0] = 0;
+	say(&p, end, ": scalars in %u", args->scalarInputCount);
+	for (uint32_t i = 0; i < args->scalarInputCount && i < 4; i++) {
+		say(&p, end, "%s0x%llx", i ? " " : " (", args->scalarInput[i]);
+	}
+	if (args->scalarInputCount) {
+		say(&p, end, "%s)", args->scalarInputCount > 4 ? " .." : "");
+	}
+	say(&p, end, ", struct in %u%s", inSize, args->structureInputDescriptor ? " (ool)" : "");
+	if (args->structureInput != NULL && args->structureInputSize > 0) {
+		say(&p, end, " [");
+		for (uint32_t i = 0; i < args->structureInputSize && i < 16; i++) {
+			say(&p, end, "%02x", ((const uint8_t *)args->structureInput)[i]);
+		}
+		say(&p, end, "%s]", args->structureInputSize > 16 ? ".." : "");
+	}
+	say(&p, end, ", out scalars %u struct %u%s", args->scalarOutputCount, outSize,
+	    args->asyncWakePort != MACH_PORT_NULL ? ", async" : "");
+	note("sel", selector, inSize, outSize, detail);
+	return kIOReturnUnsupported;
+}
+
+IOReturn
+VivaGPUProbeClient::clientMemoryForType(UInt32 type, __unused IOOptionBits *options, __unused IOMemoryDescriptor **memory)
+{
+	note("memory type", PROBE_MEMORY | (type & 0xffff), 0, 0, "");
+	return kIOReturnUnsupported;
+}
+
+IOReturn
+VivaGPUProbeClient::registerNotificationPort(mach_port_t port, UInt32 type, io_user_reference_t refCon)
+{
+	note("notification port type", PROBE_NOTIFY | (type & 0xffff), 0, 0, "");
+	return IOUserClient::registerNotificationPort(port, type, refCon);
+}
+
+IOExternalTrap *
+VivaGPUProbeClient::getTargetAndTrapForIndex(__unused IOService **targetP, UInt32 index)
+{
+	note("trap", PROBE_TRAP | (index & 0xffff), 0, 0, "");
+	return NULL;
+}
+
+IOReturn
+VivaGPUProbeClient::setProperties(OSObject *properties)
+{
+	char detail[200];
+	OSSerialize *s = OSSerialize::withCapacity(256);
+	snprintf(detail, sizeof(detail), ": %.180s", (s != NULL && properties != NULL && properties->serialize(s)) ?
+	    s->text() : "?");
+	OSSafeReleaseNULL(s);
+	note("setProperties", PROBE_NOTIFY | 0xffff, 0, 0, detail);
+	return kIOReturnUnsupported;
+}
+
+IOReturn
+VivaGPUProbeClient::connectClient(IOUserClient *client)
+{
+	char detail[64];
+	snprintf(detail, sizeof(detail), ": %s", client ? client->getMetaClass()->getClassName() : "?");
+	note("connectClient", PROBE_NOTIFY | 0xfffe, 0, 0, detail);
+	return kIOReturnUnsupported;
 }
 
 /* ---- MFG power ---- */
@@ -1997,7 +2253,7 @@ VivaGPUAccelerator::selftest(bool fault, char **out, char *end)
 	bo->release();
 }
 
-/* ---- USB link: "gpu [status|mfg|on|off|regs|selftest [fault]|publish]" ---- */
+/* ---- USB link: "gpu [status|mfg|on|off|regs|selftest [fault]|probe|publish]" ---- */
 
 void
 VivaGPUAccelerator::linkCommand(const char *args, char *out, size_t outLen)
@@ -2018,6 +2274,8 @@ VivaGPUAccelerator::linkCommand(const char *args, char *out, size_t outLen)
 			powerOff(o, end);
 		} else if (strncmp(args, "selftest", 8) == 0) {
 			selftest(strncmp(args, "selftest fault", 14) == 0, o, end);
+		} else if (strncmp(args, "probe", 5) == 0) {
+			probeDump(o, end);
 		} else if (strncmp(args, "publish", 7) == 0) {
 			if (!fPowered) {
 				say(o, end, "GPU off: gpu on first\n");
@@ -2062,7 +2320,7 @@ VivaGPUAccelerator::linkCommand(const char *args, char *out, size_t outLen)
 			    "%llu, GPU faults %llu, timeouts %llu, resets %llu\n", fJobs, fRunning[0] != NULL,
 			    fRunning[1] != NULL, fQueue[0] != NULL, fQueue[1] != NULL, fJobFaults, fMmuFaults, fHeapGrows,
 			    fGpuFaults, fTimeouts, fResets);
-			say(o, end, "usage: gpu [status|mfg|on|off|regs|selftest [fault]|publish]\n");
+			say(o, end, "usage: gpu [status|mfg|on|off|regs|selftest [fault]|probe|publish]\n");
 		}
 		return kIOReturnSuccess;
 	});

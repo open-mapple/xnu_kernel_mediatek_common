@@ -153,6 +153,9 @@ public:
 	bool powered(void) const { return fPowered; }
 	IOReturn getParam(uint32_t param, uint64_t *value);
 	void getVersion(struct vgpu_version *v);
+	/* Unknown user clients and property reads (any thread, own lock). */
+	void probeNote(const char *proc, uint32_t type, uint32_t selector, uint32_t inSize, uint32_t outSize);
+	void propertyRead(const char *key, bool found);
 	void vmFlush(VivaGPUVM *vm, uint64_t va, uint64_t size);   /* page tables changed */
 	void vmDestroyed(VivaGPUVM *vm);
 	VivaGPUBO *findHeapBO(VivaGPUVM *vm, uint64_t va);
@@ -231,6 +234,47 @@ private:
 
 	/* counters */
 	uint64_t fJobs, fJobFaults, fMmuFaults, fGpuFaults, fResets, fTimeouts, fHeapGrows;
+
+	/* unknown user clients and property reads, for "gpu probe" (fProbeLock) */
+	IOLock *fProbeLock;
+	int     fProbeMode;                 /* vivagpuprobe: 0 refuse unknown types, 1 accept and log */
+	struct ProbeEntry { char proc[20]; uint32_t type, selector, count, inSize, outSize; };
+	enum { kProbeMax = 64, kPropMax = 64 };
+	ProbeEntry fProbe[kProbeMax];
+	uint32_t   fProbeCount, fProbeDropped;
+	struct PropEntry { char proc[20]; char key[44]; uint32_t count; bool found; };
+	PropEntry  fProps[kPropMax];
+	uint32_t   fPropCount, fPropDropped;
+	void probeDump(char **out, char *end);
+};
+
+/*
+ * A user client of a type VivaGPUUserClient does not implement (IOGPU.framework's IOGPUDeviceCreate opens one on
+ * the IOAcceleratorES it finds): every call is logged ("gpu probe" lists them) and answered kIOReturnUnsupported.
+ */
+class VivaGPUProbeClient : public IOUserClient {
+	OSDeclareDefaultStructors(VivaGPUProbeClient);
+public:
+	virtual bool initWithTask(task_t owningTask, void *securityID, UInt32 type) APPLE_KEXT_OVERRIDE;
+	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+	virtual IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
+	virtual IOReturn externalMethod(uint32_t selector, IOExternalMethodArguments *args,
+	    IOExternalMethodDispatch *dispatch, OSObject *target, void *reference) APPLE_KEXT_OVERRIDE;
+	virtual IOReturn clientMemoryForType(UInt32 type, IOOptionBits *options,
+	    IOMemoryDescriptor **memory) APPLE_KEXT_OVERRIDE;
+	virtual IOReturn registerNotificationPort(mach_port_t port, UInt32 type,
+	    io_user_reference_t refCon) APPLE_KEXT_OVERRIDE;
+	virtual IOExternalTrap *getTargetAndTrapForIndex(IOService **targetP, UInt32 index) APPLE_KEXT_OVERRIDE;
+	virtual IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
+	virtual IOReturn connectClient(IOUserClient *client) APPLE_KEXT_OVERRIDE;
+
+private:
+	void note(const char *what, uint32_t selector, uint32_t inSize, uint32_t outSize, const char *detail);
+	VivaGPUAccelerator *fGPU;
+	uint32_t            fType;
+	int                 fPid;
+	char                fProc[20];
+	uint32_t            fLogged;
 };
 
 class VivaGPUUserClient : public IOUserClient {

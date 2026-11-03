@@ -3631,6 +3631,14 @@ IOCopyPropertyCompatible(IORegistryEntry * regEntry, const char * name)
 	return obj;
 }
 
+#if defined(ARM64_BOARD_CONFIG_SWEET)
+/* viva GPU (iokit/Kernel/arm/VivaGPU.cpp): logs userspace reads of the accelerator's properties. */
+extern void viva_gpu_property_read(IORegistryEntry *entry, const char *key, bool found);
+#define VIVA_GPU_PROPERTY_READ(e, k, f) viva_gpu_property_read((e), (k), (f))
+#else
+#define VIVA_GPU_PROPERTY_READ(e, k, f) do { } while (0)
+#endif
+
 /* Routine io_registry_entry_get_property */
 kern_return_t
 is_io_registry_entry_get_property_bytes(
@@ -3658,6 +3666,7 @@ is_io_registry_entry_get_property_bytes(
 #endif
 
 	obj = IOCopyPropertyCompatible(entry, property_name);
+	VIVA_GPU_PROPERTY_READ(entry, property_name, obj != NULL);
 	if (!obj) {
 		return kIOReturnNoResources;
 	}
@@ -3726,6 +3735,7 @@ is_io_registry_entry_get_property(
 #endif
 
 	obj = IOCopyPropertyCompatible(entry, property_name);
+	VIVA_GPU_PROPERTY_READ(entry, property_name, obj != NULL);
 	if (!obj) {
 		return kIOReturnNotFound;
 	}
@@ -3774,6 +3784,7 @@ is_io_registry_entry_get_property_recursively(
 
 	obj = entry->copyProperty( property_name,
 	    IORegistryEntry::getPlane( plane ), options );
+	VIVA_GPU_PROPERTY_READ(entry, property_name, obj != NULL);
 	if (!obj) {
 		return kIOReturnNotFound;
 	}
@@ -3874,6 +3885,7 @@ is_io_registry_entry_get_properties_bin_buf(
 	if (!s) {
 		return kIOReturnNoMemory;
 	}
+	VIVA_GPU_PROPERTY_READ(entry, "*", true);
 
 
 	compatProperties = entry->copyProperty(gIOUserServicePropertiesKey);
@@ -3966,6 +3978,9 @@ is_io_registry_entry_get_property_bin_buf(
 	if (!sym) {
 		return kIOReturnNoMemory;
 	}
+#if defined(ARM64_BOARD_CONFIG_SWEET)
+	IORegistryEntry * vivaEntry = entry;     /* the loop below walks entry down the plane */
+#endif
 
 	err = kIOReturnNotFound;
 	if (gIORegistryEntryPropertyKeysKey == sym) {
@@ -4000,6 +4015,7 @@ is_io_registry_entry_get_property_bin_buf(
 	}
 
 	sym->release();
+	VIVA_GPU_PROPERTY_READ(vivaEntry, property_name, obj != NULL);
 	if (!obj) {
 		return err;
 	}
