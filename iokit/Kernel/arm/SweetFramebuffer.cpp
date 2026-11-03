@@ -150,7 +150,10 @@ public:
 	uint64_t      fQueueSeq[SWEET_FB_QUEUE];
 	uint32_t      fQueueCount;
 	uint64_t      fSeq;
-	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
+	uint32_t      fFlushTicks;    /* vsync ticks between panel copies (sweetfb_hz) */
+	uint32_t      fDuty;          /* no sweetfb_hz: copies take at most this % of one CPU (sweetfb_duty) */
+	uint64_t      fNextCopy;      /* absolute time the next copy may start (fDuty) */
+	uint64_t      fCopies, fCopyNs;
 	bool          fPowerOff;      /* RequestPowerChange(0) */
 	uint32_t      fFadeStep;      /* fade-out steps done while off */
 	/* K0c: frames held back for the GPU */
@@ -259,8 +262,13 @@ AppleCLCD::start(IOService *provider)
 		return false;
 	}
 	uint32_t hz = 10;
-	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
-	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
+	fFlushTicks = 0;
+	if (PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz))) {
+		fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
+	}
+	fDuty = 25;
+	PE_parse_boot_argn("sweetfb_duty", &fDuty, sizeof(fDuty));
+	fDuty = MIN(MAX(fDuty, 1u), 100u);
 	fGpuWaitMax = 12;
 	PE_parse_boot_argn("sweetfb_gpuwait", &fGpuWaitMax, sizeof(fGpuWaitMax));
 	fScanOvl = -1;
@@ -321,7 +329,8 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
 		return;
 	}
 	/* scanout or a frame held back for the GPU: every vsync */
-	bool flush = fb->fDirty && (fb->fScanOn || fb->fRetry || (count % fb->fFlushTicks) == 0);
+	bool due = fb->fFlushTicks ? (count % fb->fFlushTicks) == 0 : now >= fb->fNextCopy;
+	bool flush = fb->fDirty && (fb->fScanOn || fb->fRetry || due);
 	uint8_t *recs = NULL;
 	uint64_t seqs[SWEET_FB_QUEUE];
 	uint32_t n = 0;
@@ -442,8 +451,10 @@ sweet_fb_convert_row(uint32_t *dst, const uint8_t *src, int32_t w, uint32_t fmt)
 /*
  * A swap only records the frame: copying 10 MB into the panel on every
  * swap (backboardd presents at 60 Hz) took the whole CPU. The vsync timer
- * shows the latest frame every fFlushTicks ticks (boot-arg sweetfb_hz,
- * default 10 Hz).
+ * shows the latest frame every fFlushTicks ticks with boot-arg sweetfb_hz;
+ * by default as often as the copies stay within sweetfb_duty percent of one
+ * CPU (default 25: a 4 ms copy allows a frame every 16 ms, 60 Hz; an 8 ms
+ * one every 32 ms, 30 Hz). Frames the GPU drew cost the CPU nothing else.
  */
 void
 AppleCLCD::swap(const uint8_t *rec)
@@ -574,6 +585,7 @@ AppleCLCD::present(const uint8_t *rec, bool force, uint64_t jobs)
 			sweet_console_muted = 1;
 		}
 	}
+	uint64_t t0 = mach_absolute_time();
 
 	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
 		uint32_t id = get32(rec, 0x54 + 4 * layer);
@@ -660,6 +672,12 @@ AppleCLCD::present(const uint8_t *rec, bool force, uint64_t jobs)
 		}
 		s->release();
 	}
+	/* the next copy no sooner than its share of the CPU (sweetfb_duty) allows */
+	uint64_t t1 = mach_absolute_time(), ns;
+	fNextCopy = t1 + (t1 - t0) * (100 - fDuty) / fDuty;
+	absolutetime_to_nanoseconds(t1 - t0, &ns);
+	fCopies++;
+	fCopyNs += ns;
 	/* a GPU job used a surface while it was copied (CoreAnimation reuses it): the copy may be mixed, redo it */
 	if (!force && (!layersIdle(rec, &jobsAfter) || jobsAfter != jobs)) {
 		fGpuTicks++;
@@ -933,6 +951,8 @@ AppleCLCD::dispCommand(const char *args, char *out, size_t len)
 		    "%llu copied%s%s\n", fWidth, fHeight, fLogicalW, fLogicalH, fScanOn ? "on" : "off",
 		    fScanActive ? " (active)" : "", fScanOvl >= 0 ? fScanLayer : "?", fScanFrames, fScanFallbacks,
 		    fScanWhy ? ", last reason: " : "", fScanWhy ? fScanWhy : "");
+		disp_say(&p, end, "copies: %llu, avg %llu us, refresh %s%u\n", fCopies, fCopies ? fCopyNs / fCopies / 1000 : 0,
+		    fFlushTicks ? "every N vsyncs, N = " : "adaptive, CPU duty % = ", fFlushTicks ? fFlushTicks : fDuty);
 		disp_say(&p, end, "GPU sync (K0c): %llu vsyncs waited for the GPU, %llu copies redone, %llu frames shown anyway "
 		    "(sweetfb_gpuwait=%u)\n", fGpuWaits, fGpuRecopies, fGpuForced, fGpuWaitMax);
 		disp_say(&p, end, "usage: disp [regs|scanout on|scanout off]\n");

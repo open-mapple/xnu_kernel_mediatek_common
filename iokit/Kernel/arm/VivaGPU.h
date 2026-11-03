@@ -245,6 +245,8 @@ private:
 	static void mmuInterrupt(OSObject *owner, IOInterruptEventSource *src, int count);
 	static void jobInterrupt(OSObject *owner, IOInterruptEventSource *src, int count);
 	static void jobTimer(OSObject *owner, IOTimerEventSource *src);
+	static void dvfsTimer(OSObject *owner, IOTimerEventSource *src);
+	void dvfsSample(void);
 	void selftest(bool fault, char **out, char *end);
 
 	inline uint32_t rd(uint32_t off) { return *(volatile uint32_t *)(fMali + off); }
@@ -254,6 +256,7 @@ private:
 	IOCommandGate          *fGate;
 	IOInterruptEventSource *fIrq[3];        /* GPU, MMU, JOB */
 	IOTimerEventSource     *fTimer;
+	IOTimerEventSource     *fDvfsTimer;
 	IOMemoryMap            *fMaps[6];       /* mali, mfgcfg, spm, topckgen, apmixed, infracfg_ao */
 	vm_offset_t             fMali, fMfgcfg, fSpm, fTopck, fApmixed, fInfra;
 	VivaPwrap              *fPwrap;
@@ -301,6 +304,12 @@ private:
 	 * write-combined like on Linux (Mesa with DRM 1.5 expects that): no CPU cache maintenance at all.
 	 */
 	bool     fLazy, fWC;
+	/* flush reduction (vivagpuflushid, 1 default): JS_FLUSH_ID_NEXT = GPU_LATEST_FLUSH at submit */
+	bool     fFlushReduce;
+	/* DVFS governor (vivagpudvfs, 1 default; fOpp is the floor, fDvfsFast from vivagpufreqmax) */
+	bool     fDvfs, fDvfsArmed;
+	uint32_t fDvfsFast, fLoadPct;
+	uint64_t fBusyStart, fBusyNs, fWindowStart, fDvfsUpMs, fDvfsUps, fDvfsDowns;
 	uint64_t fImplicitDeps, fLazyListed, fLazyBytes, fLazyNs, fLazyWaits, fLazyOverflows;
 	void cacheStats(char **out, char *end);
 public:

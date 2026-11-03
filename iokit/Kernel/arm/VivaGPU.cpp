@@ -67,6 +67,7 @@
 #define GPU_IRQ_STATUS          0x02c
 #define GPU_COMMAND             0x030
 #define GPU_STATUS              0x034
+#define GPU_LATEST_FLUSH        0x038   /* flush ID: counts the GPU's cache flushes */
 #define GPU_FAULT_STATUS        0x03c
 #define GPU_FAULT_ADDRESS_LO    0x040
 #define GPU_FAULT_ADDRESS_HI    0x044
@@ -132,6 +133,7 @@
 #define JS_AFFINITY_NEXT_HI     0x54
 #define JS_CONFIG_NEXT          0x58
 #define JS_COMMAND_NEXT         0x60
+#define JS_FLUSH_ID_NEXT        0x70    /* start flush skipped if a flush happened after this ID */
 #define JS_CMD_NOP              0
 #define JS_CMD_START            1
 #define JS_CMD_HARD_STOP        3
@@ -187,6 +189,10 @@
 #define JOB_STOP_GRACE_MS       500
 #define JOB_TIMEOUT_AFTER_FAULT_MS 500  /* fragment chains after a fault without reset (TTRX_3076 watch) */
 #define TIMER_MS                250
+#define DVFS_WINDOW_MS          50      /* governor sampling period */
+#define DVFS_UP_PCT             85      /* busier than this: fastest OPP */
+#define DVFS_TARGET_PCT         70      /* lower: the OPP that would be this busy */
+#define DVFS_HOLD_MS            200     /* no step down this soon after a step up */
 #define HEAP_CHUNK              (2ull << 20)
 #define GPU_MEMORY_LIMIT        (2048ll << 20)  /* default of boot-arg vivagpumemtotal (MiB) */
 #define GPU_PROCESS_LIMIT       (1024ll << 20)  /* default of boot-arg vivagpumem (MiB, per process) */
@@ -405,6 +411,7 @@ struct VivaGPUJob {
 	OSArray      *bos;      /* VivaGPUBO */
 	VivaGPUFence *fence;
 	uint64_t      startMs;
+	uint32_t      flushId;  /* GPU_LATEST_FLUSH at submit (flush reduction) */
 };
 
 /* ---- address spaces ---- */
@@ -836,6 +843,18 @@ VivaGPUAccelerator::start(IOService *provider)
 	flag = 1;
 	PE_parse_boot_argn("vivagpuwc", &flag, sizeof(flag));
 	fWC = flag != 0 && fCacheMode != 0;
+	flag = 1;
+	PE_parse_boot_argn("vivagpuflushid", &flag, sizeof(flag));
+	fFlushReduce = flag != 0;
+	flag = 1;
+	PE_parse_boot_argn("vivagpudvfs", &flag, sizeof(flag));
+	fDvfs = flag != 0;
+	uint32_t maxMhz = 950;
+	PE_parse_boot_argn("vivagpufreqmax", &maxMhz, sizeof(maxMhz));
+	fDvfsFast = oppForMHz(maxMhz);
+	if (fDvfsFast > fOpp) {
+		fDvfsFast = fOpp;       /* never below the floor (vivagpufreq) */
+	}
 	int64_t mib = GPU_MEMORY_LIMIT >> 20;
 	PE_parse_boot_argn("vivagpumemtotal", &mib, sizeof(mib));
 	fMemLimit = mib << 20;
@@ -870,11 +889,12 @@ VivaGPUAccelerator::start(IOService *provider)
 	}
 	fGate = IOCommandGate::commandGate(this);
 	fTimer = IOTimerEventSource::timerEventSource(this, &VivaGPUAccelerator::jobTimer);
+	fDvfsTimer = IOTimerEventSource::timerEventSource(this, &VivaGPUAccelerator::dvfsTimer);
 	IOInterruptEventSource::Action actions[3] = {
 		&VivaGPUAccelerator::gpuInterrupt, &VivaGPUAccelerator::mmuInterrupt, &VivaGPUAccelerator::jobInterrupt,
 	};
-	if (fGate == NULL || fTimer == NULL || fWorkLoop->addEventSource(fGate) != kIOReturnSuccess ||
-	    fWorkLoop->addEventSource(fTimer) != kIOReturnSuccess) {
+	if (fGate == NULL || fTimer == NULL || fDvfsTimer == NULL || fWorkLoop->addEventSource(fGate) != kIOReturnSuccess ||
+	    fWorkLoop->addEventSource(fTimer) != kIOReturnSuccess || fWorkLoop->addEventSource(fDvfsTimer) != kIOReturnSuccess) {
 		return false;
 	}
 	for (int i = 0; i < 3; i++) {
@@ -921,6 +941,11 @@ VivaGPUAccelerator::free(void)
 		fTimer->cancelTimeout();
 		fWorkLoop->removeEventSource(fTimer);
 		fTimer->release();
+	}
+	if (fDvfsTimer != NULL) {
+		fDvfsTimer->cancelTimeout();
+		fWorkLoop->removeEventSource(fDvfsTimer);
+		fDvfsTimer->release();
 	}
 	if (fGate != NULL) {
 		fWorkLoop->removeEventSource(fGate);
@@ -2103,6 +2128,7 @@ VivaGPUAccelerator::submit(VivaGPUVM *vm, uint64_t jc, uint32_t requirements, OS
 	vm->retain();
 	job->jc = jc;
 	job->requirements = requirements;
+	job->flushId = rd(GPU_LATEST_FLUSH);    /* after every CPU write for this job */
 	job->deps = deps;
 	if (deps != NULL) {
 		deps->retain();
@@ -2289,6 +2315,9 @@ void
 VivaGPUAccelerator::startJob(uint32_t slot, VivaGPUJob *job)
 {
 	uint32_t js = JS_BASE(slot);
+	if (fRunning[0] == NULL && fRunning[1] == NULL) {
+		fBusyStart = mach_absolute_time();      /* GPU busy from now (DVFS load) */
+	}
 	fRunning[slot] = job;
 	fStopDeadline[slot] = 0;
 	job->vm->running++;
@@ -2300,10 +2329,24 @@ VivaGPUAccelerator::startJob(uint32_t slot, VivaGPUJob *job)
 	wr(js + JS_AFFINITY_NEXT_HI, (uint32_t)(fShaderPresent >> 32));
 	wr(js + JS_CONFIG_NEXT, (uint32_t)job->vm->asSlot | JS_CFG_THREAD_PRI(8) | JS_CFG_START_FLUSH_CLEAN_INV |
 	    JS_CFG_END_FLUSH_CLEAN_INV);
+	/*
+	 * Flush reduction (as Linux's panfrost on FLUSH_REDUCTION GPUs, every Valhall): the start-of-chain L2 clean +
+	 * invalidate is skipped when a flush happened after the job was submitted. Every chain ends with one, so
+	 * with jobs back to back the start flush is almost never needed.
+	 */
+	if (fFlushReduce) {
+		wr(js + JS_FLUSH_ID_NEXT, job->flushId);
+	}
 	wr(js + JS_COMMAND_NEXT, JS_CMD_START);
 	if (!fTimerArmed) {
 		fTimerArmed = true;
 		fTimer->setTimeoutMS(TIMER_MS);
+	}
+	if (fDvfs && !fDvfsArmed) {
+		fDvfsArmed = true;
+		fWindowStart = mach_absolute_time();
+		fBusyNs = 0;
+		fDvfsTimer->setTimeoutMS(DVFS_WINDOW_MS);
 	}
 }
 
@@ -2317,6 +2360,10 @@ VivaGPUAccelerator::completeJob(uint32_t slot, IOReturn error, uint32_t status)
 	fRunning[slot] = NULL;
 	fStopDeadline[slot] = 0;
 	job->vm->running--;
+	if (fRunning[0] == NULL && fRunning[1] == NULL && fBusyStart != 0) {
+		fBusyNs += mach_absolute_time() - fBusyStart;   /* absolute-time units */
+		fBusyStart = 0;
+	}
 	if (error != kIOReturnSuccess) {
 		fJobFaults++;
 		if (fJobFaults <= 32) {
@@ -2583,6 +2630,68 @@ VivaGPUAccelerator::jobTimer(OSObject *owner, IOTimerEventSource *src __unused)
 	}
 }
 
+/*
+ * DVFS governor (vivagpudvfs=1, default): every DVFS_WINDOW_MS, the share of time a chain was on the hardware.
+ * Busier than DVFS_UP_PCT: straight to the fastest OPP (vivagpufreqmax); otherwise, no sooner than DVFS_HOLD_MS
+ * after a step up, down to the slowest OPP that would still be at most DVFS_TARGET_PCT busy, never below
+ * vivagpufreq. setOpp() steps the rails 50 mV at a time with jobs running (about 1 ms, gated). Idle at the floor:
+ * the timer stops until the next job.
+ */
+void
+VivaGPUAccelerator::dvfsTimer(OSObject *owner, IOTimerEventSource *src __unused)
+{
+	VivaGPUAccelerator *self = OSDynamicCast(VivaGPUAccelerator, owner);
+	if (self == NULL) {
+		return;
+	}
+	self->dvfsSample();
+}
+
+void
+VivaGPUAccelerator::dvfsSample(void)
+{
+	fDvfsArmed = false;
+	if (!fPowered || !fDvfs) {
+		return;
+	}
+	uint64_t now = mach_absolute_time(), busy = fBusyNs, window = now - fWindowStart;
+	if (fBusyStart != 0) {
+		busy += now - fBusyStart;
+		fBusyStart = now;
+	}
+	fBusyNs = 0;
+	fWindowStart = now;
+	uint32_t pct = window ? (uint32_t)MIN(busy * 100 / window, 100ull) : 0;
+	fLoadPct = pct;
+	/* OPP indexes: 0 is the fastest; fOpp (vivagpufreq, "gpu freq") the slowest allowed, fDvfsFast the fastest */
+	uint32_t fast = MIN(fDvfsFast, fOpp), cur = fClockOpp, want = cur;
+	uint64_t msec = nowMs();
+	if (pct >= DVFS_UP_PCT) {
+		want = fast;
+	} else if (msec - fDvfsUpMs >= DVFS_HOLD_MS) {
+		uint32_t khz = (uint32_t)((uint64_t)gVivaOpp[cur].khz * pct / DVFS_TARGET_PCT);
+		while (want + 1 < OPP_COUNT && gVivaOpp[want + 1].khz >= khz) {
+			want++;         /* slower while still fast enough */
+		}
+	}
+	want = MIN(MAX(want, fast), fOpp);
+	if (want != cur) {
+		if (gVivaOpp[want].khz > gVivaOpp[cur].khz) {
+			fDvfsUps++;
+			fDvfsUpMs = msec;
+		} else {
+			fDvfsDowns++;
+		}
+		uint32_t floor = fOpp;
+		setOpp(want, NULL, NULL);
+		fOpp = floor;
+	}
+	if (pct != 0 || fClockOpp != fOpp || fRunning[0] != NULL || fRunning[1] != NULL) {
+		fDvfsArmed = true;
+		fDvfsTimer->setTimeoutMS(DVFS_WINDOW_MS);
+	}
+}
+
 IOReturn
 VivaGPUAccelerator::sleepUntil(uint64_t deadline)
 {
@@ -2754,7 +2863,7 @@ VivaGPUAccelerator::selftest(bool fault, char **out, char *end)
 	bo->release();
 }
 
-/* ---- USB link: "gpu [status|mfg|on|off|regs|freq [MHz]|selftest [fault]|probe|publish]" ---- */
+/* ---- USB link: "gpu [status|mfg|on|off|regs|freq [MHz]|dvfs [on|off]|selftest [fault]|probe|publish]" ---- */
 
 void
 VivaGPUAccelerator::linkCommand(const char *args, char *out, size_t outLen)
@@ -2792,6 +2901,15 @@ VivaGPUAccelerator::linkCommand(const char *args, char *out, size_t outLen)
 				}
 				say(o, end, "\n");
 			}
+		} else if (strncmp(args, "dvfs", 4) == 0) {
+			if (strncmp(args, "dvfs on", 7) == 0) {
+				fDvfs = true;
+			} else if (strncmp(args, "dvfs off", 8) == 0) {
+				fDvfs = false;
+			}
+			say(o, end, "dvfs %s: %u..%u MHz (vivagpufreq..vivagpufreqmax), now %u MHz, load %u%%, %llu up %llu down\n",
+			    fDvfs ? "on" : "off", gVivaOpp[fOpp].khz / 1000, gVivaOpp[MIN(fDvfsFast, fOpp)].khz / 1000,
+			    gVivaOpp[fClockOpp].khz / 1000, fLoadPct, fDvfsUps, fDvfsDowns);
 		} else if (strncmp(args, "probe", 5) == 0) {
 			probeDump(o, end);
 		} else if (strncmp(args, "publish", 7) == 0) {
@@ -2840,7 +2958,10 @@ VivaGPUAccelerator::linkCommand(const char *args, char *out, size_t outLen)
 			    fWatchFragment ? ", watching fragment jobs" : "", fHeapGrows, fGpuFaults, fTimeouts, fResets);
 			memoryDump(o, end);
 			cacheStats(o, end);
-			say(o, end, "usage: gpu [status|mfg|on|off|regs|freq [MHz]|selftest [fault]|probe|publish]\n");
+			say(o, end, "dvfs %s (%u..%u MHz, load %u%%, %llu up %llu down), flush reduction %s\n", fDvfs ? "on" : "off",
+			    gVivaOpp[fOpp].khz / 1000, gVivaOpp[MIN(fDvfsFast, fOpp)].khz / 1000, fLoadPct, fDvfsUps, fDvfsDowns,
+			    fFlushReduce ? "on" : "off");
+			say(o, end, "usage: gpu [status|mfg|on|off|regs|freq [MHz]|dvfs [on|off]|selftest [fault]|probe|publish]\n");
 		}
 		return kIOReturnSuccess;
 	});
