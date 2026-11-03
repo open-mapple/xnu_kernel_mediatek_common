@@ -182,7 +182,11 @@ private:
 	bool regulatorSet(uint32_t enAddr, uint32_t voselAddr, uint32_t sel);
 	bool mtcmosOn(uint32_t idx, char **out, char *end);
 	bool mtcmosOff(uint32_t idx, char **out, char *end);
-	void mfgClock(char **out, char *end);
+	void mfgClock(uint32_t opp, char **out, char *end);
+	void oppSels(uint32_t opp, uint32_t *vgpuSel, uint32_t *vsramSel);
+	void railsRead(uint32_t *vgEn, uint32_t *vg, uint32_t *vsEn, uint32_t *vs);
+	bool railsTo(uint32_t vgpuSel, uint32_t vsramSel);
+	IOReturn setOpp(uint32_t opp, char **out, char *end);
 	void protRelease(int from = 3);
 	/* Mali */
 	bool maliInit(char **out, char *end);
@@ -221,6 +225,9 @@ private:
 	vm_offset_t             fMali, fMfgcfg, fSpm, fTopck, fApmixed, fInfra;
 	VivaPwrap              *fPwrap;
 	int                     fMode;          /* vivagpu boot-arg */
+	uint32_t                fOpp;           /* OPP index (gVivaOpp) for the next power on / "gpu freq" */
+	uint32_t                fClockOpp;      /* OPP the MFGPLL runs at */
+	int                     fMarginMv;      /* vivagpumv: added to the table's VGPU */
 	bool                    fPowered, fPublished, fAcpDone, fTimerArmed;
 	char                    fFenceEvent;
 
