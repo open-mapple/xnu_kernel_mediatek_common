@@ -40,6 +40,17 @@
  * shadow registers are bypassed on MT6781, so the switch is not tied to
  * vblank yet (a frame may tear).
  *
+ * GPU-drawn frames (K0c): backboardd hands a surface to SwapEnd right after
+ * committing its command buffer, without waiting for the GPU (on Apple the
+ * display driver waits). Swaps are therefore queued in order (the last
+ * SWEET_FB_QUEUE) and a tick shows the newest one whose surfaces have no GPU
+ * job pending (viva_gpu_surface_idle), dropping it and the older ones. If
+ * none is ready nothing is shown and the next vsync tick tries again (no
+ * waiting in the timer). A copy during which a new job used one of the
+ * surfaces is redone at the next tick. After sweetfb_gpuwait ticks (default
+ * 12, 200 ms) the newest frame is shown anyway; sweetfb_gpuwait=0 turns the
+ * wait off.
+ *
  * The panel memory itself is published as an IOSurface and returned as the
  * default framebuffer surface. The kernel text console keeps drawing over
  * the GUI by default: boot-arg sweetfb_noconsole=1 stops drawing it from
@@ -77,6 +88,7 @@ enum {
 
 #define SWEET_FB_SWAP_REC_SIZE          0x46c
 #define SWEET_FB_LAYERS                 4
+#define SWEET_FB_QUEUE                  4       /* swaps waiting for the GPU (K0c) */
 #define SWEET_FB_NOTIFY_TYPES           8
 #define SWEET_FB_NOTIFY_VSYNC           5
 #define SWEET_FB_VSYNC_US               16667
@@ -132,11 +144,20 @@ public:
 	OSArray      *fClients;
 	uint32_t      fSwapID;
 	bool          fConsolePaused;
-	uint8_t       fPending[SWEET_FB_SWAP_REC_SIZE];     /* latest swap, not yet shown */
+	uint8_t       fPending[SWEET_FB_SWAP_REC_SIZE];     /* latest swap (redrawn when the display comes on) */
 	bool          fDirty;
+	uint8_t       fQueue[SWEET_FB_QUEUE][SWEET_FB_SWAP_REC_SIZE];       /* swaps not shown yet, oldest first */
+	uint64_t      fQueueSeq[SWEET_FB_QUEUE];
+	uint32_t      fQueueCount;
+	uint64_t      fSeq;
 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
 	bool          fPowerOff;      /* RequestPowerChange(0) */
 	uint32_t      fFadeStep;      /* fade-out steps done while off */
+	/* K0c: frames held back for the GPU */
+	bool          fRetry;         /* the pending frame waits for the GPU: try again at the next tick */
+	uint32_t      fGpuTicks;      /* consecutive ticks the pending frame waited */
+	uint32_t      fGpuWaitMax;    /* sweetfb_gpuwait: ticks before showing it anyway */
+	uint64_t      fGpuWaits, fGpuRecopies, fGpuForced;
 
 	/* viva direct scanout (see the top) */
 	IOLock       *fScanLock;      /* scanout state: present() vs. the link command */
@@ -155,6 +176,7 @@ public:
 	bool dispMap(void);
 	bool findLKLayer(char **out, char *end);
 	bool scanout(const uint8_t *rec);
+	bool layersIdle(const uint8_t *rec, uint64_t *jobs);
 	void scanoutStop(void);
 	void dispCommand(const char *args, char *out, size_t len);
 
@@ -162,7 +184,8 @@ public:
 	void addClient(IOMobileFramebufferUserClient *client);
 	void removeClient(IOMobileFramebufferUserClient *client);
 	void swap(const uint8_t *rec);
-	void present(const uint8_t *rec);
+	bool present(const uint8_t *rec, bool force, uint64_t jobs);
+	int presentQueued(const uint8_t *recs, uint32_t n);
 };
 
 OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
@@ -238,6 +261,8 @@ AppleCLCD::start(IOService *provider)
 	uint32_t hz = 10;
 	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
 	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
+	fGpuWaitMax = 12;
+	PE_parse_boot_argn("sweetfb_gpuwait", &fGpuWaitMax, sizeof(fGpuWaitMax));
 	fScanOvl = -1;
 	fScanLock = IOLockAlloc();
 	uint32_t scan = 0;
@@ -295,19 +320,51 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
 		sender->setTimeoutUS(SWEET_FB_VSYNC_US);
 		return;
 	}
-	bool flush = fb->fDirty && (fb->fScanOn || (count % fb->fFlushTicks) == 0);     /* scanout: every vsync */
-	uint8_t *rec = NULL;
+	/* scanout or a frame held back for the GPU: every vsync */
+	bool flush = fb->fDirty && (fb->fScanOn || fb->fRetry || (count % fb->fFlushTicks) == 0);
+	uint8_t *recs = NULL;
+	uint64_t seqs[SWEET_FB_QUEUE];
+	uint32_t n = 0;
 	if (flush) {
-		rec = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE);
-		if (rec != NULL) {
-			memcpy(rec, fb->fPending, SWEET_FB_SWAP_REC_SIZE);
+		recs = (uint8_t *)IOMallocData(SWEET_FB_QUEUE * SWEET_FB_SWAP_REC_SIZE);
+		if (recs != NULL) {
+			if (fb->fQueueCount != 0) {
+				n = fb->fQueueCount;
+				memcpy(recs, fb->fQueue, n * SWEET_FB_SWAP_REC_SIZE);
+				memcpy(seqs, fb->fQueueSeq, n * sizeof(seqs[0]));
+			} else {
+				n = 1;                  /* redraw of the latest frame */
+				memcpy(recs, fb->fPending, SWEET_FB_SWAP_REC_SIZE);
+				seqs[0] = 0;
+			}
 			fb->fDirty = false;
 		}
 	}
 	IOLockUnlock(fb->fLock);
-	if (rec != NULL) {
-		fb->present(rec);
-		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+	if (n != 0) {
+		int shown = fb->presentQueued(recs, n);
+		IOLockLock(fb->fLock);
+		if (shown >= 0 && seqs[shown] != 0) {
+			uint32_t keep = 0;      /* drop the shown swap and the older ones */
+			for (uint32_t i = 0; i < fb->fQueueCount; i++) {
+				if (fb->fQueueSeq[i] > seqs[shown]) {
+					if (keep != i) {
+						memcpy(fb->fQueue[keep], fb->fQueue[i], SWEET_FB_SWAP_REC_SIZE);
+						fb->fQueueSeq[keep] = fb->fQueueSeq[i];
+					}
+					keep++;
+				}
+			}
+			fb->fQueueCount = keep;
+		}
+		fb->fRetry = shown < 0;         /* held back for the GPU: try again at the next tick */
+		if (shown < 0 || fb->fQueueCount != 0) {
+			fb->fDirty = true;
+		}
+		IOLockUnlock(fb->fLock);
+	}
+	if (recs != NULL) {
+		IOFreeData(recs, SWEET_FB_QUEUE * SWEET_FB_SWAP_REC_SIZE);
 	}
 	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
 }
@@ -393,6 +450,14 @@ AppleCLCD::swap(const uint8_t *rec)
 {
 	IOLockLock(fLock);
 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
+	if (fQueueCount == SWEET_FB_QUEUE) {
+		/* the oldest swap was never shown: drop it */
+		memmove(fQueue[0], fQueue[1], (SWEET_FB_QUEUE - 1) * SWEET_FB_SWAP_REC_SIZE);
+		memmove(&fQueueSeq[0], &fQueueSeq[1], (SWEET_FB_QUEUE - 1) * sizeof(fQueueSeq[0]));
+		fQueueCount--;
+	}
+	memcpy(fQueue[fQueueCount], rec, SWEET_FB_SWAP_REC_SIZE);
+	fQueueSeq[fQueueCount++] = ++fSeq;
 	fDirty = true;
 	IOLockUnlock(fLock);
 	/* the format of every layer CoreAnimation sets (SwapSetLayer), logged when it changes */
@@ -422,17 +487,83 @@ AppleCLCD::swap(const uint8_t *rec)
 	}
 }
 
-void
-AppleCLCD::present(const uint8_t *rec)
+/*
+ * K0c: no GPU job pending on any enabled layer's surface. *jobs = the GPU jobs that used them so far (it only
+ * grows: a change means a new job touched one of them).
+ */
+bool
+AppleCLCD::layersIdle(const uint8_t *rec, uint64_t *jobs)
 {
 	uint32_t mask = get32(rec, 0x104);
+	bool idle = true;
+	*jobs = 0;
+	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
+		uint32_t id = get32(rec, 0x54 + 4 * layer);
+		if (!(mask & (1u << layer)) || id == 0) {
+			continue;
+		}
+		SweetSurface *s = sweet_surface_copy(id);
+		if (s == NULL || s == fSurface) {
+			OSSafeReleaseNULL(s);
+			continue;
+		}
+		uint64_t n = 0;
+		if (!viva_gpu_surface_idle(s, &n)) {
+			idle = false;
+		}
+		*jobs += n;
+		s->release();
+	}
+	return idle;
+}
 
+/*
+ * K0c: show the newest of the n queued swaps (oldest first) whose surfaces the GPU has finished. Returns its index,
+ * or -1 when none is ready yet (or its copy has to be redone): nothing shown, retry at the next tick.
+ */
+int
+AppleCLCD::presentQueued(const uint8_t *recs, uint32_t n)
+{
+	uint64_t jobs = 0;
+	int pick = -1;
+	for (int i = (int)n - 1; i >= 0; i--) {
+		if (layersIdle(recs + (size_t)i * SWEET_FB_SWAP_REC_SIZE, &jobs)) {
+			pick = i;
+			break;
+		}
+	}
+	bool force = false;
+	if (pick < 0) {
+		if (fGpuWaitMax != 0 && fGpuTicks < fGpuWaitMax) {
+			fGpuTicks++;
+			fGpuWaits++;
+			return -1;
+		}
+		pick = (int)n - 1;
+		force = true;
+		if (fGpuWaitMax != 0 && ++fGpuForced <= 8) {
+			IOLog("SWEET FB: frame shown after waiting %u vsyncs for the GPU\n", fGpuTicks);
+		}
+	}
+	return present(recs + (size_t)pick * SWEET_FB_SWAP_REC_SIZE, force, jobs) ? pick : -1;
+}
+
+/*
+ * Show a swap whose surfaces the GPU has finished (jobs = their GPU job count then; force: shown as it is). false:
+ * a new GPU job used a surface during the copy, which may be mixed: redo it at the next tick.
+ */
+bool
+AppleCLCD::present(const uint8_t *rec, bool force, uint64_t jobs)
+{
+	uint32_t mask = get32(rec, 0x104);
+	uint64_t jobsAfter = 0;
 
 	IOLockLock(fScanLock);
 	bool scanned = fScanOn && scanout(rec);
 	IOLockUnlock(fScanLock);
 	if (scanned) {
-		return;
+		fGpuTicks = 0;
+		return true;
 	}
 	if (!fConsolePaused) {
 		int quiet = 0;
@@ -529,6 +660,14 @@ AppleCLCD::present(const uint8_t *rec)
 		}
 		s->release();
 	}
+	/* a GPU job used a surface while it was copied (CoreAnimation reuses it): the copy may be mixed, redo it */
+	if (!force && (!layersIdle(rec, &jobsAfter) || jobsAfter != jobs)) {
+		fGpuTicks++;
+		fGpuRecopies++;
+		return false;
+	}
+	fGpuTicks = 0;
+	return true;
 }
 
 /* ---- viva direct scanout ---- */
@@ -794,6 +933,8 @@ AppleCLCD::dispCommand(const char *args, char *out, size_t len)
 		    "%llu copied%s%s\n", fWidth, fHeight, fLogicalW, fLogicalH, fScanOn ? "on" : "off",
 		    fScanActive ? " (active)" : "", fScanOvl >= 0 ? fScanLayer : "?", fScanFrames, fScanFallbacks,
 		    fScanWhy ? ", last reason: " : "", fScanWhy ? fScanWhy : "");
+		disp_say(&p, end, "GPU sync (K0c): %llu vsyncs waited for the GPU, %llu copies redone, %llu frames shown anyway "
+		    "(sweetfb_gpuwait=%u)\n", fGpuWaits, fGpuRecopies, fGpuForced, fGpuWaitMax);
 		disp_say(&p, end, "usage: disp [regs|scanout on|scanout off]\n");
 	}
 	IOLockUnlock(fScanLock);

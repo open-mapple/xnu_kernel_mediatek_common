@@ -90,6 +90,8 @@ enum {
 #define SWEET_SURFACE_BULK_SIZE         0x70
 #define SWEET_SURFACE_MAX_VALUES        (256u << 10)    /* serialized values per surface */
 #define kIOSurfaceLockReadOnly          0x1
+#define kIOSurfaceLockAvoidSync         0x2     /* do not wait for pending GPU access: kIOReturnCannotLock instead */
+#define SWEET_SURFACE_LOCK_WAIT_MS      1000    /* longest wait for the GPU in IOSurfaceLock */
 
 static IOLock       *sweet_surface_lock;
 static SweetSurface *sweet_surface_table[SWEET_SURFACE_MAX_ID];
@@ -117,6 +119,7 @@ SweetSurface::free()
 	OSSafeReleaseNULL(memory);
 	OSSafeReleaseNULL(state);
 	OSSafeReleaseNULL(values);
+	OSSafeReleaseNULL(gpuFence);
 	OSObject::free();
 }
 
@@ -1111,6 +1114,14 @@ IOSurfaceRootUserClient::trapLock(void *id, void *options, void *seedOut,
 	SweetSurface *s = sweet_surface_held(fLock, fRefs, (uint32_t)(uintptr_t)id);
 	if (s == NULL) {
 		return kIOReturnNotFound;
+	}
+	/* like Apple's: the lock waits for the GPU jobs pending on the surface (AvoidSync: fail instead) */
+	if (!viva_gpu_surface_idle(s, NULL)) {
+		if ((uintptr_t)options & kIOSurfaceLockAvoidSync) {
+			s->release();
+			return kIOReturnCannotLock;
+		}
+		viva_gpu_surface_wait(s, SWEET_SURFACE_LOCK_WAIT_MS);
 	}
 	sweet_surface_before_cpu_access(s);
 	if (!((uintptr_t)options & kIOSurfaceLockReadOnly) && OSDynamicCast(IOBufferMemoryDescriptor, s->memory)) {

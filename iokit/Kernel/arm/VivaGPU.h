@@ -43,6 +43,7 @@ class VivaPwrap;
 enum { kVivaCacheClean, kVivaCacheFlush };
 void cacheBuffer(IOBufferMemoryDescriptor *md, uint64_t offset, uint64_t len, int op);
 class VivaGPUAccelerator;
+class VivaGPUBO;
 class SweetSurface;
 
 /* Metal of iOS 16 looks GPUs up with IOServiceMatching("IOAcceleratorES") (IOGPUFamily is not in this kernel). */
@@ -92,6 +93,15 @@ public:
 	uint32_t   bos;
 	VivaGPUVM *nextVM;              /* the accelerator's list of live VMs */
 
+	/*
+	 * Lazy invalidation (vivagpulazy=1): CPU-maintained BOs the GPU used since the CPU last dropped their lines.
+	 * Not retained (a BO leaves the list when freed); flushed when userspace waits (WAIT_BO, syncobj wait).
+	 */
+	void invAdd(VivaGPUBO *bo);
+	void invRemove(VivaGPUBO *bo);
+	VivaGPUBO **inv;
+	uint32_t    invCount, invCap;
+
 private:
 	uint64_t *tableFor(uint64_t va, bool create);
 	uint64_t *tableKVA(uint64_t pa);
@@ -136,7 +146,8 @@ public:
 	bool                lazySurface;/* cacheable IOSurface: cleaned only after a CPU write lock (SweetSurface) */
 	bool                cacheable;  /* CPU-cacheable memory (SYNC_BO applies) */
 	bool                prepared;   /* memory->prepare() done (user memory) */
-	VivaGPUFence       *busy;       /* fence of the last job using it */
+	bool                invPending; /* in vm->inv: the GPU used it, the CPU lines are not dropped yet */
+	VivaGPUFence       *busy;       /* fence of the last job using it (it signals after every earlier one) */
 	IOBufferMemoryDescriptor **chunks;      /* heap: one per 2 MiB of VA, NULL until the GPU faults on it */
 	uint32_t            chunkCount;
 	SweetSurface       *surface;
@@ -166,6 +177,17 @@ public:
 	    VivaGPUFence *fence);
 	/* Gated: sleep until the fence signals or the absolute deadline (0 = forever) passes. */
 	IOReturn waitFence(VivaGPUFence *fence, uint64_t deadline);
+	/* Gated: no pending job uses the BO (for an IOSurface: in any connection). */
+	static bool boIdle(VivaGPUBO *bo);
+	/* Gated: no pending job uses the surface (any connection); *jobs = jobs that used it so far. */
+	static bool surfaceIdle(SweetSurface *surface, uint64_t *jobs);
+	/*
+	 * Gated, lazy invalidation: drop the CPU lines of the idle BOs of vm->inv (only = that BO alone, if listed),
+	 * so the CPU reads what the GPU wrote. Called when userspace waits for the GPU.
+	 */
+	void invalidatePending(VivaGPUVM *vm, VivaGPUBO *only);
+	bool lazyInvalidate(void) const { return fLazy; }
+	bool writeCombined(void) const { return fWC; }
 	/* Gated: sleep until any fence or syncobj changes (kIOReturnTimeout, kIOReturnAborted). */
 	IOReturn sleepUntil(uint64_t deadline);
 	void wakeWaiters(void) { fGate->commandWakeup(&fFenceEvent, false); }
@@ -213,6 +235,7 @@ private:
 	void asDisable(int as);
 	bool asBind(VivaGPUVM *vm);
 	/* jobs */
+	void addImplicitDep(OSArray *deps, VivaGPUFence *f, VivaGPUFence *self);
 	void kick(void);
 	void startJob(uint32_t slot, VivaGPUJob *job);
 	void completeJob(uint32_t slot, IOReturn error, uint32_t status);
@@ -272,6 +295,13 @@ private:
 	 */
 	int      fCacheMode;
 	uint64_t fSubmits, fSubmitNs, fSubmitCacheNs, fSubmitCacheBytes, fDoneCacheNs, fDoneCacheBytes;
+	/*
+	 * K0b: vivagpulazy (1 default): after a job only list the CPU-maintained BOs, their lines are dropped when
+	 * userspace waits (0: after every job, as before). vivagpuwc (1 default): BOs without VGPU_BO_WB_MMAP are
+	 * write-combined like on Linux (Mesa with DRM 1.5 expects that): no CPU cache maintenance at all.
+	 */
+	bool     fLazy, fWC;
+	uint64_t fImplicitDeps, fLazyListed, fLazyBytes, fLazyNs, fLazyWaits, fLazyOverflows;
 	void cacheStats(char **out, char *end);
 public:
 	int cacheMode(void) const { return fCacheMode; }

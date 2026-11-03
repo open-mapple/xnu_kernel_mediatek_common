@@ -51,6 +51,14 @@ public:
 	OSDictionary             *values;       /* IOSurfaceSetValue (non-bulk), under the surface table lock */
 	bool                      contig;       /* physically contiguous below 4 GiB (scanout candidate) */
 
+	/*
+	 * viva GPU (VivaGPU.cpp, under its gate): fence of the last GPU job that used the surface, from any
+	 * connection (every job also waits for the one before on the surface, so this one signals last), and how
+	 * many jobs used it so far.
+	 */
+	OSObject                 *gpuFence;
+	uint64_t                  gpuJobs;
+
 	bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
 	void free() APPLE_KEXT_OVERRIDE;
 
@@ -79,6 +87,14 @@ SweetSurface *sweet_surface_create_physical(uint64_t phys, uint32_t width,
 uint64_t sweet_surface_before_device_read(SweetSurface *surface);
 uint64_t sweet_surface_before_cpu_access(SweetSurface *surface);
 void sweet_surface_device_wrote(SweetSurface *surface);
+
+/*
+ * viva GPU (VivaGPU.cpp), any thread but the GPU's work loop: no GPU job using the surface is pending (true when
+ * the GPU driver is not running); *jobs (optional) = GPU jobs that used it so far. surface_wait sleeps until it
+ * is idle, at most timeoutMs (kIOReturnTimeout).
+ */
+bool viva_gpu_surface_idle(SweetSurface *surface, uint64_t *jobs);
+IOReturn viva_gpu_surface_wait(SweetSurface *surface, uint32_t timeoutMs);
 
 /*
  * Size of the surfaces the display may scan out directly (viva OVL, SweetFramebuffer.cpp; 0 = none): such

@@ -326,7 +326,7 @@ VivaGPUUserClient::dispatch(uint32_t selector, void *arg)
 			uint64_t deadline = deadlineFor(a->timeout_ns, &expired);
 			b->retain();
 			IOReturn ret = kIOReturnSuccess;
-			while (b->busy != NULL && !b->busy->signalled) {
+			while (!VivaGPUAccelerator::boIdle(b)) {
 				if (expired) {
 					ret = kIOReturnBusy;
 					break;
@@ -338,6 +338,9 @@ VivaGPUUserClient::dispatch(uint32_t selector, void *arg)
 					ret = r;
 					break;
 				}
+			}
+			if (ret == kIOReturnSuccess) {
+				fGPU->invalidatePending(b->vm, b);     /* K0b: the CPU is about to read what the GPU wrote */
 			}
 			b->release();
 			return ret;
@@ -472,8 +475,14 @@ VivaGPUUserClient::createBO(struct vgpu_create_bo *a)
 				b->release();
 				return kIOReturnNoMemory;
 			}
+			/*
+			 * K0b: write-combined unless userspace asks for VGPU_BO_WB_MMAP, as Linux maps panfrost BOs on a
+			 * non-coherent GPU (Mesa with DRM 1.5 relies on it): CPU writes reach memory without any cache
+			 * maintenance before or after jobs. vivagpuwc=0: cacheable, maintained by the kernel as before.
+			 */
+			bool wc = fGPU->writeCombined() && !(flags & VGPU_BO_WB_MMAP);
 			IOBufferMemoryDescriptor *mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
-			    kIODirectionInOut | kIOMemoryKernelUserShared, size, page_size);
+			    kIODirectionInOut | kIOMemoryKernelUserShared | (wc ? kIOMapWriteCombineCache : 0), size, page_size);
 			if (mem == NULL) {
 				fGPU->chargeMemory(fVM, -(int64_t)size);
 				b->vaSize = 0;
@@ -481,14 +490,16 @@ VivaGPUUserClient::createBO(struct vgpu_create_bo *a)
 				return kIOReturnNoMemory;
 			}
 			b->memory = mem;
-			/*
-			 * Cacheable everywhere (write-combined BOs used to panic: pmap_sync_page_attributes_phys
-			 * truncated physical addresses above 4 GiB, fixed in 0112). The kernel keeps CPU and GPU
-			 * coherent: zeros pushed out now, then a clean + invalidate before and after every job.
-			 */
-			b->cacheable = true;
-			b->cacheMaint = fGPU->cacheMode() == 0;        /* else from the first user mapping (boMapped) */
-			cacheBuffer(mem, 0, size, kVivaCacheFlush);
+			if (!wc) {
+				/*
+				 * Cacheable: the kernel keeps CPU and GPU coherent, zeros pushed out now, then a clean +
+				 * invalidate before and after jobs. (Write-combined pages are zeroed and flushed by XNU when
+				 * their cache mode changes: pmap_sync_page_attributes_phys, fixed for PAs above 4 GiB in 0112.)
+				 */
+				b->cacheable = true;
+				b->cacheMaint = fGPU->cacheMode() == 0;        /* else from the first user mapping (boMapped) */
+				cacheBuffer(mem, 0, size, kVivaCacheFlush);
+			}
 		}
 		b->va = fVM->allocVA(size, align);
 		if (b->va == 0) {
@@ -618,6 +629,7 @@ VivaGPUUserClient::syncobjWait(struct vgpu_syncobj_wait *a)
 			}
 			if ((a->flags & VGPU_SYNCOBJ_WAIT_ALL) ? signalled == a->count_handles : signalled > 0) {
 				a->first_signaled = first == UINT32_MAX ? 0 : first;
+				fGPU->invalidatePending(fVM, NULL);    /* K0b: the CPU may now read what those jobs wrote */
 				return kIOReturnSuccess;
 			}
 			if (expired) {

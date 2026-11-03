@@ -447,7 +447,47 @@ VivaGPUVM::free(void)
 	if (fRanges != NULL) {
 		IODeleteData(fRanges, Range, fRangeCap);
 	}
+	if (inv != NULL) {
+		IODelete(inv, VivaGPUBO *, invCap);
+	}
 	OSObject::free();
+}
+
+/* Gated. Without memory for the list the BO stays unlisted (invPending false): the caller invalidates at once. */
+void
+VivaGPUVM::invAdd(VivaGPUBO *bo)
+{
+	if (bo->invPending) {
+		return;
+	}
+	if (invCount == invCap) {
+		uint32_t cap = invCap ? invCap * 2 : 64;
+		VivaGPUBO **bigger = IONew(VivaGPUBO *, cap);
+		if (bigger == NULL) {
+			return;
+		}
+		if (inv != NULL) {
+			bcopy(inv, bigger, invCount * sizeof(*inv));
+			IODelete(inv, VivaGPUBO *, invCap);
+		}
+		inv = bigger;
+		invCap = cap;
+	}
+	inv[invCount++] = bo;
+	bo->invPending = true;
+}
+
+/* Gated. */
+void
+VivaGPUVM::invRemove(VivaGPUBO *bo)
+{
+	for (uint32_t i = 0; i < invCount; i++) {
+		if (inv[i] == bo) {
+			inv[i] = inv[--invCount];
+			break;
+		}
+	}
+	bo->invPending = false;
 }
 
 /* A zeroed 4 KiB table (physical address), carved from 16 KiB wired pages. */
@@ -675,6 +715,9 @@ VivaGPUBO::free(void)
 	if (kind == kVivaBOHeap && vm != NULL) {
 		vm->gpu->heapRemove(this);
 	}
+	if (invPending && vm != NULL) {
+		vm->invRemove(this);
+	}
 	if (chunks != NULL) {
 		for (uint32_t i = 0; i < chunkCount; i++) {
 			if (chunks[i] != NULL) {
@@ -787,6 +830,12 @@ VivaGPUAccelerator::start(IOService *provider)
 	fMarginMv = MIN(MAX(fMarginMv, 0), 100);
 	fCacheMode = 1;
 	PE_parse_boot_argn("vivagpucache", &fCacheMode, sizeof(fCacheMode));
+	int flag = 1;
+	PE_parse_boot_argn("vivagpulazy", &flag, sizeof(flag));
+	fLazy = flag != 0 && fCacheMode != 0;
+	flag = 1;
+	PE_parse_boot_argn("vivagpuwc", &flag, sizeof(flag));
+	fWC = flag != 0 && fCacheMode != 0;
 	int64_t mib = GPU_MEMORY_LIMIT >> 20;
 	PE_parse_boot_argn("vivagpumemtotal", &mib, sizeof(mib));
 	fMemLimit = mib << 20;
@@ -2042,6 +2091,13 @@ VivaGPUAccelerator::submit(VivaGPUVM *vm, uint64_t jc, uint32_t requirements, OS
 		return kIOReturnNotReady;
 	}
 	uint64_t t0 = mach_absolute_time(), cacheNs = 0, cacheBytes = 0;
+	OSArray *ownDeps = NULL;
+	if (deps == NULL && bos != NULL && bos->getCount() != 0) {
+		deps = ownDeps = OSArray::withCapacity(4);
+		if (deps == NULL) {
+			return kIOReturnNoMemory;
+		}
+	}
 	VivaGPUJob *job = IOMallocType(VivaGPUJob);
 	job->vm = vm;
 	vm->retain();
@@ -2056,12 +2112,32 @@ VivaGPUAccelerator::submit(VivaGPUVM *vm, uint64_t jc, uint32_t requirements, OS
 		bos->retain();
 		for (unsigned int i = 0; i < bos->getCount(); i++) {
 			VivaGPUBO *bo = (VivaGPUBO *)bos->getObject(i);
+			/*
+			 * K0, implicit sync as Linux's panfrost_job.c: every BO counts as written, so the job waits for the
+			 * last job on each of its BOs (Mesa submits a batch's vertex/tiler and fragment chains without an
+			 * in-sync between them, and every batch shares the tiler heap). An IOSurface also waits for the last
+			 * job on it in any other connection. Each busy fence then signals after every earlier job on the BO.
+			 */
+			addImplicitDep(deps, bo->busy, fence);
 			fence->retain();
 			OSSafeReleaseNULL(bo->busy);
 			bo->busy = fence;
+			if (bo->kind == kVivaBOSurface && bo->surface != NULL) {
+				SweetSurface *s = bo->surface;
+				addImplicitDep(deps, OSDynamicCast(VivaGPUFence, s->gpuFence), fence);
+				if (s->gpuFence != fence) {
+					fence->retain();
+					OSSafeReleaseNULL(s->gpuFence);
+					s->gpuFence = fence;
+					s->gpuJobs++;
+				}
+			}
 			uint64_t c0 = mach_absolute_time(), bytes = 0;
 			if (bo->cacheMaint) {
 				bytes = bo->cacheOp(0, 0, kVivaCacheFlush);     /* CPU writes out before the GPU reads */
+				if (bo->invPending) {
+					bo->vm->invRemove(bo);                  /* the flush also dropped the stale lines */
+				}
 			} else if (bo->lazySurface) {
 				bytes = sweet_surface_before_device_read(bo->surface);
 			}
@@ -2088,7 +2164,68 @@ VivaGPUAccelerator::submit(VivaGPUVM *vm, uint64_t jc, uint32_t requirements, OS
 	absolutetime_to_nanoseconds(cacheNs, &ns);
 	fSubmitCacheNs += ns;
 	fSubmitCacheBytes += cacheBytes;
+	OSSafeReleaseNULL(ownDeps);
 	return kIOReturnSuccess;
+}
+
+/* Gated: K0, the job also waits for `f` (another job's fence on one of its BOs), once, unless done already. */
+void
+VivaGPUAccelerator::addImplicitDep(OSArray *deps, VivaGPUFence *f, VivaGPUFence *self)
+{
+	if (f == NULL || f == self || f->signalled || deps == NULL ||
+	    deps->getNextIndexOfObject(f, 0) != (unsigned int)-1) {
+		return;
+	}
+	if (deps->setObject(f)) {
+		fImplicitDeps++;
+	}
+}
+
+bool
+VivaGPUAccelerator::boIdle(VivaGPUBO *bo)
+{
+	if (bo->busy != NULL && !bo->busy->signalled) {
+		return false;
+	}
+	return bo->kind != kVivaBOSurface || bo->surface == NULL || surfaceIdle(bo->surface, NULL);
+}
+
+bool
+VivaGPUAccelerator::surfaceIdle(SweetSurface *s, uint64_t *jobs)
+{
+	VivaGPUFence *f = OSDynamicCast(VivaGPUFence, s->gpuFence);
+	if (jobs != NULL) {
+		*jobs = s->gpuJobs;
+	}
+	return f == NULL || f->signalled;
+}
+
+/* Gated. */
+void
+VivaGPUAccelerator::invalidatePending(VivaGPUVM *vm, VivaGPUBO *only)
+{
+	if (vm == NULL || vm->invCount == 0 || (only != NULL && !only->invPending)) {
+		return;
+	}
+	uint64_t c0 = mach_absolute_time(), bytes = 0;
+	for (uint32_t i = 0; i < vm->invCount;) {
+		VivaGPUBO *bo = vm->inv[i];
+		if ((only != NULL && bo != only) || !boIdle(bo)) {
+			i++;            /* a job still uses it: stays listed */
+			continue;
+		}
+		/* civac: drops the lines older than the GPU's writes, keeps what the CPU wrote meanwhile */
+		bytes += bo->cacheOp(0, 0, kVivaCacheFlush);
+		bo->invPending = false;
+		vm->inv[i] = vm->inv[--vm->invCount];
+	}
+	if (bytes != 0) {
+		uint64_t ns;
+		absolutetime_to_nanoseconds(mach_absolute_time() - c0, &ns);
+		fLazyWaits++;
+		fLazyNs += ns;
+		fLazyBytes += bytes;
+	}
 }
 
 /* Gated. */
@@ -2108,10 +2245,14 @@ void
 VivaGPUAccelerator::cacheStats(char **out, char *end)
 {
 	uint64_t n = fSubmits ? fSubmits : 1, jobs = fJobs ? fJobs : 1;
-	say(out, end, "cache (vivagpucache=%d): submit avg %llu us (maintenance %llu us, %llu KiB), completion "
-	    "maintenance avg %llu us (%llu KiB) over %llu submits\n", fCacheMode, fSubmitNs / n / 1000,
-	    fSubmitCacheNs / n / 1000, fSubmitCacheBytes / n >> 10, fDoneCacheNs / jobs / 1000,
+	say(out, end, "cache (vivagpucache=%d, vivagpuwc=%d, vivagpulazy=%d): submit avg %llu us (maintenance %llu us, "
+	    "%llu KiB), completion maintenance avg %llu us (%llu KiB) over %llu submits\n", fCacheMode, fWC, fLazy,
+	    fSubmitNs / n / 1000, fSubmitCacheNs / n / 1000, fSubmitCacheBytes / n >> 10, fDoneCacheNs / jobs / 1000,
 	    fDoneCacheBytes / jobs >> 10, fSubmits);
+	uint64_t w = fLazyWaits ? fLazyWaits : 1;
+	say(out, end, "lazy invalidation: %llu BOs listed after jobs, %llu waits invalidated %llu KiB (avg %llu us, "
+	    "%llu KiB), %llu list overflows; implicit dependencies %llu\n", fLazyListed, fLazyWaits, fLazyBytes >> 10,
+	    fLazyNs / w / 1000, fLazyBytes / w >> 10, fLazyOverflows, fImplicitDeps);
 }
 
 void
@@ -2187,6 +2328,23 @@ VivaGPUAccelerator::completeJob(uint32_t slot, IOReturn error, uint32_t status)
 	for (unsigned int i = 0; job->bos != NULL && i < job->bos->getCount(); i++) {
 		VivaGPUBO *bo = (VivaGPUBO *)job->bos->getObject(i);
 		if (bo->cacheMaint) {
+			if (bo->kind == kVivaBONormal && !(bo->flags & VGPU_BO_NOEXEC) && fLazy) {
+				continue;       /* shader code: the GPU never writes it */
+			}
+			/*
+			 * K0b: the fence signals now; the CPU lines are dropped when userspace waits for the GPU (WAIT_BO,
+			 * syncobj wait), once per BO however many jobs used it. Without room in the list: at once.
+			 */
+			if (fLazy && bo->vm != NULL) {
+				if (!bo->invPending) {
+					bo->vm->invAdd(bo);
+					fLazyListed++;
+				}
+				if (bo->invPending) {
+					continue;
+				}
+				fLazyOverflows++;
+			}
 			/* drop stale CPU lines so the CPU sees what the GPU wrote; civac keeps lines the CPU dirtied meanwhile */
 			bytes += bo->cacheOp(0, 0, kVivaCacheFlush);
 		} else if (bo->lazySurface) {
@@ -2537,6 +2695,7 @@ VivaGPUAccelerator::selftest(bool fault, char **out, char *end)
 	fSelfVM->retain();
 	fSelfVM->bos++;
 	bo->kind = kVivaBONormal;
+	bo->flags = VGPU_BO_NOEXEC;             /* GPU-written: listed for invalidation (vivagpulazy) */
 	bo->memory = mem;
 	bo->cacheMaint = bo->cacheable = true;  /* written and read through the kernel's cacheable mapping */
 	bo->size = bo->vaSize = page_size;
@@ -2574,6 +2733,7 @@ VivaGPUAccelerator::selftest(bool fault, char **out, char *end)
 		clock_interval_to_deadline(1000, kMillisecondScale, &deadline);
 		ret = waitFence(fence, deadline);
 	}
+	invalidatePending(fSelfVM, bo);         /* what userspace's wait does */
 	uint32_t got = w[0x200 / 4], exc = w[0];
 	say(out, end, "selftest%s: submit/wait 0x%x after %llu ms, fence %s 0x%x, job status 0x%02x (%s), "
 	    "value 0x%08x (expected 0x%08x), MMU faults +%llu\n", fault ? " fault" : "", ret, nowMs() - t0,
@@ -2681,6 +2841,49 @@ VivaGPUAccelerator::linkCommand(const char *args, char *out, size_t outLen)
 			memoryDump(o, end);
 			cacheStats(o, end);
 			say(o, end, "usage: gpu [status|mfg|on|off|regs|freq [MHz]|selftest [fault]|probe|publish]\n");
+		}
+		return kIOReturnSuccess;
+	});
+}
+
+/* K0c: the display (AppleCLCD) and IOSurfaceLock wait for the GPU's writes to a surface. */
+bool
+viva_gpu_surface_idle(SweetSurface *surface, uint64_t *jobs)
+{
+	VivaGPUAccelerator *gpu = gVivaGPU;
+	if (gpu == NULL || surface == NULL || gpu->gate() == NULL) {
+		if (jobs != NULL) {
+			*jobs = 0;
+		}
+		return true;
+	}
+	__block bool idle = true;
+	__block uint64_t n = 0;
+	gpu->gate()->runActionBlock(^IOReturn {
+		idle = VivaGPUAccelerator::surfaceIdle(surface, &n);
+		return kIOReturnSuccess;
+	});
+	if (jobs != NULL) {
+		*jobs = n;
+	}
+	return idle;
+}
+
+IOReturn
+viva_gpu_surface_wait(SweetSurface *surface, uint32_t timeoutMs)
+{
+	VivaGPUAccelerator *gpu = gVivaGPU;
+	if (gpu == NULL || surface == NULL || gpu->gate() == NULL) {
+		return kIOReturnSuccess;
+	}
+	uint64_t deadline;
+	clock_interval_to_deadline(timeoutMs, kMillisecondScale, &deadline);
+	return gpu->gate()->runActionBlock(^IOReturn {
+		while (!VivaGPUAccelerator::surfaceIdle(surface, NULL)) {
+			IOReturn r = gpu->sleepUntil(deadline);
+			if (r != kIOReturnSuccess) {
+				return VivaGPUAccelerator::surfaceIdle(surface, NULL) ? kIOReturnSuccess : r;
+			}
 		}
 		return kIOReturnSuccess;
 	});
