@@ -6881,7 +6881,8 @@ void
 pmap_sync_page_attributes_phys(
 	ppnum_t pp)
 {
-	flush_dcache((vm_offset_t) (pp << PAGE_SHIFT), PAGE_SIZE, TRUE);
+	/* ptoa(): ppnum_t is 32 bits, a plain shift drops physical address bits 32+ (sweet/viva RAM above 4 GiB) */
+	flush_dcache((vm_offset_t) ptoa(pp), PAGE_SIZE, TRUE);
 }
 
 #if CONFIG_COREDUMP
