@@ -206,6 +206,7 @@ extern uint32_t sweet_log_copy(uint64_t *pos, char *out, uint32_t max);   /* bsd
 extern uint64_t sweet_log_position(void);
 extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
 extern int viva_pwrap_read(uint32_t addr, uint32_t *value);               /* iokit/Kernel/arm/VivaPwrap.cpp */
+extern int viva_i2c_xfer(uint8_t addr, const uint8_t *wbuf, uint32_t wlen, uint8_t *rbuf, uint32_t rlen); /* VivaIO.cpp */
 
 static void
 vl_sleep_ms(unsigned ms)
@@ -486,6 +487,8 @@ vl_arg(char **p, uint64_t *v)
  *   poke PA VALUE     write one 32-bit word, then read it back
  *   rewind [BYTES]    resend the log from BYTES back (default: whole ring)
  *   pmic ADDR [N]     read N (max 32) 16-bit PMIC registers through pwrap (read only)
+ *   i2c DEV REG N     read N (max 64) bytes from 16-bit register REG of I2C0 device DEV
+ *   i2cw DEV REG B..  write bytes (max 6) to register REG of I2C0 device DEV
  *   panic [TEXT]      panic (to test the panic path)
  *   reboot            watchdog software reset (back through preloader/LK)
  * peek/poke have no guard: an address in a gated block can hang the bus.
@@ -549,6 +552,34 @@ vl_command(void)
 			vl_reply(" %04x", val);
 		}
 		vl_reply("\n");
+	} else if ((IS("i2c") || IS("i2cw")) && vl_arg(&rest, &a) && vl_arg(&rest, &v)) {
+		bool wr = len == 4;
+		uint8_t w[8] = { (uint8_t)(v >> 8), (uint8_t)v }, r[8];
+		uint64_t n = 0, b;
+		if (wr) {
+			while (n < 6 && vl_arg(&rest, &b)) {
+				w[2 + n++] = (uint8_t)b;
+			}
+			int err = viva_i2c_xfer((uint8_t)a, w, 2 + (uint32_t)n, NULL, 0);
+			vl_reply("i2c 0x%02llx 0x%04llx <- %llu bytes: %s\n", a, v, n, err ? "error" : "ok");
+		} else {
+			(void)vl_arg(&rest, &n);
+			n = MIN(MAX(n, 1ull), 64ull);
+			for (uint64_t off = 0; off < n; off += 8) {
+				uint32_t k = (uint32_t)MIN(8ull, n - off);
+				w[0] = (uint8_t)((v + off) >> 8);
+				w[1] = (uint8_t)(v + off);
+				if (viva_i2c_xfer((uint8_t)a, w, 2, r, k)) {
+					vl_reply("i2c 0x%02llx 0x%04llx: error\n", a, v + off);
+					break;
+				}
+				vl_reply("i2c 0x%02llx 0x%04llx:", a, v + off);
+				for (uint32_t i = 0; i < k; i++) {
+					vl_reply(" %02x", r[i]);
+				}
+				vl_reply("\n");
+			}
+		}
 	} else if (IS("rewind")) {
 		uint64_t total = sweet_log_position(), back = UINT64_MAX;
 		(void)vl_arg(&rest, &back);
@@ -566,7 +597,7 @@ vl_command(void)
 			delay(5000);
 		}
 	} else if (IS("help")) {
-		vl_reply("ping | stat | peek PA [WORDS] | poke PA VALUE | pmic ADDR [N] | rewind [BYTES] | panic [TEXT] | reboot\n");
+		vl_reply("ping | stat | peek PA [WORDS] | poke PA VALUE | pmic ADDR [N] | i2c DEV REG N | i2cw DEV REG B.. | rewind [BYTES] | panic [TEXT] | reboot\n");
 	} else {
 		vl_reply("unknown command: %s (try help)\n", c);
 	}

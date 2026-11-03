@@ -145,6 +145,8 @@ VivaGPIO::getInput(uint32_t pin, bool *high)
 
 OSDefineMetaClassAndStructors(VivaI2C, IOService);
 
+static VivaI2C *gVivaI2C;
+
 static uint32_t
 dtU32(IOService *provider, const char *key, uint32_t dflt)
 {
@@ -233,9 +235,20 @@ VivaI2C::start(IOService *provider)
 	fInterrupt->enable();
 	IOLog("VIVA I2C: %s, source %u Hz, %u Hz: timing 0x%04x ltiming 0x%04x hw_timeout 0x%04x\n",
 	    provider->getName(), fSrcHz, fSpeedHz, fTiming, fLTiming, fHWTimeout);
+	gVivaI2C = this;
 	registerService();
 	VivaDTNub::publishChildren(this, provider);
 	return true;
+}
+
+/* USB link "i2c" commands (bsd/dev/viva_usb.c): one transaction on I2C0. */
+extern "C" int
+viva_i2c_xfer(uint8_t addr, const uint8_t *wbuf, uint32_t wlen, uint8_t *rbuf, uint32_t rlen)
+{
+	if (gVivaI2C == NULL) {
+		return -1;
+	}
+	return gVivaI2C->transfer(addr, wbuf, wlen, rbuf, rlen) == kIOReturnSuccess ? 0 : -2;
 }
 
 void
