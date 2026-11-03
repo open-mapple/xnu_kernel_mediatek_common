@@ -486,7 +486,8 @@ VivaGPUUserClient::createBO(struct vgpu_create_bo *a)
 			 * for RAM below 0xc0000000, outside XNU's physical aperture). The kernel keeps CPU and GPU
 			 * coherent: zeros pushed out now, then a flush before and an invalidate after every job.
 			 */
-			b->cacheMaint = true;
+			b->cacheable = true;
+			b->cacheMaint = fGPU->cacheMode() == 0;        /* else from the first user mapping (boMapped) */
 			cacheBuffer(mem, 0, size, kVivaCacheFlush);
 		}
 		b->va = fVM->allocVA(size, align);
@@ -666,7 +667,10 @@ VivaGPUUserClient::importSurface(struct vgpu_import_iosurface *a)
 		b->memOffset = mapStart;
 		b->size = b->vaSize = mapSize;
 		fVM->imported += (int64_t)mapSize;
-		b->cacheMaint = s->mapCache != kIOMapWriteCombineCache && s->mapCache != kIOMapInhibitCache;
+		b->cacheable = OSDynamicCast(IOBufferMemoryDescriptor, s->memory) != NULL &&
+		    s->mapCache != kIOMapWriteCombineCache && s->mapCache != kIOMapInhibitCache;
+		b->cacheMaint = b->cacheable && fGPU->cacheMode() == 0;
+		b->lazySurface = b->cacheable && !b->cacheMaint;
 		b->va = fVM->allocVA(mapSize, mapSize >= HEAP_ALIGN ? HEAP_ALIGN : page_size);
 		b->gpuOffset = planeOff - mapStart;
 		if (!b->prepared || b->va == 0 || !fVM->map(b->va, b->memory, mapStart, mapSize, VivaGPUVM::leafAttrs(false))) {
@@ -723,6 +727,7 @@ VivaGPUUserClient::importUser(struct vgpu_import_userptr *a)
 		b->memory = md;
 		md->retain();
 		b->prepared = true;
+		b->cacheable = true;
 		b->size = b->vaSize = a->size;
 		fVM->imported += (int64_t)a->size;
 		b->cacheMaint = true;
@@ -762,7 +767,7 @@ VivaGPUUserClient::syncBO(struct vgpu_sync_bo *a)
 			if (ops[i].type > VGPU_SYNC_CPU_CACHE_FLUSH_INVALIDATE) {
 				return kIOReturnBadArgument;
 			}
-			if ((b->flags & VGPU_BO_WB_MMAP) || b->cacheMaint) {
+			if (b->cacheable) {
 				b->cacheOp(ops[i].offset, ops[i].size, ops[i].type == VGPU_SYNC_CPU_CACHE_FLUSH_INVALIDATE);
 			}
 		}
@@ -781,6 +786,7 @@ VivaGPUUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options, IOMem
 		if (b == NULL || b->memory == NULL || b->kind == kVivaBOHeap) {
 			return kIOReturnBadArgument;
 		}
+		fGPU->boMapped(b);
 		IOMemoryDescriptor *md = b->memory;
 		if (b->memOffset != 0) {
 			md = IOSubMemoryDescriptor::withSubRange(b->memory, b->memOffset, b->vaSize, kIODirectionInOut);

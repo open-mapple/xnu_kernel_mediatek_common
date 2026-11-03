@@ -709,11 +709,11 @@ VivaGPUBO::growHeap(uint64_t addr)
 	return true;
 }
 
-void
+uint64_t
 VivaGPUBO::cacheOp(uint64_t offset, uint64_t len, int op)
 {
 	if (memory == NULL) {
-		return;
+		return 0;
 	}
 	if (len == 0 || offset + len > size) {
 		len = offset < size ? size - offset : 0;
@@ -721,12 +721,13 @@ VivaGPUBO::cacheOp(uint64_t offset, uint64_t len, int op)
 	IOBufferMemoryDescriptor *buf = OSDynamicCast(IOBufferMemoryDescriptor, memory);
 	if (buf != NULL) {
 		cacheBuffer(buf, memOffset + offset, len, op);
-		return;
+		return len;
 	}
 	if (kmap == NULL && (kmap = memory->map()) == NULL) {        /* user memory, physical surfaces */
-		return;
+		return 0;
 	}
 	cacheVA((const uint8_t *)kmap->getVirtualAddress() + memOffset + offset, len, op);
+	return len;
 }
 
 /* ---- accelerator ---- */
@@ -748,6 +749,8 @@ VivaGPUAccelerator::start(IOService *provider)
 		return false;
 	}
 	fMode = mode;
+	fCacheMode = 1;
+	PE_parse_boot_argn("vivagpucache", &fCacheMode, sizeof(fCacheMode));
 	int64_t mib = GPU_MEMORY_LIMIT >> 20;
 	PE_parse_boot_argn("vivagpumemtotal", &mib, sizeof(mib));
 	fMemLimit = mib << 20;
@@ -1859,6 +1862,7 @@ VivaGPUAccelerator::submit(VivaGPUVM *vm, uint64_t jc, uint32_t requirements, OS
 	if (!fPowered) {
 		return kIOReturnNotReady;
 	}
+	uint64_t t0 = mach_absolute_time(), cacheNs = 0, cacheBytes = 0;
 	VivaGPUJob *job = IOMallocType(VivaGPUJob);
 	job->vm = vm;
 	vm->retain();
@@ -1876,8 +1880,15 @@ VivaGPUAccelerator::submit(VivaGPUVM *vm, uint64_t jc, uint32_t requirements, OS
 			fence->retain();
 			OSSafeReleaseNULL(bo->busy);
 			bo->busy = fence;
+			uint64_t c0 = mach_absolute_time(), bytes = 0;
 			if (bo->cacheMaint) {
-				bo->cacheOp(0, 0, kVivaCacheFlush);     /* CPU writes out before the GPU reads */
+				bytes = bo->cacheOp(0, 0, kVivaCacheFlush);     /* CPU writes out before the GPU reads */
+			} else if (bo->lazySurface) {
+				bytes = sweet_surface_before_device_read(bo->surface);
+			}
+			if (bytes != 0) {
+				cacheBytes += bytes;
+				cacheNs += mach_absolute_time() - c0;
 			}
 		}
 	}
@@ -1891,7 +1902,37 @@ VivaGPUAccelerator::submit(VivaGPUVM *vm, uint64_t jc, uint32_t requirements, OS
 	}
 	fQueueTail[slot] = job;
 	kick();
+	uint64_t ns;
+	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
+	fSubmits++;
+	fSubmitNs += ns;
+	absolutetime_to_nanoseconds(cacheNs, &ns);
+	fSubmitCacheNs += ns;
+	fSubmitCacheBytes += cacheBytes;
 	return kIOReturnSuccess;
+}
+
+/* Gated. */
+void
+VivaGPUAccelerator::boMapped(VivaGPUBO *bo)
+{
+	if (bo->cacheMaint || !bo->cacheable) {
+		return;
+	}
+	/* the GPU may have written it while nobody looked: drop stale lines once, then maintain it like the rest */
+	bo->cacheOp(0, 0, kVivaCacheFlush);
+	bo->cacheMaint = true;
+	bo->lazySurface = false;
+}
+
+void
+VivaGPUAccelerator::cacheStats(char **out, char *end)
+{
+	uint64_t n = fSubmits ? fSubmits : 1, jobs = fJobs ? fJobs : 1;
+	say(out, end, "cache (vivagpucache=%d): submit avg %llu us (maintenance %llu us, %llu KiB), completion "
+	    "maintenance avg %llu us (%llu KiB) over %llu submits\n", fCacheMode, fSubmitNs / n / 1000,
+	    fSubmitCacheNs / n / 1000, fSubmitCacheBytes / n >> 10, fDoneCacheNs / jobs / 1000,
+	    fDoneCacheBytes / jobs >> 10, fSubmits);
 }
 
 void
@@ -1963,11 +2004,20 @@ VivaGPUAccelerator::completeJob(uint32_t slot, IOReturn error, uint32_t status)
 			    slot, status, jsStatusName(status), job->jc, job->vm->asSlot, nowMs() - job->startMs);
 		}
 	}
+	uint64_t c0 = mach_absolute_time(), bytes = 0;
 	for (unsigned int i = 0; job->bos != NULL && i < job->bos->getCount(); i++) {
 		VivaGPUBO *bo = (VivaGPUBO *)job->bos->getObject(i);
 		if (bo->cacheMaint) {
-			bo->cacheOp(0, 0, kVivaCacheInvalidate);        /* drop CPU lines: the CPU sees what the GPU wrote */
+			bytes += bo->cacheOp(0, 0, kVivaCacheInvalidate);       /* drop CPU lines: the CPU sees what the GPU wrote */
+		} else if (bo->lazySurface) {
+			sweet_surface_device_wrote(bo->surface);                /* dropped at the next IOSurfaceLock */
 		}
+	}
+	if (bytes != 0) {
+		uint64_t ns;
+		absolutetime_to_nanoseconds(mach_absolute_time() - c0, &ns);
+		fDoneCacheNs += ns;
+		fDoneCacheBytes += bytes;
 	}
 	job->fence->signalled = true;
 	job->fence->error = error;
@@ -2303,7 +2353,7 @@ VivaGPUAccelerator::selftest(bool fault, char **out, char *end)
 	fSelfVM->bos++;
 	bo->kind = kVivaBONormal;
 	bo->memory = mem;
-	bo->cacheMaint = true;  /* written and read through the kernel's cacheable mapping */
+	bo->cacheMaint = bo->cacheable = true;  /* written and read through the kernel's cacheable mapping */
 	bo->size = bo->vaSize = page_size;
 	if (!chargeMemory(fSelfVM, page_size)) {
 		bo->vaSize = 0;
@@ -2427,6 +2477,7 @@ VivaGPUAccelerator::linkCommand(const char *args, char *out, size_t outLen)
 			    fRunning[1] != NULL, fQueue[0] != NULL, fQueue[1] != NULL, fJobFaults, fMmuFaults, fFaultsNoReset,
 			    fWatchFragment ? ", watching fragment jobs" : "", fHeapGrows, fGpuFaults, fTimeouts, fResets);
 			memoryDump(o, end);
+			cacheStats(o, end);
 			say(o, end, "usage: gpu [status|mfg|on|off|regs|selftest [fault]|probe|publish]\n");
 		}
 		return kIOReturnSuccess;

@@ -111,8 +111,8 @@ public:
 	virtual void free(void) APPLE_KEXT_OVERRIDE;
 	/* Heap BO: back the 2 MiB chunk containing `va` (GPU fault). */
 	bool growHeap(uint64_t va);
-	/* CPU cache maintenance (kVivaCache*) of [offset, offset + len) of the BO (len 0 = all). */
-	void cacheOp(uint64_t offset, uint64_t len, int op);
+	/* CPU cache maintenance (kVivaCache*) of [offset, offset + len) of the BO (len 0 = all); bytes done. */
+	uint64_t cacheOp(uint64_t offset, uint64_t len, int op);
 
 	VivaGPUVM          *vm;
 	VivaGPUBOKind       kind;
@@ -122,7 +122,9 @@ public:
 	uint64_t            va, vaSize; /* GPU VA and mapped span (16 KiB multiple) */
 	uint64_t            size;       /* size reported to userspace */
 	uint32_t            flags, madv;
-	bool                cacheMaint; /* CPU-cacheable: flush around jobs */
+	bool                cacheMaint; /* CPU-mapped and cacheable: flush before and invalidate after every job */
+	bool                lazySurface;/* cacheable IOSurface: cleaned only after a CPU write lock (SweetSurface) */
+	bool                cacheable;  /* CPU-cacheable memory (SYNC_BO applies) */
 	bool                prepared;   /* memory->prepare() done (user memory) */
 	VivaGPUFence       *busy;       /* fence of the last job using it */
 	IOBufferMemoryDescriptor **chunks;      /* heap: one per 2 MiB of VA, NULL until the GPU faults on it */
@@ -247,6 +249,15 @@ private:
 
 	/* counters */
 	uint64_t fJobs, fJobFaults, fMmuFaults, fGpuFaults, fResets, fTimeouts, fHeapGrows;
+	/* CPU cache maintenance (vivagpucache: 0 every BO around every job, 1 only CPU-mapped BOs + lazy surfaces) */
+	int      fCacheMode;
+	uint64_t fSubmits, fSubmitNs, fSubmitCacheNs, fSubmitCacheBytes, fDoneCacheNs, fDoneCacheBytes;
+	void cacheStats(char **out, char *end);
+public:
+	int cacheMode(void) const { return fCacheMode; }
+	/* A BO gets a CPU mapping (user mmap): from now on it is maintained around jobs. Gated. */
+	void boMapped(VivaGPUBO *bo);
+private:
 	uint64_t fFaultsNoReset;            /* chains killed by an MMU fault without a GPU reset */
 	bool     fWatchFragment;            /* since then no fragment chain completed: short timeout on JS0 */
 

@@ -40,6 +40,14 @@ public:
 	IOBufferMemoryDescriptor *state;        /* shared state page, read-only for users */
 	IOMemoryMap              *kernelMap;    /* lazily created for kernel copies */
 
+	/*
+	 * CPU cache state for devices that read and write the pixels without snooping the CPU caches (the viva
+	 * GPU, the display). CPU access goes through IOSurfaceLock/Unlock: a write lock marks the CPU lines dirty,
+	 * any lock first drops the lines a device made stale. Only buffer surfaces (cacheable) track this.
+	 */
+	volatile UInt32           cpuDirty;     /* the CPU may hold dirty lines (write lock since the last clean) */
+	volatile UInt32           gpuDirty;     /* a device wrote the memory since the CPU last dropped its lines */
+
 	bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
 	void free() APPLE_KEXT_OVERRIDE;
 
@@ -57,6 +65,17 @@ SweetSurface *sweet_surface_copy(uint32_t id);
  */
 SweetSurface *sweet_surface_create_physical(uint64_t phys, uint32_t width,
     uint32_t height, uint32_t bytesPerRow, uint32_t pixelFormat);
+
+/*
+ * Cache maintenance around device access (see cpuDirty/gpuDirty). Each returns the bytes cleaned (0: nothing
+ * to do or not a cacheable surface).
+ *   before_device_read: a device is about to read: clean the CPU's dirty lines to memory
+ *   before_cpu_access:  the CPU is about to read: drop lines older than what a device wrote
+ *   device_wrote:       a device finished writing it
+ */
+uint64_t sweet_surface_before_device_read(SweetSurface *surface);
+uint64_t sweet_surface_before_cpu_access(SweetSurface *surface);
+void sweet_surface_device_wrote(SweetSurface *surface);
 
 /* Send right for the surface in task (IOSurfaceLookupFromMachPort). */
 mach_port_name_t sweet_surface_port_in_task(SweetSurface *surface, task_t task);

@@ -104,6 +104,42 @@ SweetSurface::kernelAddress()
 	return kernelMap != NULL ? (uintptr_t)kernelMap->getVirtualAddress() : 0;
 }
 
+/* Clean + invalidate (dc civac: never loses a CPU write) the whole surface, through the kernel mapping. */
+static uint64_t
+sweet_surface_clean(SweetSurface *s)
+{
+	IOBufferMemoryDescriptor *buffer = OSDynamicCast(IOBufferMemoryDescriptor, s->memory);
+	if (buffer == NULL) {
+		return 0;               /* physical (panel) memory: write-combined, nothing cached */
+	}
+	uintptr_t p = (uintptr_t)buffer->getBytesNoCopy(), end = p + buffer->getLength();
+	for (uintptr_t line = p & ~(uintptr_t)63; line < end; line += 64) {
+		__asm__ volatile ("dc civac, %0" : : "r"(line) : "memory");
+	}
+	__asm__ volatile ("dsb sy" : : : "memory");
+	return end - p;
+}
+
+uint64_t
+sweet_surface_before_device_read(SweetSurface *s)
+{
+	return OSCompareAndSwap(1, 0, &s->cpuDirty) ? sweet_surface_clean(s) : 0;
+}
+
+uint64_t
+sweet_surface_before_cpu_access(SweetSurface *s)
+{
+	return OSCompareAndSwap(1, 0, &s->gpuDirty) ? sweet_surface_clean(s) : 0;
+}
+
+void
+sweet_surface_device_wrote(SweetSurface *s)
+{
+	if (OSDynamicCast(IOBufferMemoryDescriptor, s->memory) != NULL) {
+		OSCompareAndSwap(0, 1, &s->gpuDirty);
+	}
+}
+
 static uint32_t *
 sweet_surface_seed(SweetSurface *s)
 {
@@ -697,6 +733,7 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
 		} else {
 			bzero(mem->getBytesNoCopy(), s->allocSize);
 			s->memory = mem;
+			s->cpuDirty = 1;        /* the zeros may still be in the CPU caches */
 			s->mapCache = kIOMapDefaultCache;
 			if (!sweet_surface_publish(s)) {
 				ret = kIOReturnNoResources;
@@ -822,12 +859,16 @@ sweet_surface_held(IOLock *lock, OSArray *refs, uint32_t id)
 }
 
 IOReturn
-IOSurfaceRootUserClient::trapLock(void *id, __unused void *options, void *seedOut,
+IOSurfaceRootUserClient::trapLock(void *id, void *options, void *seedOut,
     void *, void *, void *)
 {
 	SweetSurface *s = sweet_surface_held(fLock, fRefs, (uint32_t)(uintptr_t)id);
 	if (s == NULL) {
 		return kIOReturnNotFound;
+	}
+	sweet_surface_before_cpu_access(s);
+	if (!((uintptr_t)options & kIOSurfaceLockReadOnly) && OSDynamicCast(IOBufferMemoryDescriptor, s->memory)) {
+		OSCompareAndSwap(0, 1, &s->cpuDirty);
 	}
 	IOReturn ret = sweet_surface_seed_out(s, seedOut, false);
 	s->release();
@@ -841,6 +882,9 @@ IOSurfaceRootUserClient::trapUnlock(void *id, void *options, void *seedOut,
 	SweetSurface *s = sweet_surface_held(fLock, fRefs, (uint32_t)(uintptr_t)id);
 	if (s == NULL) {
 		return kIOReturnNotFound;
+	}
+	if (!((uintptr_t)options & kIOSurfaceLockReadOnly) && OSDynamicCast(IOBufferMemoryDescriptor, s->memory)) {
+		OSCompareAndSwap(0, 1, &s->cpuDirty);   /* the writes made while locked */
 	}
 	IOReturn ret = sweet_surface_seed_out(s, seedOut,
 	    !((uintptr_t)options & kIOSurfaceLockReadOnly));

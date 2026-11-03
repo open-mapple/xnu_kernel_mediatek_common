@@ -348,6 +348,7 @@ AppleCLCD::present(const uint8_t *rec)
 			continue;
 		}
 		uintptr_t src = s->kernelAddress();
+		sweet_surface_before_cpu_access(s);     /* the GPU may have drawn it: no stale CPU lines */
 		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
 		if (w <= 0 || h <= 0) {
 			w = (int32_t)s->width;
