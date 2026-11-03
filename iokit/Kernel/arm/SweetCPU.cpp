@@ -1,7 +1,8 @@
 /*
- * A55 SMP bring-up for sweet using XNU's legacy IOCPU interface and PSCI.
+ * SMP bring-up for sweet/viva using XNU's legacy IOCPU interface and PSCI:
+ * six A55s and two A76s (MPIDR Aff1 = core) as one homogeneous cluster.
  * The architected timer and SGI1 already enter through pe_fiq/sleh_irq.
- * CPU_OFF, suspend and the A76 cores still require separate platform work.
+ * CPU_OFF and suspend still require separate platform work.
  */
 #include <pexpert/arm64/board_config.h>
 
@@ -43,6 +44,7 @@ class SweetCPU : public IOCPU {
 	OSDeclareDefaultStructors(SweetCPU);
 	const OSSymbol *cpuName = NULL;
 	uint32_t initialized = 0; /* release/acquire publication after initCPU sends SGI */
+	uint32_t midr = 0;        /* MIDR_EL1 read on the core itself, published with initialized */
 
 public:
 	static void startAll(void *arg, wait_result_t result);
@@ -165,8 +167,12 @@ SweetCPU::startAll(void *arg __unused, wait_result_t result __unused)
 			}
 			IOSleep(1);
 		}
-		IOLog("SWEET CPU: cpu=%u mpidr=0x%x came alive; SGI1 OK\n",
-		    i, topology->cpus[i].phys_id);
+		/* MIDR: implementer 0x41, part 0xd05 = Cortex-A55, 0xd0b = Cortex-A76 */
+		IOLog("SWEET CPU: cpu=%u mpidr=0x%x midr=0x%08x (%s r%up%u) came alive; SGI1 OK\n",
+		    i, topology->cpus[i].phys_id, cpu->midr,
+		    ((cpu->midr >> 4) & 0xfff) == 0xd0b ? "A76" :
+		    ((cpu->midr >> 4) & 0xfff) == 0xd05 ? "A55" : "?",
+		    (cpu->midr >> 20) & 0xf, cpu->midr & 0xf);
 	}
 	/* Publish exactly once, after every selected CPU has completed initCPU(). */
 	ml_cpu_init_completed();
@@ -203,6 +209,7 @@ SweetCPU::initCPU(bool boot)
 	kprintf("SWEET CPU: cpu=%u entered initCPU mpidr=0x%llx EL%llu IRQs=%u\n",
 	    getCPUNumber(), __builtin_arm_rsr64("MPIDR_EL1") & 0xffffULL,
 	    __builtin_arm_rsr64("CurrentEL") >> 2, ml_get_interrupts_enabled());
+	midr = (uint32_t)__builtin_arm_rsr64("MIDR_EL1");
 	__atomic_store_n(&initialized, 1, __ATOMIC_RELEASE);
 }
 
