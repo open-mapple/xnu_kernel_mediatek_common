@@ -78,6 +78,13 @@ public:
 	uint64_t  lastUse;              /* LRU stamp for address-space eviction */
 	uint32_t  faults;
 	bool      asFaulted;            /* its AS was disabled by a fault: reprogram before the next job */
+	/* accounting ("gpu status", limits per process) */
+	int        pid;
+	char       proc[20];
+	int64_t    bytes;               /* GPU memory charged: BOs, heap chunks, page tables */
+	int64_t    imported;            /* IOSurface / user memory mapped (not charged) */
+	uint32_t   bos;
+	VivaGPUVM *nextVM;              /* the accelerator's list of live VMs */
 
 private:
 	uint64_t *tableFor(uint64_t va, bool create);
@@ -161,7 +168,9 @@ public:
 	VivaGPUBO *findHeapBO(VivaGPUVM *vm, uint64_t va);
 	void heapAdd(VivaGPUBO *bo);
 	void heapRemove(VivaGPUBO *bo);
-	bool chargeMemory(int64_t bytes);       /* GPU memory accounting (false = over the limit) */
+	/* GPU memory accounting: false = over the per-process or global limit (nothing charged). */
+	bool chargeMemory(VivaGPUVM *vm, int64_t bytes);
+	void vmLink(VivaGPUVM *vm);
 
 private:
 	/* MFG power (MediaTek) */
@@ -230,6 +239,10 @@ private:
 	VivaGPUBO **fHeapList;              /* heap BOs (not retained), for GPU faults */
 	uint32_t    fHeapCount, fHeapCap;
 	int64_t     fMemory;                /* bytes of GPU memory allocated */
+	int64_t     fMemPeak, fMemLimit, fProcLimit;    /* boot-args vivagpumemtotal / vivagpumem (MiB) */
+	uint64_t    fMemRefused;
+	VivaGPUVM  *fVMs;                   /* live VMs (gated) */
+	void memoryDump(char **out, char *end);
 	VivaGPUVM  *fSelfVM;
 
 	/* counters */

@@ -454,6 +454,7 @@ VivaGPUUserClient::createBO(struct vgpu_create_bo *a)
 		}
 		b->vm = fVM;
 		fVM->retain();
+		fVM->bos++;
 		b->flags = flags;
 		b->size = b->vaSize = size;
 		if (heap) {
@@ -466,7 +467,7 @@ VivaGPUUserClient::createBO(struct vgpu_create_bo *a)
 			}
 		} else {
 			b->kind = kVivaBONormal;
-			if (!fGPU->chargeMemory((int64_t)size)) {
+			if (!fGPU->chargeMemory(fVM, (int64_t)size)) {
 				b->vaSize = 0;          /* nothing charged: free() must not refund */
 				b->release();
 				return kIOReturnNoMemory;
@@ -474,7 +475,7 @@ VivaGPUUserClient::createBO(struct vgpu_create_bo *a)
 			IOBufferMemoryDescriptor *mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
 			    kIODirectionInOut | kIOMemoryKernelUserShared, size, page_size);
 			if (mem == NULL) {
-				fGPU->chargeMemory(-(int64_t)size);
+				fGPU->chargeMemory(fVM, -(int64_t)size);
 				b->vaSize = 0;
 				b->release();
 				return kIOReturnNoMemory;
@@ -655,6 +656,7 @@ VivaGPUUserClient::importSurface(struct vgpu_import_iosurface *a)
 		}
 		b->vm = fVM;
 		fVM->retain();
+		fVM->bos++;
 		b->kind = kVivaBOSurface;
 		b->surface = s;
 		s->retain();
@@ -663,6 +665,7 @@ VivaGPUUserClient::importSurface(struct vgpu_import_iosurface *a)
 		b->prepared = b->memory->prepare() == kIOReturnSuccess;
 		b->memOffset = mapStart;
 		b->size = b->vaSize = mapSize;
+		fVM->imported += (int64_t)mapSize;
 		b->cacheMaint = s->mapCache != kIOMapWriteCombineCache && s->mapCache != kIOMapInhibitCache;
 		b->va = fVM->allocVA(mapSize, mapSize >= HEAP_ALIGN ? HEAP_ALIGN : page_size);
 		b->gpuOffset = planeOff - mapStart;
@@ -715,11 +718,13 @@ VivaGPUUserClient::importUser(struct vgpu_import_userptr *a)
 		}
 		b->vm = fVM;
 		fVM->retain();
+		fVM->bos++;
 		b->kind = kVivaBOUser;
 		b->memory = md;
 		md->retain();
 		b->prepared = true;
 		b->size = b->vaSize = a->size;
+		fVM->imported += (int64_t)a->size;
 		b->cacheMaint = true;
 		b->va = fVM->allocVA(a->size, a->size >= HEAP_ALIGN ? HEAP_ALIGN : page_size);
 		uint32_t h = 0;
