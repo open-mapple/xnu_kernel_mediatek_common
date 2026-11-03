@@ -482,9 +482,9 @@ VivaGPUUserClient::createBO(struct vgpu_create_bo *a)
 			}
 			b->memory = mem;
 			/*
-			 * Cacheable everywhere: no write-combined BOs on this port (changing a page's cache mode panics
-			 * for RAM below 0xc0000000, outside XNU's physical aperture). The kernel keeps CPU and GPU
-			 * coherent: zeros pushed out now, then a flush before and an invalidate after every job.
+			 * Cacheable everywhere (write-combined BOs used to panic: pmap_sync_page_attributes_phys
+			 * truncated physical addresses above 4 GiB, fixed in 0112). The kernel keeps CPU and GPU
+			 * coherent: zeros pushed out now, then a clean + invalidate before and after every job.
 			 */
 			b->cacheable = true;
 			b->cacheMaint = fGPU->cacheMode() == 0;        /* else from the first user mapping (boMapped) */
@@ -549,6 +549,16 @@ VivaGPUUserClient::submit(struct vgpu_submit *a)
 				if (b == NULL) {
 					r = kIOReturnNotFound;
 				} else {
+					bos->setObject(b);
+				}
+			}
+			/*
+			 * vivagpucache=2 (diagnosis): every CPU-maintained BO of the connection goes with the job, listed or
+			 * not, so a BO userspace forgot in bo_handles still gets its CPU writes cleaned before the job.
+			 */
+			for (uint32_t h = 1; r == kIOReturnSuccess && fGPU->cacheMode() == 2 && h < fBOCap; h++) {
+				VivaGPUBO *b = fBOs[h];
+				if (b != NULL && (b->cacheMaint || b->lazySurface) && bos->getNextIndexOfObject(b, 0) == (unsigned int)-1) {
 					bos->setObject(b);
 				}
 			}
@@ -768,7 +778,8 @@ VivaGPUUserClient::syncBO(struct vgpu_sync_bo *a)
 				return kIOReturnBadArgument;
 			}
 			if (b->cacheable) {
-				b->cacheOp(ops[i].offset, ops[i].size, ops[i].type == VGPU_SYNC_CPU_CACHE_FLUSH_INVALIDATE);
+				b->cacheOp(ops[i].offset, ops[i].size,
+				    ops[i].type == VGPU_SYNC_CPU_CACHE_FLUSH_INVALIDATE ? kVivaCacheFlush : kVivaCacheClean);
 			}
 		}
 		return kIOReturnSuccess;

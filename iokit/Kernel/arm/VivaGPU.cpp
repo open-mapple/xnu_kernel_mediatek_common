@@ -308,9 +308,9 @@ nowMs(void)
 }
 
 /*
- * CPU cache maintenance (to PoC) by kernel virtual address. Always through a kernel mapping of the buffer:
- * on this port the physical aperture (phystokv) only covers RAM from 0xc0000000, and kernel allocations
- * come from below it too.
+ * CPU cache maintenance (to PoC) by kernel virtual address, always through a kernel mapping of the buffer.
+ * (The "illegal PA 0x6860c000" panics that led here were 0x16860c000 truncated to 32 bits by XNU's
+ * pmap_sync_page_attributes_phys, fixed in 0112; kernel mappings stay the simpler path anyway.)
  */
 static void
 cacheVA(const void *p, uint64_t len, int op)
@@ -319,8 +319,6 @@ cacheVA(const void *p, uint64_t len, int op)
 	for (uintptr_t line = (uintptr_t)p & ~(uintptr_t)63; line < end; line += 64) {
 		if (op == kVivaCacheFlush) {
 			__asm__ volatile ("dc civac, %0" : : "r"(line) : "memory");
-		} else if (op == kVivaCacheInvalidate) {
-			__asm__ volatile ("dc ivac, %0" : : "r"(line) : "memory");
 		} else {
 			__asm__ volatile ("dc cvac, %0" : : "r"(line) : "memory");
 		}
@@ -626,10 +624,40 @@ VivaGPUVM::freeVA(uint64_t va)
 {
 	for (uint32_t i = 0; i < fRangeCount; i++) {
 		if (fRanges[i].start == va) {
+			Freed *f = &fFreed[fFreedNext++ % kFreedMax];
+			f->start = fRanges[i].start;
+			f->end = fRanges[i].end;
+			f->ms = nowMs();
 			bcopy(&fRanges[i + 1], &fRanges[i], (fRangeCount - i - 1) * sizeof(Range));
 			fRangeCount--;
 			return;
 		}
+	}
+}
+
+void
+VivaGPUVM::describe(uint64_t addr, char *buf, size_t len)
+{
+	for (uint32_t i = 0; i < fRangeCount; i++) {
+		if (addr >= fRanges[i].start && addr < fRanges[i].end) {
+			uint64_t *l3 = tableFor(addr, false);
+			snprintf(buf, len, "inside live VA [0x%llx, 0x%llx), PTE 0x%llx", fRanges[i].start, fRanges[i].end,
+			    l3 != NULL ? l3[(uint32_t)(addr >> 12) & 511] : 0);
+			return;
+		}
+	}
+	uint64_t now = nowMs();
+	for (uint32_t n = 0; n < kFreedMax && n < fFreedNext; n++) {
+		const Freed *f = &fFreed[(fFreedNext - 1 - n) % kFreedMax];
+		if (addr >= f->start && addr < f->end) {
+			snprintf(buf, len, "in VA [0x%llx, 0x%llx) freed %llu ms ago", f->start, f->end, now - f->ms);
+			return;
+		}
+	}
+	if (addr < VGPU_VA_START || addr >= VGPU_VA_END) {
+		snprintf(buf, len, "outside the VA range (bad pointer)");
+	} else {
+		snprintf(buf, len, "not allocated (none of the last %u frees)", MIN(fFreedNext, (uint32_t)kFreedMax));
 	}
 }
 
@@ -2159,7 +2187,8 @@ VivaGPUAccelerator::completeJob(uint32_t slot, IOReturn error, uint32_t status)
 	for (unsigned int i = 0; job->bos != NULL && i < job->bos->getCount(); i++) {
 		VivaGPUBO *bo = (VivaGPUBO *)job->bos->getObject(i);
 		if (bo->cacheMaint) {
-			bytes += bo->cacheOp(0, 0, kVivaCacheInvalidate);       /* drop CPU lines: the CPU sees what the GPU wrote */
+			/* drop stale CPU lines so the CPU sees what the GPU wrote; civac keeps lines the CPU dirtied meanwhile */
+			bytes += bo->cacheOp(0, 0, kVivaCacheFlush);
 		} else if (bo->lazySurface) {
 			sweet_surface_device_wrote(bo->surface);                /* dropped at the next IOSurfaceLock */
 		}
@@ -2281,10 +2310,15 @@ VivaGPUAccelerator::mmuInterrupt(OSObject *owner, IOInterruptEventSource *src __
 				vm->faults++;
 			}
 			if (self->fMmuFaults <= 32) {
-				IOLog("VIVA GPU: MMU %s on AS%u at 0x%llx: status 0x%08x (%s, %s access, source 0x%04x)\n",
+				char what[96] = "no VM";
+				if (vm != NULL) {
+					vm->describe(addr, what, sizeof(what));
+				}
+				IOLog("VIVA GPU: MMU %s on AS%u at 0x%llx: status 0x%08x (%s, %s access, source 0x%04x), %s%s%s\n",
 				    (bits & (1u << as)) ? "fault" : "bus error", as, addr, fs, jsStatusName(fs & 0xff),
 				    ((fs >> 8) & 3) == 1 ? "execute" : ((fs >> 8) & 3) == 2 ? "read" :
-				    ((fs >> 8) & 3) == 3 ? "write" : "atomic", fs >> 16);
+				    ((fs >> 8) & 3) == 3 ? "write" : "atomic", fs >> 16, what, vm != NULL ? ", " : "",
+				    vm != NULL ? vm->proc : "");
 			}
 			/*
 			 * Kill the address space: the job on it fails. The slot stays owned by the VM (not handed to

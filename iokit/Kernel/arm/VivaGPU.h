@@ -35,8 +35,12 @@
 
 class VivaPwrap;
 
-/* CPU cache maintenance (to PoC): before the GPU reads (clean/flush), after it wrote (invalidate). */
-enum { kVivaCacheClean, kVivaCacheFlush, kVivaCacheInvalidate };
+/*
+ * CPU cache maintenance (to PoC): clean (dc cvac) or flush = clean + invalidate (dc civac), before the GPU reads
+ * and after it wrote. No plain invalidate (dc ivac): userspace keeps writing other parts of a BO while a job that
+ * uses it runs, and dropping those dirty lines loses its writes (stale job descriptors: GPU faults, missing tiles).
+ */
+enum { kVivaCacheClean, kVivaCacheFlush };
 void cacheBuffer(IOBufferMemoryDescriptor *md, uint64_t offset, uint64_t len, int op);
 class VivaGPUAccelerator;
 class SweetSurface;
@@ -70,6 +74,8 @@ public:
 	void unmap(uint64_t va, uint64_t size);
 	/* Leaf attributes for ordinary GPU memory (read/write, GPU-cacheable), executable or not. */
 	static uint64_t leafAttrs(bool exec);
+	/* MMU fault report: what `addr` is (live BO and its PTE, VA freed lately, outside the range). Gated. */
+	void describe(uint64_t addr, char *buf, size_t len);
 
 	VivaGPUAccelerator *gpu;
 	uint64_t  rootPA;               /* level 0 table */
@@ -100,6 +106,10 @@ private:
 	struct Range { uint64_t start, end; };
 	Range    *fRanges;              /* allocated VA, sorted */
 	uint32_t  fRangeCount, fRangeCap;
+	struct Freed { uint64_t start, end, ms; };
+	enum { kFreedMax = 64 };
+	Freed     fFreed[kFreedMax];    /* last VA ranges freed (ring), for describe() */
+	uint32_t  fFreedNext;
 };
 
 enum VivaGPUBOKind { kVivaBONormal, kVivaBOHeap, kVivaBOSurface, kVivaBOUser };
@@ -256,7 +266,10 @@ private:
 
 	/* counters */
 	uint64_t fJobs, fJobFaults, fMmuFaults, fGpuFaults, fResets, fTimeouts, fHeapGrows;
-	/* CPU cache maintenance (vivagpucache: 0 every BO around every job, 1 only CPU-mapped BOs + lazy surfaces) */
+	/*
+	 * CPU cache maintenance (vivagpucache: 0 every BO around every job, 1 only CPU-mapped BOs + lazy surfaces,
+	 * 2 like 1 but every such BO of the connection with every job, listed in bo_handles or not: diagnosis)
+	 */
 	int      fCacheMode;
 	uint64_t fSubmits, fSubmitNs, fSubmitCacheNs, fSubmitCacheBytes, fDoneCacheNs, fDoneCacheBytes;
 	void cacheStats(char **out, char *end);
