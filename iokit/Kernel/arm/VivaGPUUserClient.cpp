@@ -7,7 +7,11 @@
  * Calls are IOConnectCallStructMethod(selector, &args, sizeof args, &args):
  * the structure is checked against vgpu_selector_size[], handled under the
  * accelerator's gate and copied back. Arrays the structures point to are
- * read from the calling task with copyin() before taking the gate.
+ * read from the calling task with copyin() before taking the gate. The same
+ * call without a Mach message (K0g): IOConnectTrap2(conn, VGPU_TRAP_CALL,
+ * selector, &args), the structure read with copyin() and written back with
+ * copyout(). Every call's time and its wait for the gate are counted per
+ * selector ("gpu calls" on the USB link).
  *
  * Semantics follow DRM_PANFROST_* and DRM binary syncobjs, with three
  * leniencies the userspace mock also has: an in-sync without a fence is no
@@ -125,6 +129,7 @@ VivaGPUUserClient::closeAll(void)
 			OSSafeReleaseNULL(fBOs[h]);
 		}
 		for (uint32_t h = 1; h < fSyncCap; h++) {
+			fGPU->fenceWake(fSyncobjs[h].fence);    /* its waiters see the syncobj gone */
 			OSSafeReleaseNULL(fSyncobjs[h].fence);
 			fSyncobjs[h].used = false;
 		}
@@ -212,13 +217,67 @@ VivaGPUUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *
 	if (size > sizeof(buf) || args->structureInputSize != size || args->structureInput == NULL) {
 		return kIOReturnBadArgument;
 	}
+	uint64_t t0 = mach_absolute_time();
 	bcopy(args->structureInput, buf, size);
 	IOReturn ret = dispatch(selector, buf);
 	if (args->structureOutput != NULL && args->structureOutputSize >= size) {
 		bcopy(buf, args->structureOutput, size);
 		args->structureOutputSize = size;
 	}
+	fGPU->callDone(selector, mach_absolute_time() - t0, false);
 	return ret;
+}
+
+/*
+ * K0g: the struct method without the Mach message (MIG request and reply, port lookups, message copies): the
+ * structure comes from the caller's memory and goes back there.
+ */
+static IOExternalTrap vgpu_traps[] = {
+	[VGPU_TRAP_CALL] = { NULL, (IOTrap) & VivaGPUUserClient::trapCall },
+};
+
+IOExternalTrap *
+VivaGPUUserClient::getTargetAndTrapForIndex(IOService **targetP, UInt32 index)
+{
+	if (index >= sizeof(vgpu_traps) / sizeof(vgpu_traps[0])) {
+		return NULL;
+	}
+	*targetP = this;
+	return &vgpu_traps[index];
+}
+
+IOReturn
+VivaGPUUserClient::trapCall(void *selectorArg, void *uaddr, void *, void *, void *, void *)
+{
+	uint64_t buf[16] = { 0 };
+	uint32_t selector = (uint32_t)(uintptr_t)selectorArg;
+	if ((uintptr_t)selectorArg >= VGPU_SEL_COUNT || fClosed || uaddr == NULL) {
+		return kIOReturnBadArgument;
+	}
+	uint32_t size = vgpu_selector_size[selector];
+	if (size > sizeof(buf)) {
+		return kIOReturnBadArgument;
+	}
+	uint64_t t0 = mach_absolute_time();
+	if (copyin((user_addr_t)(uintptr_t)uaddr, buf, size) != 0) {
+		return kIOReturnBadArgument;
+	}
+	IOReturn ret = dispatch(selector, buf);
+	if (copyout(buf, (user_addr_t)(uintptr_t)uaddr, size) != 0 && ret == kIOReturnSuccess) {
+		ret = kIOReturnBadArgument;
+	}
+	fGPU->callDone(selector, mach_absolute_time() - t0, true);
+	return ret;
+}
+
+IOReturn
+VivaGPUUserClient::gated(uint32_t selector, IOReturn (^block)(void))
+{
+	uint64_t t0 = mach_absolute_time();
+	return fGPU->gate()->runActionBlock(^IOReturn {
+		fGPU->gateWaited(selector, mach_absolute_time() - t0);
+		return block();
+	});
 }
 
 IOReturn
@@ -260,7 +319,7 @@ VivaGPUUserClient::dispatch(uint32_t selector, void *arg)
 			return ret;
 		}
 		bool signal = selector == VGPU_SEL_SYNCOBJ_SIGNAL;
-		ret = fGPU->gate()->runActionBlock(^IOReturn {
+		ret = gated(selector, ^IOReturn {
 			for (uint32_t i = 0; i < a->count_handles; i++) {
 				if (!syncobjValid(handles[i])) {
 					return kIOReturnBadArgument;
@@ -268,6 +327,7 @@ VivaGPUUserClient::dispatch(uint32_t selector, void *arg)
 			}
 			for (uint32_t i = 0; i < a->count_handles; i++) {
 				Syncobj *s = &fSyncobjs[handles[i]];
+				fGPU->fenceWake(s->fence);      /* waiters of the old fence re-check the syncobj */
 				OSSafeReleaseNULL(s->fence);
 				if (signal) {
 					s->fence = VivaGPUFence::create(true);
@@ -286,7 +346,7 @@ VivaGPUUserClient::dispatch(uint32_t selector, void *arg)
 	}
 
 	/* the rest: small, entirely under the gate */
-	return fGPU->gate()->runActionBlock(^IOReturn {
+	return gated(selector, ^IOReturn {
 		switch (selector) {
 		case VGPU_SEL_MMAP_BO: {
 			struct vgpu_mmap_bo *a = (struct vgpu_mmap_bo *)arg;
@@ -331,7 +391,12 @@ VivaGPUUserClient::dispatch(uint32_t selector, void *arg)
 					ret = kIOReturnBusy;
 					break;
 				}
-				IOReturn r = fGPU->sleepUntil(deadline);
+				/* the BO's last job, else (an IOSurface) the last job on the surface in any connection */
+				VivaGPUFence *f = (b->busy != NULL && !b->busy->signalled) ? b->busy :
+				    OSDynamicCast(VivaGPUFence, b->surface->gpuFence);
+				f->retain();
+				IOReturn r = fGPU->sleepOn(f, deadline);
+				f->release();
 				if (r == kIOReturnTimeout) {
 					expired = true;
 				} else if (r != kIOReturnSuccess) {
@@ -386,9 +451,9 @@ VivaGPUUserClient::dispatch(uint32_t selector, void *arg)
 			if (!syncobjValid(a->handle)) {
 				return kIOReturnBadArgument;
 			}
+			fGPU->fenceWake(fSyncobjs[a->handle].fence);
 			OSSafeReleaseNULL(fSyncobjs[a->handle].fence);
 			fSyncobjs[a->handle].used = false;
-			fGPU->wakeWaiters();
 			return kIOReturnSuccess;
 		}
 		case VGPU_SEL_SYNCOBJ_TRANSFER: {
@@ -400,9 +465,9 @@ VivaGPUUserClient::dispatch(uint32_t selector, void *arg)
 			if (f != NULL) {
 				f->retain();
 			}
+			fGPU->fenceWake(fSyncobjs[a->dst].fence);
 			OSSafeReleaseNULL(fSyncobjs[a->dst].fence);
 			fSyncobjs[a->dst].fence = f;
-			fGPU->wakeWaiters();
 			return kIOReturnSuccess;
 		}
 		case VGPU_SEL_QUERY_BO_INFO: {
@@ -446,7 +511,7 @@ VivaGPUUserClient::createBO(struct vgpu_create_bo *a)
 		size = (size + HEAP_ALIGN - 1) & ~(HEAP_ALIGN - 1);
 	}
 
-	return fGPU->gate()->runActionBlock(^IOReturn {
+	return gated(VGPU_SEL_CREATE_BO, ^IOReturn {
 		if (fVM == NULL) {
 			return kIOReturnNotOpen;
 		}
@@ -537,7 +602,7 @@ VivaGPUUserClient::submit(struct vgpu_submit *a)
 		    (void **)&handles, &hsize);
 	}
 	if (ret == kIOReturnSuccess) {
-		ret = fGPU->gate()->runActionBlock(^IOReturn {
+		ret = gated(VGPU_SEL_SUBMIT, ^IOReturn {
 			if (fVM == NULL) {
 				return kIOReturnNotOpen;
 			}
@@ -577,10 +642,11 @@ VivaGPUUserClient::submit(struct vgpu_submit *a)
 				r = fGPU->submit(fVM, a->jc, a->requirements, deps, bos, fence);
 			}
 			if (r == kIOReturnSuccess && a->out_sync != 0) {
+				/* waiters of the old fence re-check the syncobj; WAIT_FOR_SUBMIT waiters are generic ones */
+				fGPU->fenceWake(fSyncobjs[a->out_sync].fence);
 				OSSafeReleaseNULL(fSyncobjs[a->out_sync].fence);
 				fSyncobjs[a->out_sync].fence = fence;
 				fence->retain();
-				fGPU->wakeWaiters();    /* WAIT_FOR_SUBMIT waiters */
 			}
 			OSSafeReleaseNULL(deps);
 			OSSafeReleaseNULL(bos);
@@ -609,25 +675,31 @@ VivaGPUUserClient::syncobjWait(struct vgpu_syncobj_wait *a)
 	if (ret != kIOReturnSuccess) {
 		return ret;
 	}
-	ret = fGPU->gate()->runActionBlock(^IOReturn {
+	ret = gated(VGPU_SEL_SYNCOBJ_WAIT, ^IOReturn {
 		bool expired;
 		uint64_t deadline = deadlineFor(a->timeout_nsec, &expired);
+		bool all = (a->flags & VGPU_SYNCOBJ_WAIT_ALL) != 0;
 		for (;;) {
 			uint32_t signalled = 0, first = UINT32_MAX;
+			VivaGPUFence *sleepFence = NULL;        /* the one fence that can complete the wait, if there is one */
+			bool generic = false;
 			for (uint32_t i = 0; i < a->count_handles; i++) {
 				if (!syncobjValid(handles[i])) {
 					return kIOReturnBadArgument;
 				}
 				VivaGPUFence *f = fSyncobjs[handles[i]].fence;
 				if (f == NULL) {
-					continue;       /* no fence yet: unsignalled (DRM would fail without WAIT_FOR_SUBMIT) */
+					generic = true;         /* no fence yet: unsignalled (DRM would fail without WAIT_FOR_SUBMIT) */
+					continue;
 				}
 				if (f->signalled) {
 					signalled++;
 					first = MIN(first, i);
+				} else if (sleepFence == NULL) {
+					sleepFence = f;
 				}
 			}
-			if ((a->flags & VGPU_SYNCOBJ_WAIT_ALL) ? signalled == a->count_handles : signalled > 0) {
+			if (all ? signalled == a->count_handles : signalled > 0) {
 				a->first_signaled = first == UINT32_MAX ? 0 : first;
 				fGPU->invalidatePending(fVM, NULL);    /* K0b: the CPU may now read what those jobs wrote */
 				return kIOReturnSuccess;
@@ -635,7 +707,19 @@ VivaGPUUserClient::syncobjWait(struct vgpu_syncobj_wait *a)
 			if (expired) {
 				return kIOReturnTimeout;
 			}
-			IOReturn r = fGPU->sleepUntil(deadline);
+			/*
+			 * K0g: one handle, or all of them with a fence each: sleep on the first unsignalled fence (it must
+			 * signal before the wait can end; replacing it in the syncobj wakes it too). Otherwise any fence may
+			 * end the wait: the generic event.
+			 */
+			IOReturn r;
+			if (sleepFence != NULL && !generic && (all || a->count_handles == 1)) {
+				sleepFence->retain();
+				r = fGPU->sleepOn(sleepFence, deadline);
+				sleepFence->release();
+			} else {
+				r = fGPU->sleepUntil(deadline);
+			}
 			if (r == kIOReturnTimeout) {
 				expired = true;
 			} else if (r != kIOReturnSuccess) {
@@ -668,7 +752,7 @@ VivaGPUUserClient::importSurface(struct vgpu_import_iosurface *a)
 	uint64_t mapStart = planeOff & ~(uint64_t)(page_size - 1);
 	uint64_t mapSize = round_page(total - mapStart);
 
-	IOReturn ret = fGPU->gate()->runActionBlock(^IOReturn {
+	IOReturn ret = gated(VGPU_SEL_IMPORT_IOSURFACE, ^IOReturn {
 		if (fVM == NULL) {
 			return kIOReturnNotOpen;
 		}
@@ -733,7 +817,7 @@ VivaGPUUserClient::importUser(struct vgpu_import_userptr *a)
 		md->release();
 		return ret;
 	}
-	ret = fGPU->gate()->runActionBlock(^IOReturn {
+	ret = gated(VGPU_SEL_IMPORT_USERPTR, ^IOReturn {
 		if (fVM == NULL) {
 			return kIOReturnNotOpen;
 		}
@@ -780,7 +864,7 @@ VivaGPUUserClient::syncBO(struct vgpu_sync_bo *a)
 	if (ret != kIOReturnSuccess || ops == NULL) {
 		return ret;
 	}
-	ret = fGPU->gate()->runActionBlock(^IOReturn {
+	ret = gated(VGPU_SEL_SYNC_BO, ^IOReturn {
 		for (uint32_t i = 0; i < a->op_count; i++) {
 			VivaGPUBO *b = bo(ops[i].handle);
 			if (b == NULL) {

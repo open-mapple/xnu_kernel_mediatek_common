@@ -20,7 +20,8 @@
  * commands). Waits sleep on the gate with commandSleep(). The one exception
  * is the job interrupt's filter (primary interrupt context, K0e fast kick):
  * it only touches fArm/fIrqDone/fIrqAt and the job slot registers, under
- * fFastLock (a spinlock taken with interrupts off on the gated side).
+ * fFastLock (a spinlock taken with interrupts off on the gated side). The per-selector call counters ("gpu calls")
+ * have their own spinlock, fCallLock: the time of a call is known only after it left the gate.
  */
 #ifndef _IOKIT_ARM_VIVAGPU_H
 #define _IOKIT_ARM_VIVAGPU_H
@@ -56,7 +57,10 @@ class IOAcceleratorES : public IOService {
 	OSDeclareDefaultStructors(IOAcceleratorES);
 };
 
-/* Completion of one job chain (or a syncobj signalled by hand). */
+/*
+ * Completion of one job chain (or a syncobj signalled by hand). Threads waiting for one fence sleep on the fence
+ * itself (VivaGPUAccelerator::sleepOn), so a job's completion wakes only them, not every waiter of every process.
+ */
 class VivaGPUFence : public OSObject {
 	OSDeclareDefaultStructors(VivaGPUFence);
 public:
@@ -64,6 +68,7 @@ public:
 	bool     signalled;
 	IOReturn error;
 	uint64_t signalAt;      /* mach_absolute_time of the job's interrupt (0: signalled by hand or not yet) */
+	uint32_t waiters;       /* threads in sleepOn() for it (gated) */
 };
 
 /* A GPU address space: AArch64 4K page tables plus the VA allocator for [VGPU_VA_START, VGPU_VA_END). */
@@ -194,9 +199,17 @@ public:
 	void invalidatePending(VivaGPUVM *vm, VivaGPUBO *only);
 	bool lazyInvalidate(void) const { return fLazy; }
 	bool writeCombined(void) const { return fWC; }
-	/* Gated: sleep until any fence or syncobj changes (kIOReturnTimeout, kIOReturnAborted). */
+	/*
+	 * Gated waits (kIOReturnTimeout, kIOReturnAborted; the caller re-checks its condition). sleepOn: until `fence`
+	 * (retained by the caller) signals or is dropped from a syncobj. sleepUntil: until any fence signals or any
+	 * syncobj changes (waits on several syncobjs, a syncobj without a fence).
+	 */
+	IOReturn sleepOn(VivaGPUFence *fence, uint64_t deadline);
 	IOReturn sleepUntil(uint64_t deadline);
-	void wakeWaiters(void) { fGate->commandWakeup(&fFenceEvent, false); }
+	/* Gated: wake the threads sleeping on `fence` (signalled, or no longer what a syncobj holds) and the generic ones. */
+	void fenceWake(VivaGPUFence *fence);
+	/* Gated: wake the generic waiters only (a syncobj changed). */
+	void wakeWaiters(void);
 	bool powered(void) const { return fPowered; }
 	IOReturn getParam(uint32_t param, uint64_t *value);
 	void getVersion(struct vgpu_version *v);
@@ -211,6 +224,13 @@ public:
 	/* GPU memory accounting: false = over the per-process or global limit (nothing charged). */
 	bool chargeMemory(VivaGPUVM *vm, int64_t bytes);
 	void vmLink(VivaGPUVM *vm);
+	/*
+	 * K0g: cost of the user client calls ("gpu calls"). callDone: any thread, a call of `selector` took `abs`
+	 * (mach_absolute_time units) from entry to return, through the trap or the method path. gateWaited: gated,
+	 * it waited `abs` for the gate.
+	 */
+	void callDone(uint32_t selector, uint64_t abs, bool trap);
+	void gateWaited(uint32_t selector, uint64_t abs);
 
 private:
 	/* MFG power (MediaTek) */
@@ -364,6 +384,21 @@ private:
 	uint64_t fLatN[3], fLatSum[3], fLatMax[3];  /* start - ready: ready at submit, after a dependency (work loop, filter) */
 	uint64_t fExecN, fExecSum, fIrqN, fIrqSum, fIrqMax, fFastStarts, fFastArmed;
 
+	/*
+	 * K0g. Wakeups (gated): fGenericWaiters threads in sleepUntil (fFenceEvent is only woken when there are some);
+	 * fence wakeups issued, generic wakeups issued, sleeps that ended with nothing changed (spurious).
+	 */
+	uint32_t fGenericWaiters;
+	uint64_t fWakeFence, fWakeGeneric, fSleeps, fSleepsSpurious;
+	/* per selector: calls through the method / trap path, time from entry to return, time waiting for the gate */
+	struct CallStat { uint64_t n, trapN, sum, max, gateN, gateSum, gateMax; };
+	CallStat fCalls[VGPU_SEL_COUNT];
+	IOSimpleLock *fCallLock;
+	void callStats(char **out, char *end);
+	void callReset(void);
+	/* "gpu clocks": CPU, CCI and MFG PLLs from apmixedsys (read only) */
+	void clocksDump(char **out, char *end);
+
 	/* unknown user clients and property reads, for "gpu probe" (fProbeLock) */
 	IOLock *fProbeLock;
 	int     fProbeMode;                 /* vivagpuprobe: 0 refuse unknown types, 1 accept and log */
@@ -417,9 +452,14 @@ public:
 	    IOExternalMethodDispatch *dispatch, OSObject *target, void *reference) APPLE_KEXT_OVERRIDE;
 	virtual IOReturn clientMemoryForType(UInt32 type, IOOptionBits *options,
 	    IOMemoryDescriptor **memory) APPLE_KEXT_OVERRIDE;
+	virtual IOExternalTrap *getTargetAndTrapForIndex(IOService **targetP, UInt32 index) APPLE_KEXT_OVERRIDE;
+	/* K0g trap VGPU_TRAP_CALL: (selector, user address of its structure), same semantics as the method path. */
+	IOReturn trapCall(void *selector, void *uaddr, void *, void *, void *, void *);
 
 private:
 	IOReturn dispatch(uint32_t selector, void *arg);
+	/* runActionBlock with the gate wait accounted to `selector` */
+	IOReturn gated(uint32_t selector, IOReturn (^block)(void));
 	IOReturn createBO(struct vgpu_create_bo *a);
 	IOReturn submit(struct vgpu_submit *a);
 	IOReturn syncobjWait(struct vgpu_syncobj_wait *a);

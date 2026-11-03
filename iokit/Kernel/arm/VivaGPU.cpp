@@ -399,6 +399,7 @@ VivaGPUFence::create(bool isSignalled)
 		f->signalled = isSignalled;
 		f->error = kIOReturnSuccess;
 		f->signalAt = 0;
+		f->waiters = 0;
 	}
 	return f;
 }
@@ -872,8 +873,10 @@ VivaGPUAccelerator::start(IOService *provider)
 	PE_parse_boot_argn("vivagpuprobe", &fProbeMode, sizeof(fProbeMode));
 	fProbeLock = IOLockAlloc();
 	fFastLock = IOSimpleLockAlloc();
+	fCallLock = IOSimpleLockAlloc();
 	fWorkLoop = IOWorkLoop::workLoop();
-	if (fWorkLoop == NULL || fProbeLock == NULL || fFastLock == NULL || !IOAcceleratorES::start(provider)) {
+	if (fWorkLoop == NULL || fProbeLock == NULL || fFastLock == NULL || fCallLock == NULL ||
+	    !IOAcceleratorES::start(provider)) {
 		return false;
 	}
 	for (int i = 0; i < 6; i++) {
@@ -974,6 +977,10 @@ VivaGPUAccelerator::free(void)
 	if (fFastLock != NULL) {
 		IOSimpleLockFree(fFastLock);
 		fFastLock = NULL;
+	}
+	if (fCallLock != NULL) {
+		IOSimpleLockFree(fCallLock);
+		fCallLock = NULL;
 	}
 	if (fProbeLock != NULL) {
 		IOLockFree(fProbeLock);
@@ -2436,8 +2443,10 @@ VivaGPUAccelerator::completeJob(uint32_t slot, IOReturn error, uint32_t status, 
 		}
 	}
 	uint64_t c0 = mach_absolute_time(), bytes = 0;
+	bool surfaces = false;
 	for (unsigned int i = 0; job->bos != NULL && i < job->bos->getCount(); i++) {
 		VivaGPUBO *bo = (VivaGPUBO *)job->bos->getObject(i);
+		surfaces |= bo->kind == kVivaBOSurface;
 		if (bo->cacheMaint) {
 			if (bo->kind == kVivaBONormal && !(bo->flags & VGPU_BO_NOEXEC) && fLazy) {
 				continue;       /* shader code: the GPU never writes it */
@@ -2471,12 +2480,15 @@ VivaGPUAccelerator::completeJob(uint32_t slot, IOReturn error, uint32_t status, 
 	job->fence->signalled = true;
 	job->fence->error = error;
 	job->fence->signalAt = at;
+	fenceWake(job->fence);          /* K0g: only the threads waiting for this job (and the generic waiters) */
 	OSSafeReleaseNULL(job->deps);
 	OSSafeReleaseNULL(job->bos);
 	OSSafeReleaseNULL(job->fence);
 	OSSafeReleaseNULL(job->vm);
 	IOFreeType(job, VivaGPUJob);
-	wakeWaiters();
+	if (surfaces) {
+		sweet_fb_gpu_done();    /* a frame held back for the GPU may be ready: the display need not wait for a tick */
+	}
 }
 
 /* Fail the jobs on the hardware (reset, power off); queued jobs stay queued (power off fails them too). */
@@ -2874,6 +2886,109 @@ VivaGPUAccelerator::latencyStats(char **out, char *end)
 	    fIrqN, fFastKick ? "on" : "off", fFastArmed, fFastStarts);
 }
 
+/* K0g: per-selector cost of the user client calls. Any thread. */
+void
+VivaGPUAccelerator::callDone(uint32_t selector, uint64_t abs, bool trap)
+{
+	if (selector >= VGPU_SEL_COUNT) {
+		return;
+	}
+	IOInterruptState is = IOSimpleLockLockDisableInterrupt(fCallLock);
+	CallStat *c = &fCalls[selector];
+	c->n++;
+	c->trapN += trap;
+	c->sum += abs;
+	c->max = MAX(c->max, abs);
+	IOSimpleLockUnlockEnableInterrupt(fCallLock, is);
+}
+
+/* Gated (the caller just got the gate). */
+void
+VivaGPUAccelerator::gateWaited(uint32_t selector, uint64_t abs)
+{
+	if (selector >= VGPU_SEL_COUNT) {
+		return;
+	}
+	IOInterruptState is = IOSimpleLockLockDisableInterrupt(fCallLock);
+	CallStat *c = &fCalls[selector];
+	c->gateN++;
+	c->gateSum += abs;
+	c->gateMax = MAX(c->gateMax, abs);
+	IOSimpleLockUnlockEnableInterrupt(fCallLock, is);
+}
+
+void
+VivaGPUAccelerator::callReset(void)
+{
+	IOInterruptState is = IOSimpleLockLockDisableInterrupt(fCallLock);
+	bzero(fCalls, sizeof(fCalls));
+	IOSimpleLockUnlockEnableInterrupt(fCallLock, is);
+	fWakeFence = fWakeGeneric = fSleeps = fSleepsSpurious = 0;
+}
+
+void
+VivaGPUAccelerator::callStats(char **out, char *end)
+{
+	static const char *const names[VGPU_SEL_COUNT] = {
+		"version", "param", "create_bo", "mmap_bo", "bo_offset", "gem_close", "submit", "wait_bo", "madvise",
+		"sync_create", "sync_destroy", "sync_wait", "sync_reset", "sync_signal", "import_surf", "sync_bo",
+		"bo_info", "ctx_create", "ctx_destroy", "sync_xfer", "import_user",
+	};
+	CallStat c[VGPU_SEL_COUNT];
+	IOInterruptState is = IOSimpleLockLockDisableInterrupt(fCallLock);
+	memcpy(c, fCalls, sizeof(c));
+	IOSimpleLockUnlockEnableInterrupt(fCallLock, is);
+	say(out, end, "calls (entry -> return, us; gate = waiting for the gate; gpu calls reset):");
+	bool any = false;
+	for (uint32_t s = 0; s < VGPU_SEL_COUNT; s++) {
+		if (c[s].n == 0) {
+			continue;
+		}
+		any = true;
+		say(out, end, "\n  %-12s %8llu (%llu trap) avg %llu max %llu, gate avg %llu max %llu", names[s], c[s].n, c[s].trapN,
+		    absUs(c[s].sum / c[s].n), absUs(c[s].max), c[s].gateN ? absUs(c[s].gateSum / c[s].gateN) : 0,
+		    absUs(c[s].gateMax));
+	}
+	say(out, end, "%s\nwaits: %llu sleeps (%llu woke with nothing done), %llu fence wakeups, %llu generic wakeups, %u generic "
+	    "waiters now\n", any ? "" : " none yet", fSleeps, fSleepsSpurious, fWakeFence, fWakeGeneric, fGenericWaiters);
+}
+
+/*
+ * "gpu clocks": the PLLs in apmixedsys (MT6781 clk-mt6781.c offsets): CON0 bit 0 = enabled, CON1 = PCW (22 bits, 14
+ * fractional, from 26 MHz) and post divider [26:24]. The CPU PLLs are driven by the MCUPM firmware's DVFS on Android;
+ * here they stay where the preloader/LK left them. Read only.
+ */
+#define PLL_AP_CON3             0x00c
+#define PLL_AP_CON4             0x010
+#define PLL_ARM_LL_CON0         0x200   /* little cluster, Cortex-A55 */
+#define PLL_ARM_BL_CON0         0x210   /* big cluster, Cortex-A76 */
+#define PLL_ARM_BB_CON0         0x220
+#define PLL_CCI_CON0            0x2a0
+
+static uint32_t
+pllMHz(uint32_t con1)
+{
+	uint64_t pcw = con1 & 0x3fffff;
+	uint32_t posdiv = (con1 >> 24) & 7;
+	return (uint32_t)(((26ull * pcw) >> 14) >> posdiv);
+}
+
+void
+VivaGPUAccelerator::clocksDump(char **out, char *end)
+{
+	static const struct { const char *name; uint32_t con0; } plls[] = {
+		{ "armpll_ll (A55)", PLL_ARM_LL_CON0 }, { "armpll_bl (A76)", PLL_ARM_BL_CON0 },
+		{ "armpll_bb", PLL_ARM_BB_CON0 }, { "ccipll", PLL_CCI_CON0 }, { "mfgpll", PLL_MFG_CON0 },
+	};
+	for (uint32_t i = 0; i < sizeof(plls) / sizeof(plls[0]); i++) {
+		uint32_t con0 = rd32(fApmixed, plls[i].con0), con1 = rd32(fApmixed, plls[i].con0 + 4);
+		say(out, end, "%-16s %s %4u MHz (con0 0x%08x con1 0x%08x)\n", plls[i].name, (con0 & 1) ? "on " : "off",
+		    pllMHz(con1), con0, con1);
+	}
+	say(out, end, "ap_pll_con3 0x%08x con4 0x%08x (CPU PLL hardware-control select bits)\n", rd32(fApmixed, PLL_AP_CON3),
+	    rd32(fApmixed, PLL_AP_CON4));
+}
+
 void
 VivaGPUAccelerator::jobTimer(OSObject *owner, IOTimerEventSource *src __unused)
 {
@@ -2980,19 +3095,71 @@ VivaGPUAccelerator::dvfsSample(void)
 	}
 }
 
+/*
+ * K0g, targeted wakeups. Before, every waiter slept on one event that every job completion, submit and syncobj
+ * change woke: with ~100 jobs per frame each sleeping thread of every process (Mesa's WAIT_BO, the Metal driver's
+ * completion threads, IOSurfaceLock) woke ~200 times per frame, took the gate, found nothing and slept again, and
+ * submits queued behind them for the gate. Now a thread waiting for one fence sleeps on that fence, and the shared
+ * event is only for waits on several syncobjs (or one without a fence yet), woken only when such waiters exist.
+ */
+static IOReturn
+sleepResult(int r)
+{
+	return r == THREAD_TIMED_OUT ? kIOReturnTimeout : r == THREAD_INTERRUPTED ? kIOReturnAborted : kIOReturnSuccess;
+}
+
+IOReturn
+VivaGPUAccelerator::sleepOn(VivaGPUFence *fence, uint64_t deadline)
+{
+	if (fence->signalled) {
+		return kIOReturnSuccess;
+	}
+	fence->waiters++;
+	int r = deadline ? fGate->commandSleep(fence, deadline, THREAD_ABORTSAFE) :
+	    fGate->commandSleep(fence, THREAD_ABORTSAFE);
+	fence->waiters--;
+	fSleeps++;
+	if (r == THREAD_AWAKENED && !fence->signalled) {
+		fSleepsSpurious++;      /* dropped from a syncobj, or a generic wake */
+	}
+	return sleepResult(r);
+}
+
 IOReturn
 VivaGPUAccelerator::sleepUntil(uint64_t deadline)
 {
-	IOReturn r = deadline ? fGate->commandSleep(&fFenceEvent, deadline, THREAD_ABORTSAFE) :
+	fGenericWaiters++;
+	int r = deadline ? fGate->commandSleep(&fFenceEvent, deadline, THREAD_ABORTSAFE) :
 	    fGate->commandSleep(&fFenceEvent, THREAD_ABORTSAFE);
-	return r == THREAD_TIMED_OUT ? kIOReturnTimeout : r == THREAD_INTERRUPTED ? kIOReturnAborted : kIOReturnSuccess;
+	fGenericWaiters--;
+	fSleeps++;
+	return sleepResult(r);
+}
+
+void
+VivaGPUAccelerator::fenceWake(VivaGPUFence *fence)
+{
+	if (fence != NULL && fence->waiters != 0) {
+		fWakeFence++;
+		fGate->commandWakeup(fence, false);
+	}
+	wakeWaiters();
+}
+
+void
+VivaGPUAccelerator::wakeWaiters(void)
+{
+	if (fGenericWaiters != 0) {
+		fWakeGeneric++;
+		fGate->commandWakeup(&fFenceEvent, false);
+	}
 }
 
 IOReturn
 VivaGPUAccelerator::waitFence(VivaGPUFence *fence, uint64_t deadline)
 {
 	while (!fence->signalled) {
-		IOReturn r = sleepUntil(deadline);
+		IOReturn r = sleepOn(fence, deadline);
 		if (r != kIOReturnSuccess) {
 			return fence->signalled ? kIOReturnSuccess : r;
 		}
@@ -3205,6 +3372,15 @@ VivaGPUAccelerator::linkCommand(const char *args, char *out, size_t outLen)
 			} else {
 				latencyStats(o, end);
 			}
+		} else if (strncmp(args, "calls", 5) == 0) {
+			if (strncmp(args, "calls reset", 11) == 0) {
+				callReset();
+				say(o, end, "call counters reset\n");
+			} else {
+				callStats(o, end);
+			}
+		} else if (strncmp(args, "clocks", 6) == 0) {
+			clocksDump(o, end);
 		} else if (strncmp(args, "fastkick", 8) == 0) {
 			if (strncmp(args, "fastkick on", 11) == 0) {
 				fFastKick = true;
@@ -3265,9 +3441,9 @@ VivaGPUAccelerator::linkCommand(const char *args, char *out, size_t outLen)
 			say(o, end, "dvfs %s (%u..%u MHz, load %u%%, %llu up %llu down), flush reduction %s\n", fDvfs ? "on" : "off",
 			    gVivaOpp[fOpp].khz / 1000, gVivaOpp[MIN(fDvfsFast, fOpp)].khz / 1000, fLoadPct, fDvfsUps, fDvfsDowns,
 			    fFlushReduce ? "on" : "off");
-			latencyStats(o, end);
-			say(o, end, "usage: gpu [status|mfg|on|off|regs|freq [MHz]|dvfs [on|off]|lat [reset]|fastkick [on|off]|"
-			    "selftest [fault]|probe|publish]\n");
+			latencyStats(o, end);   /* per-call costs: "gpu calls" (the reply holds 4000 bytes) */
+			say(o, end, "usage: gpu [status|mfg|on|off|regs|freq [MHz]|dvfs [on|off]|lat [reset]|calls [reset]|clocks|"
+			    "fastkick [on|off]|selftest [fault]|probe|publish]\n");
 		}
 		return kIOReturnSuccess;
 	});
@@ -3307,7 +3483,10 @@ viva_gpu_surface_wait(SweetSurface *surface, uint32_t timeoutMs)
 	clock_interval_to_deadline(timeoutMs, kMillisecondScale, &deadline);
 	return gpu->gate()->runActionBlock(^IOReturn {
 		while (!VivaGPUAccelerator::surfaceIdle(surface, NULL)) {
-			IOReturn r = gpu->sleepUntil(deadline);
+			VivaGPUFence *f = OSDynamicCast(VivaGPUFence, surface->gpuFence);     /* unsignalled: not idle */
+			f->retain();            /* a newer job may replace it while we sleep */
+			IOReturn r = gpu->sleepOn(f, deadline);
+			f->release();
 			if (r != kIOReturnSuccess) {
 				return VivaGPUAccelerator::surfaceIdle(surface, NULL) ? kIOReturnSuccess : r;
 			}

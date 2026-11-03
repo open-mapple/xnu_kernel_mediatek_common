@@ -97,6 +97,13 @@ bool viva_gpu_surface_idle(SweetSurface *surface, uint64_t *jobs);
 IOReturn viva_gpu_surface_wait(SweetSurface *surface, uint32_t timeoutMs);
 
 /*
+ * Display (SweetFramebuffer.cpp), from the GPU's work loop: a GPU job that used IOSurfaces completed. If a swap is
+ * waiting to be shown, AppleCLCD tries it at once on its own work loop instead of at the next vsync tick. Cheap,
+ * never blocks.
+ */
+void sweet_fb_gpu_done(void);
+
+/*
  * Size of the surfaces the display may scan out directly (viva OVL, SweetFramebuffer.cpp; 0 = none): such
  * 4-byte single-plane surfaces are allocated physically contiguous below 4 GiB when possible.
  */
