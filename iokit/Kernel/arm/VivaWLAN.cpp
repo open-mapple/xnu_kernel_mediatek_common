@@ -97,6 +97,19 @@ VivaWLAN::start(IOService *provider)
 		IOLog("VIVA WLAN: off (vivawlan=0)\n");
 		return false;
 	}
+	/*
+	 * 0148: ifnet_allocate needs DLIL (dlil_init in bsd_init), which runs concurrently with IOKit matching: on
+	 * 0147 this start ran first and panicked in zalloc_flags(dlif_zone == NULL). IOBSD is published by
+	 * bsd_autoconf, after dlil_init and the network domains.
+	 */
+	OSDictionary *bsd = IOService::resourceMatching("IOBSD");
+	IOService *ready = bsd != NULL ? IOService::waitForMatchingService(bsd, 120000000000ull) : NULL;
+	OSSafeReleaseNULL(bsd);
+	if (ready == NULL) {
+		IOLog("VIVA WLAN: BSD networking not up after 120 s, no en0\n");
+		return false;
+	}
+	ready->release();
 	if (!IO80211Controller::start(provider)) {
 		return false;
 	}
