@@ -18,7 +18,26 @@ public:
 	void processTopLevel(IORegistryEntry *root) APPLE_KEXT_OVERRIDE;
 	const char *deleteList(void) APPLE_KEXT_OVERRIDE;
 	const char *excludeList(void) APPLE_KEXT_OVERRIDE;
+	void getUTCTimeOfDay(clock_sec_t *secs, clock_nsec_t *nsecs) APPLE_KEXT_OVERRIDE;
+	void setUTCTimeOfDay(clock_sec_t secs, clock_nsec_t nsecs) APPLE_KEXT_OVERRIDE;
 };
+
+extern "C" int viva_rtc_read(uint64_t *secs);   /* VivaPwrap.cpp: the PMIC's RTC (viva only) */
+
+/* The calendar at boot from the PMIC's RTC (otherwise 1970: no TLS, every site refuses the clock). */
+void
+SweetPlatformExpert::getUTCTimeOfDay(clock_sec_t *secs, clock_nsec_t *nsecs)
+{
+	uint64_t s = 0;
+	*secs = viva_rtc_read(&s) == 0 ? (clock_sec_t)s : 0;
+	*nsecs = 0;
+}
+
+/* settimeofday / timed: the kernel calendar only (RTC writes need a PMIC write path; the RTC is already UTC). */
+void
+SweetPlatformExpert::setUTCTimeOfDay(__unused clock_sec_t secs, __unused clock_nsec_t nsecs)
+{
+}
 
 OSDefineMetaClassAndStructors(SweetPlatformExpert, IODTPlatformExpert);
 

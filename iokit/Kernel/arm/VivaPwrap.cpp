@@ -53,7 +53,8 @@
 
 OSDefineMetaClassAndStructors(VivaPwrap, IOService);
 
-extern "C" void viva_wifi_reserve(void);        /* VivaWiFi.cpp: CONNSYS memory, before the scanout fragments it */
+extern "C" void viva_wifi_reserve(void);
+extern "C" int viva_rtc_read(uint64_t *secs);        /* VivaWiFi.cpp: CONNSYS memory, before the scanout fragments it */
 extern "C" void viva_cpufreq_start(void);       /* osfmk/arm64/viva_cpufreq.c: CPU DVFS needs the PMIC */
 
 static VivaPwrap *gVivaPwrap;
@@ -101,6 +102,17 @@ VivaPwrap::start(IOService *provider)
 	gVivaPwrap = this;
 	viva_cpufreq_start();
 	registerService();
+	{
+		/* the PMIC's RTC (kept by Android / LK, UTC): the calendar at boot (IOKitInitializeTime waits up to
+		 * 30 s for IORTC, then reads PEGetUTCTimeOfDay -> SweetPlatformExpert -> viva_rtc_read) */
+		uint64_t now = 0;
+		if (viva_rtc_read(&now) == 0) {
+			IOLog("VIVA RTC: %llu s since 1970 (UTC)\n", now);
+			publishResource("IORTC");
+		} else {
+			IOLog("VIVA RTC: not readable, calendar stays at 1970\n");
+		}
+	}
 	VivaDTNub::publishChildren(this, provider);
 	return true;
 }
@@ -313,5 +325,51 @@ viva_pwrap_read(uint32_t addr, uint32_t *value)
 		return -1;
 	}
 	return gVivaPwrap->readPMIC(addr, value) == kIOReturnSuccess ? 0 : -2;
+}
+
+/*
+ * MT6366 RTC (MT6358 layout, Linux rtc-mt6397.c; base 0x588): TC_SEC +0x0a, MIN +0x0c, HOU +0x0e, DOM +0x10,
+ * DOW +0x12, MTH +0x14 (1-12), YEA +0x16 (years since 1968). UTC on Android. Read only: the seconds are read again
+ * and the whole set retried if they changed in between. Measured 2026-11-04: 2026-11-04 21:00:07 = the Mac's UTC.
+ */
+#define RTC_BASE        0x588
+
+static uint64_t
+days_from_civil(int64_t y, uint32_t m, uint32_t d)
+{
+	y -= m <= 2;
+	int64_t era = (y >= 0 ? y : y - 399) / 400;
+	uint64_t yoe = (uint64_t)(y - era * 400);
+	uint64_t doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+	uint64_t doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+	return (uint64_t)(era * 146097 + (int64_t)doe - 719468);
+}
+
+extern "C" int
+viva_rtc_read(uint64_t *secs)
+{
+	static const uint32_t off[6] = { 0x0a, 0x0c, 0x0e, 0x10, 0x14, 0x16 };   /* sec min hour day month year */
+	static const uint32_t mask[6] = { 0x3f, 0x3f, 0x1f, 0x1f, 0x0f, 0x7f };
+	uint32_t v[6], again = 0;
+	for (int tries = 0; tries < 3; tries++) {
+		for (int i = 0; i < 6; i++) {
+			if (viva_pwrap_read(RTC_BASE + off[i], &v[i]) != 0) {
+				return -1;
+			}
+			v[i] &= mask[i];
+		}
+		if (viva_pwrap_read(RTC_BASE + off[0], &again) != 0) {
+			return -1;
+		}
+		if ((again & mask[0]) == v[0]) {
+			break;
+		}
+	}
+	uint32_t year = 1968 + v[5];
+	if (v[0] > 59 || v[1] > 59 || v[2] > 23 || v[3] < 1 || v[3] > 31 || v[4] < 1 || v[4] > 12 || year < 2020) {
+		return -2;                                      /* not set (e.g. after the battery ran flat) */
+	}
+	*secs = days_from_civil(year, v[4], v[3]) * 86400 + v[2] * 3600 + v[1] * 60 + v[0];
+	return 0;
 }
 #endif /* SWEET */
