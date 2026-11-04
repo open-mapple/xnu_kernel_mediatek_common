@@ -109,6 +109,13 @@ IOReturn viva_gpu_surface_wait(SweetSurface *surface, uint32_t timeoutMs);
 void sweet_fb_gpu_done(void);
 
 /*
+ * 0137: vsync ticks at which the display had a frame queued but the GPU had not finished it (K0c). The GPU's DVFS
+ * governor goes to its fastest OPP when this moves: with SwapWait (0133) every frame of GPU latency is a frame less
+ * per second, and the load average of bursty frames kept the clock low.
+ */
+extern volatile uint32_t sweet_fb_gpu_waits;
+
+/*
  * Size of the surfaces the display may scan out directly (viva OVL, SweetFramebuffer.cpp; 0 = none): such
  * 4-byte single-plane surfaces are allocated physically contiguous below 4 GiB when possible.
  */

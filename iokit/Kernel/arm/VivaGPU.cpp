@@ -909,6 +909,9 @@ VivaGPUAccelerator::start(IOService *provider)
 	PE_parse_boot_argn("vivagpudvfs", &flag, sizeof(flag));
 	fDvfs = flag != 0;
 	flag = 1;
+	PE_parse_boot_argn("vivagpuboost", &flag, sizeof(flag));
+	fDvfsBoost = flag != 0;
+	flag = 1;
 	PE_parse_boot_argn("vivagpufastkick", &flag, sizeof(flag));
 	fFastKick = flag != 0;
 	uint32_t maxMhz = 950;
@@ -3265,7 +3268,14 @@ VivaGPUAccelerator::dvfsSample(void)
 		fast = MIN(MAX(fast, oppForMHz(gVivaGPUCapMHz)), fOpp);   /* Low Power Mode ceiling */
 	}
 	uint64_t msec = nowMs();
-	if (pct >= DVFS_UP_PCT) {
+	uint32_t waits = sweet_fb_gpu_waits;
+	bool boost = fDvfsBoost && waits != fDvfsSeenWaits;
+	fDvfsSeenWaits = waits;
+	if (boost) {
+		want = fast;            /* 0137: a frame missed its vsync waiting for us (bursty load averages low) */
+		fDvfsBoosts++;
+	}
+	if (pct >= DVFS_UP_PCT || boost) {
 		want = fast;
 	} else if (msec - fDvfsUpMs >= DVFS_HOLD_MS) {
 		uint32_t khz = (uint32_t)((uint64_t)gVivaOpp[cur].khz * pct / DVFS_TARGET_PCT);
@@ -4054,8 +4064,9 @@ VivaGPUAccelerator::linkCommand(const char *args, char *out, size_t outLen)
 			    fWatchFragment ? ", watching fragment jobs" : "", fHeapGrows, fGpuFaults, fTimeouts, fResets);
 			memoryDump(o, end);
 			cacheStats(o, end);
-			say(o, end, "dvfs %s (%u..%u MHz, load %u%%, %llu up %llu down), flush reduction %s\n", fDvfs ? "on" : "off",
-			    gVivaOpp[fOpp].khz / 1000, gVivaOpp[MIN(fDvfsFast, fOpp)].khz / 1000, fLoadPct, fDvfsUps, fDvfsDowns,
+			say(o, end, "dvfs %s (%u..%u MHz, load %u%%, %llu up %llu down, %llu display boosts%s), flush reduction "
+			    "%s\n", fDvfs ? "on" : "off", gVivaOpp[fOpp].khz / 1000, gVivaOpp[MIN(fDvfsFast, fOpp)].khz / 1000,
+			    fLoadPct, fDvfsUps, fDvfsDowns, fDvfsBoosts, fDvfsBoost ? "" : ", vivagpuboost=0",
 			    fFlushReduce ? "on" : "off");
 			latencyStats(o, end);   /* per-call costs: "gpu calls" (the reply holds 4000 bytes) */
 			say(o, end, "usage: gpu [status|mfg|on|off|regs|freq [MHz]|dvfs [on|off]|lat [reset]|calls [reset]|clocks|"

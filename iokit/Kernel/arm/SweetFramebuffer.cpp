@@ -287,6 +287,7 @@ public:
 OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
 
 static AppleCLCD *gSweetFB;     /* for the USB link "disp" command */
+volatile uint32_t sweet_fb_gpu_waits;
 static volatile uint32_t gSweetFbDutyCap;       /* sweet_fb_set_duty_cap (Low Power Mode); 0 = sweetfb_duty */
 
 /* Low Power Mode (VivaBattery.cpp): panel copies take at most `pct` % of one CPU (0 = sweetfb_duty again). */
@@ -802,6 +803,7 @@ AppleCLCD::presentQueued(const uint8_t *recs, uint32_t n, bool early)
 		if (fGpuWaitMax != 0 && fGpuTicks < fGpuWaitMax) {
 			fGpuTicks++;
 			fGpuWaits++;
+			sweet_fb_gpu_waits++;   /* 0137: the GPU governor boosts */
 			return -1;
 		}
 		pick = (int)n - 1;

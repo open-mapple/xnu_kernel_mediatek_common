@@ -413,6 +413,9 @@ private:
 	bool     fDvfs, fDvfsArmed;
 	uint32_t fDvfsFast, fLoadPct;
 	uint64_t fBusyStart, fBusyNs, fWindowStart, fDvfsUpMs, fDvfsUps, fDvfsDowns;
+	bool     fDvfsBoost;                /* 0137 vivagpuboost: fastest OPP while the display waits for frames */
+	uint32_t fDvfsSeenWaits;
+	uint64_t fDvfsBoosts;
 	uint64_t fImplicitDeps, fLazyListed, fLazyBytes, fLazyNs, fLazyWaits, fLazyOverflows;
 	void cacheStats(char **out, char *end);
 public:
