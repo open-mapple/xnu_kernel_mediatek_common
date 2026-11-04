@@ -416,6 +416,7 @@ VivaGPUFence::create(bool isSignalled)
 		f->owner = NULL;
 		f->deadline = 0;
 		f->followers = NULL;
+		f->deps = NULL;
 	}
 	return f;
 }
@@ -424,6 +425,7 @@ void
 VivaGPUFence::free(void)
 {
 	OSSafeReleaseNULL(followers);
+	OSSafeReleaseNULL(deps);
 	OSObject::free();
 }
 
@@ -2220,20 +2222,32 @@ VivaGPUAccelerator::submit(VivaGPUVM *vm, uint64_t jc, uint32_t requirements, OS
 			 * in-sync between them, and every batch shares the tiler heap). An IOSurface also waits for the last
 			 * job on it in any other connection. Each busy fence then signals after every earlier job on the BO.
 			 */
-			addImplicitDep(deps, bo->busy, fence);
+			addImplicitDepFor(deps, bo->busy, fence, vm);
 			fence->retain();
 			OSSafeReleaseNULL(bo->busy);
 			bo->busy = fence;
 			if (bo->kind == kVivaBOSurface && bo->surface != NULL) {
 				SweetSurface *s = bo->surface;
 				VivaGPUFence *last = OSDynamicCast(VivaGPUFence, s->gpuFence);
+				uint32_t budget = 128;
 				if (last != NULL && last->promise && !last->signalled) {
 					/*
 					 * K0i: a pending promise stays the surface's fence until it is resolved. Its owner's jobs
-					 * (the ones that will resolve it) wait for what came before it; anyone else's wait for it.
+					 * (the ones that will resolve it) wait for what came before it; anyone else's wait for it
+					 * (K0j: unless it depends on a pending promise of ours: then it comes after this job).
 					 */
-					addImplicitDep(deps, last->owner == vm ? OSDynamicCast(VivaGPUFence, s->gpuPrev) : last,
-					    fence);
+					addImplicitDepFor(deps, last->owner == vm ? OSDynamicCast(VivaGPUFence, s->gpuPrev) : last,
+					    fence, vm);
+					s->gpuJobs++;
+				} else if (last != NULL && !last->signalled && vmHasPromise(vm) &&
+				    dependsOnPromiseOf(last, vm, &budget)) {
+					/*
+					 * K0j: the surface's last job waits (maybe through other jobs) for a pending promise of this
+					 * connection, so it runs after the promised work, this job included. It stays the surface's
+					 * fence (the later one); this job waits for what that one waited for on the surface.
+					 */
+					fPromiseBypass++;
+					addImplicitDepFor(deps, last, fence, vm);
 					s->gpuJobs++;
 				} else {
 					addImplicitDep(deps, last, fence);
@@ -2263,6 +2277,11 @@ VivaGPUAccelerator::submit(VivaGPUVM *vm, uint64_t jc, uint32_t requirements, OS
 	}
 	job->fence = fence;
 	fence->retain();
+	if (deps != NULL && fence->deps != deps) {
+		deps->retain();                 /* K0j: what this fence waits for, until it signals */
+		OSSafeReleaseNULL(fence->deps);
+		fence->deps = deps;
+	}
 	job->submitAt = mach_absolute_time();
 	/* K0h: numbered in its connection, listed until it completes (completion page watermark) */
 	job->seq = ++vm->seqNext;
@@ -2405,28 +2424,96 @@ VivaGPUAccelerator::kick(void)
 	}
 	fastSync();
 	for (uint32_t slot = 0; slot < 2; slot++) {
-		VivaGPUJob *job = fQueue[slot];
-		if (fRunning[slot] != NULL || job == NULL) {
+		if (fRunning[slot] != NULL || fQueue[slot] == NULL) {
 			continue;
 		}
-		bool ready = true;
-		for (unsigned int i = 0; job->deps != NULL && i < job->deps->getCount(); i++) {
-			if (!((VivaGPUFence *)job->deps->getObject(i))->signalled) {
-				ready = false;
-				break;
-			}
+		VivaGPUJob *job = nextStartable(slot, false);
+		if (job != NULL) {
+			startJob(slot, job);
 		}
-		if (!ready || !asBind(job->vm)) {
-			continue;
-		}
-		fQueue[slot] = job->next;
-		if (fQueue[slot] == NULL) {
-			fQueueTail[slot] = NULL;
-		}
-		job->next = NULL;
-		startJob(slot, job);
 	}
 	fastArm();
+}
+
+static bool
+vmListed(VivaGPUVM *const *list, uint32_t n, VivaGPUVM *vm)
+{
+	for (uint32_t i = 0; i < n; i++) {
+		if (list[i] == vm) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/* Gated: take `job` (after `prev`, NULL = the head) out of the slot's queue. */
+void
+VivaGPUAccelerator::unlinkQueued(uint32_t slot, VivaGPUJob *job, VivaGPUJob *prev)
+{
+	if (prev != NULL) {
+		prev->next = job->next;
+	} else {
+		fQueue[slot] = job->next;
+	}
+	if (fQueueTail[slot] == job) {
+		fQueueTail[slot] = prev;
+	}
+	job->next = NULL;
+}
+
+/*
+ * Gated, K0j. The slot queues are FIFO per connection, not across connections (like Linux's drm_sched entities):
+ * the first job whose connection has no earlier job still waiting in this slot. Otherwise a job of SpringBoard that
+ * waits for a backboardd promise, at the head of the fragment queue, would hold back the backboardd jobs that
+ * resolve the promise. kick (forArm false): every dependency signalled, AS bound -> unlinked and returned.
+ * fastArm (forArm true): every unsignalled dependency a running job, the wait mask in fArmWait, AS bound;
+ * left in the queue (fastSync unlinks it once the filter started it).
+ */
+VivaGPUJob *
+VivaGPUAccelerator::nextStartable(uint32_t slot, bool forArm)
+{
+	VivaGPUVM *blocked[16];
+	uint32_t n = 0;
+	VivaGPUJob *prev = NULL;
+	for (VivaGPUJob *job = fQueue[slot]; job != NULL; prev = job, job = job->next) {
+		if (vmListed(blocked, n, job->vm)) {
+			continue;
+		}
+		bool ok = true;
+		uint32_t wait = (forArm && fRunning[slot] != NULL) ? 1u << slot : 0;
+		for (unsigned int i = 0; ok && job->deps != NULL && i < job->deps->getCount(); i++) {
+			VivaGPUFence *f = (VivaGPUFence *)job->deps->getObject(i);
+			if (f->signalled) {
+				continue;
+			}
+			if (forArm && fRunning[0] != NULL && f == fRunning[0]->fence) {
+				wait |= 1;
+			} else if (forArm && fRunning[1] != NULL && f == fRunning[1]->fence) {
+				wait |= 2;
+			} else {
+				ok = false;
+			}
+		}
+		if (ok && forArm && wait == 0) {
+			ok = false;             /* ready now: kick's business (its AS could not be bound) */
+		}
+		if (ok && asBind(job->vm)) {
+			if (prev != NULL) {
+				fQueueBypass++;
+			}
+			if (forArm) {
+				fArmWait = wait;
+			} else {
+				unlinkQueued(slot, job, prev);
+			}
+			return job;
+		}
+		if (n == sizeof(blocked) / sizeof(blocked[0])) {
+			break;
+		}
+		blocked[n++] = job->vm;
+	}
+	return NULL;
 }
 
 uint32_t
@@ -2869,12 +2956,12 @@ VivaGPUAccelerator::fastSync(void)
 			job->vm->running--;             /* reservation of fastArm */
 			continue;
 		}
-		/* armed = head of its queue, and nothing dequeues without fastSync first */
-		fQueue[slot] = job->next;
-		if (fQueue[slot] == NULL) {
-			fQueueTail[slot] = NULL;
+		/* armed = still queued (K0j: not necessarily the head), and nothing dequeues without fastSync first */
+		VivaGPUJob *prev = NULL;
+		for (VivaGPUJob *q = fQueue[slot]; q != NULL && q != job; q = q->next) {
+			prev = q;
 		}
-		job->next = NULL;
+		unlinkQueued(slot, job, prev);
 		fFastStarts++;
 		jobStarted(slot, job, arm[slot].startAt, true);
 	}
@@ -2892,28 +2979,15 @@ VivaGPUAccelerator::fastArm(void)
 		return;
 	}
 	for (uint32_t slot = 0; slot < 2; slot++) {
-		VivaGPUJob *job = fQueue[slot];
+		if (fQueue[slot] == NULL) {
+			continue;
+		}
+		/* waits only for jobs on the hardware (a queued job or a syncobj: the normal path) */
+		VivaGPUJob *job = nextStartable(slot, true);
 		if (job == NULL) {
 			continue;
 		}
-		uint32_t wait = fRunning[slot] != NULL ? 1u << slot : 0;
-		bool ok = true;
-		for (unsigned int i = 0; ok && job->deps != NULL && i < job->deps->getCount(); i++) {
-			VivaGPUFence *f = (VivaGPUFence *)job->deps->getObject(i);
-			if (f->signalled) {
-				continue;
-			}
-			if (fRunning[0] != NULL && f == fRunning[0]->fence) {
-				wait |= 1;
-			} else if (fRunning[1] != NULL && f == fRunning[1]->fence) {
-				wait |= 2;
-			} else {
-				ok = false;             /* waits for a queued job or a syncobj: the normal path */
-			}
-		}
-		if (!ok || wait == 0 || !asBind(job->vm)) {
-			continue;
-		}
+		uint32_t wait = fArmWait;
 		job->vm->running++;
 		IOInterruptState is = IOSimpleLockLockDisableInterrupt(fFastLock);
 		fArm[slot].job = job;
@@ -3046,8 +3120,9 @@ VivaGPUAccelerator::callStats(char **out, char *end)
 	}
 	say(out, end, "%s\nwaits: %llu sleeps (%llu woke with nothing done), %llu fence wakeups, %llu generic wakeups, %u generic "
 	    "waiters now\n", any ? "" : " none yet", fSleeps, fSleepsSpurious, fWakeFence, fWakeGeneric, fGenericWaiters);
-	say(out, end, "surface promises (K0i): %llu made, %u pending, %llu timed out\n", fPromisesMade,
-	    fPromises != NULL ? fPromises->getCount() : 0, fPromisesTimedOut);
+	say(out, end, "surface promises (K0i): %llu made, %u pending, %llu timed out; K0j: %llu waits past an own "
+	    "promise, %llu jobs started ahead of another connection's, %llu queued jobs dropped at close\n", fPromisesMade,
+	    fPromises != NULL ? fPromises->getCount() : 0, fPromisesTimedOut, fPromiseBypass, fQueueBypass, fJobsDiscarded);
 }
 
 /*
@@ -3266,6 +3341,7 @@ VivaGPUAccelerator::signalFence(VivaGPUFence *fence, IOReturn error, uint64_t at
 	fence->signalled = true;
 	fence->error = error;
 	fence->signalAt = at;
+	OSSafeReleaseNULL(fence->deps);         /* K0j: only unsignalled fences keep what they waited for */
 	fenceWake(fence);
 	OSArray *followers = fence->followers;
 	fence->followers = NULL;
@@ -3288,6 +3364,7 @@ VivaGPUAccelerator::resolvePromise(VivaGPUFence *p, VivaGPUFence *to)
 	}
 	if (to == NULL || to->signalled) {
 		signalFence(p, to != NULL ? to->error : kIOReturnSuccess, mach_absolute_time());
+		kick();                 /* K0j: jobs waiting for it can start now, not at the next submit */
 		return;
 	}
 	if (to->followers == NULL) {
@@ -3295,7 +3372,11 @@ VivaGPUAccelerator::resolvePromise(VivaGPUFence *p, VivaGPUFence *to)
 	}
 	if (to->followers == NULL || !to->followers->setObject(p)) {
 		signalFence(p, kIOReturnSuccess, mach_absolute_time());    /* no memory: never leave readers waiting */
+		kick();
+		return;
 	}
+	OSSafeReleaseNULL(p->deps);
+	p->deps = OSArray::withObjects((const OSObject **)&to, 1);     /* K0j: it now waits for `to` */
 }
 
 VivaGPUFence *
@@ -3340,6 +3421,7 @@ void
 VivaGPUAccelerator::promiseTimeouts(void)
 {
 	uint64_t now = mach_absolute_time();
+	bool kicked = false;
 	for (unsigned int i = 0; fPromises != NULL && i < fPromises->getCount();) {
 		VivaGPUFence *p = (VivaGPUFence *)fPromises->getObject(i);
 		if (!p->signalled && now >= p->deadline) {
@@ -3348,12 +3430,207 @@ VivaGPUAccelerator::promiseTimeouts(void)
 				IOLog("VIVA GPU: surface promise not resolved in time, signalled (readers may see it unfinished)\n");
 			}
 			signalFence(p, kIOReturnTimeout, now);
+			kicked = true;
 		}
 		if (p->signalled) {
 			fPromises->removeObject(i);
 		} else {
 			i++;
 		}
+	}
+	if (kicked) {
+		kick();                 /* K0j: the jobs that waited for them start now (they used to stay queued) */
+	}
+}
+
+/* ---- K0j: waits that must not wait for a connection's own pending promise ---- */
+
+bool
+VivaGPUAccelerator::vmHasPromise(VivaGPUVM *vm)
+{
+	for (unsigned int i = 0; vm != NULL && fPromises != NULL && i < fPromises->getCount(); i++) {
+		VivaGPUFence *p = (VivaGPUFence *)fPromises->getObject(i);
+		if (!p->signalled && p->owner == vm) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/* Gated: does unsignalled `f` wait, through job dependencies and resolved promises, for a pending promise of vm? */
+bool
+VivaGPUAccelerator::dependsOnPromiseOf(VivaGPUFence *f, VivaGPUVM *vm, uint32_t *budget)
+{
+	if (f == NULL || f->signalled) {
+		return false;
+	}
+	if (f->promise && f->owner == vm) {
+		return true;
+	}
+	if (*budget == 0) {
+		return false;           /* too deep to tell: wait as before (the promise timeout is the backstop) */
+	}
+	(*budget)--;
+	for (unsigned int i = 0; f->deps != NULL && i < f->deps->getCount(); i++) {
+		if (dependsOnPromiseOf((VivaGPUFence *)f->deps->getObject(i), vm, budget)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+/*
+ * Gated: the fences connection `vm` has to wait for instead of `f`. A fence that depends on one of vm's pending
+ * promises runs after vm's promised work (which is what vm is doing now), so waiting for it is a deadlock: vm waits
+ * for what it waited for instead, recursively. vm's own promise: nothing (vm resolves it).
+ */
+void
+VivaGPUAccelerator::collectWait(VivaGPUFence *f, VivaGPUVM *vm, OSArray *out, uint32_t depth)
+{
+	if (f == NULL || f->signalled || (f->promise && f->owner == vm)) {
+		return;
+	}
+	uint32_t budget = 128;
+	if (depth >= 16 || !dependsOnPromiseOf(f, vm, &budget)) {
+		if (out->getNextIndexOfObject(f, 0) == (unsigned int)-1) {
+			out->setObject(f);
+		}
+		return;
+	}
+	fPromiseBypass++;
+	for (unsigned int i = 0; f->deps != NULL && i < f->deps->getCount(); i++) {
+		collectWait((VivaGPUFence *)f->deps->getObject(i), vm, out, depth + 1);
+	}
+}
+
+void
+VivaGPUAccelerator::addImplicitDepFor(OSArray *deps, VivaGPUFence *f, VivaGPUFence *self, VivaGPUVM *vm)
+{
+	if (f == NULL || f->signalled) {
+		return;
+	}
+	OSArray *list = vmHasPromise(vm) ? OSArray::withCapacity(4) : NULL;
+	if (list == NULL) {
+		addImplicitDep(deps, f, self);
+		return;
+	}
+	collectWait(f, vm, list, 0);
+	for (unsigned int i = 0; i < list->getCount(); i++) {
+		addImplicitDep(deps, (VivaGPUFence *)list->getObject(i), self);
+	}
+	list->release();
+}
+
+VivaGPUFence *
+VivaGPUAccelerator::boWaitFence(VivaGPUBO *bo)
+{
+	VivaGPUFence *first = boBusyFence(bo);
+	if (first == NULL) {
+		return NULL;
+	}
+	OSArray *list = vmHasPromise(bo->vm) ? OSArray::withCapacity(4) : NULL;
+	if (list == NULL) {
+		first->retain();
+		return first;
+	}
+	/* the BO's last job and (an IOSurface) the surface's last fence, both through collectWait */
+	collectWait(bo->busy, bo->vm, list, 0);
+	if (bo->kind == kVivaBOSurface && bo->surface != NULL) {
+		VivaGPUFence *sf = OSDynamicCast(VivaGPUFence, bo->surface->gpuFence);
+		if (sf != NULL && sf->promise && !sf->signalled && sf->owner == bo->vm) {
+			sf = OSDynamicCast(VivaGPUFence, bo->surface->gpuPrev);
+		}
+		collectWait(sf, bo->vm, list, 0);
+	}
+	VivaGPUFence *f = NULL;
+	for (unsigned int i = 0; f == NULL && i < list->getCount(); i++) {
+		VivaGPUFence *c = (VivaGPUFence *)list->getObject(i);
+		if (!c->signalled) {
+			f = c;
+			f->retain();
+		}
+	}
+	list->release();
+	return f;
+}
+
+/* Gated: a queued job that will never run (its connection closed): out of its connection's list, fence signalled. */
+void
+VivaGPUAccelerator::discardJob(VivaGPUJob *job, IOReturn error)
+{
+	VivaGPUVM *vm = job->vm;
+	if (job->vmPrev != NULL) {
+		job->vmPrev->vmNext = job->vmNext;
+	} else if (vm->jobHead == job) {
+		vm->jobHead = job->vmNext;
+	}
+	if (job->vmNext != NULL) {
+		job->vmNext->vmPrev = job->vmPrev;
+	} else if (vm->jobTail == job) {
+		vm->jobTail = job->vmPrev;
+	}
+	vm->seqUpdate();
+	signalFence(job->fence, error, mach_absolute_time());
+	OSSafeReleaseNULL(job->deps);
+	OSSafeReleaseNULL(job->bos);
+	OSSafeReleaseNULL(job->fence);
+	OSSafeReleaseNULL(job->vm);
+	IOFreeType(job, VivaGPUJob);
+	fJobsDiscarded++;
+}
+
+/*
+ * Gated, K0j: the connection is closing (its process may be dead: vctl kill backboardd). Its queued jobs would run
+ * after its BOs and address space are gone and fault: drop them (their fences signal kIOReturnAborted, so other
+ * processes' jobs waiting for them go on). Wait (up to 1 s, then the job timeout's reset) for its running jobs.
+ */
+void
+VivaGPUAccelerator::abortVM(VivaGPUVM *vm)
+{
+	if (vm == NULL) {
+		return;
+	}
+	fastSync();
+	uint64_t dropped = 0;
+	for (uint32_t slot = 0; slot < 2; slot++) {
+		VivaGPUJob *prev = NULL, *job = fQueue[slot];
+		while (job != NULL) {
+			VivaGPUJob *next = job->next;
+			if (job->vm == vm) {
+				unlinkQueued(slot, job, prev);
+				discardJob(job, kIOReturnAborted);
+				dropped++;
+			} else {
+				prev = job;
+			}
+			job = next;
+		}
+	}
+	if (dropped != 0) {
+		IOLog("VIVA GPU: connection closed with %llu queued jobs: dropped\n", dropped);
+		stateUpdate(mach_absolute_time());
+	}
+	kick();
+	uint64_t deadline;
+	clock_interval_to_deadline(1000, kMillisecondScale, &deadline);
+	for (;;) {
+		VivaGPUFence *f = NULL;
+		for (uint32_t slot = 0; slot < 2 && f == NULL; slot++) {
+			if (fRunning[slot] != NULL && fRunning[slot]->vm == vm) {
+				f = fRunning[slot]->fence;
+			}
+		}
+		if (f == NULL) {
+			break;
+		}
+		f->retain();
+		IOReturn r = sleepOn(f, deadline);
+		f->release();
+		if (r != kIOReturnSuccess) {
+			IOLog("VIVA GPU: closed connection's job still running after 1 s (the job timeout handles it)\n");
+			break;
+		}
+		fastSync();
 	}
 }
 

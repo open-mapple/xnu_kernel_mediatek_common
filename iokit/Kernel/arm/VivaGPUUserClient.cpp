@@ -124,6 +124,7 @@ VivaGPUUserClient::closeAll(void)
 		return;
 	}
 	fGPU->gate()->runActionBlock(^IOReturn {
+		fGPU->abortVM(fVM);             /* K0j: no queued job of ours runs after our memory is gone */
 		for (uint32_t h = 1; h < fBOCap; h++) {
 			OSSafeReleaseNULL(fBOs[h]);
 		}
@@ -396,14 +397,17 @@ VivaGPUUserClient::dispatch(uint32_t selector, void *arg)
 			uint64_t deadline = deadlineFor(a->timeout_ns, &expired);
 			b->retain();
 			IOReturn ret = kIOReturnSuccess;
-			while (!VivaGPUAccelerator::boIdle(b)) {
+			VivaGPUFence *f;
+			/*
+			 * the BO's last job, else (an IOSurface) the last job on the surface in any connection; K0j: not a job
+			 * that waits for a pending promise of ours (it comes after our promised work)
+			 */
+			while ((f = fGPU->boWaitFence(b)) != NULL) {
 				if (expired) {
+					f->release();
 					ret = kIOReturnBusy;
 					break;
 				}
-				/* the BO's last job, else (an IOSurface) the last job on the surface in any connection */
-				VivaGPUFence *f = VivaGPUAccelerator::boBusyFence(b);
-				f->retain();
 				IOReturn r = fGPU->sleepOn(f, deadline);
 				f->release();
 				if (r == kIOReturnTimeout) {

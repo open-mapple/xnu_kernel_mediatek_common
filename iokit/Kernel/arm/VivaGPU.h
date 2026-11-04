@@ -82,6 +82,8 @@ public:
 	VivaGPUVM *owner;       /* connection that made it (compared only, not retained) */
 	uint64_t   deadline;    /* mach_absolute_time */
 	OSArray   *followers;   /* promises linked to this fence: signalled with it */
+	/* K0j: what it waits for while unsignalled (its job's dependencies; a resolved promise: the fence it follows) */
+	OSArray   *deps;
 };
 
 /* A GPU address space: AArch64 4K page tables plus the VA allocator for [VGPU_VA_START, VGPU_VA_END). */
@@ -227,6 +229,15 @@ public:
 	 * surface's last fence, or what came before the connection's own pending promise (K0i). NULL = idle.
 	 */
 	static VivaGPUFence *boBusyFence(VivaGPUBO *bo);
+	/*
+	 * Gated, K0j: one fence WAIT_BO on `bo` must still sleep on (retained; NULL = done). Fences that depend on a
+	 * pending promise of the BO's own connection come after its promised work: what they waited for counts instead.
+	 */
+	VivaGPUFence *boWaitFence(VivaGPUBO *bo);
+	/* Gated, K0j: drop the connection's queued jobs (fences signal kIOReturnAborted), let its running ones finish. */
+	void abortVM(VivaGPUVM *vm);
+	/* Gated: start what can start (after a fence was signalled outside a job completion). */
+	void kickNow(void) { kick(); }
 	/* Gated: no pending job uses the surface (any connection); *jobs = jobs that used it so far. */
 	static bool surfaceIdle(SweetSurface *surface, uint64_t *jobs);
 	/*
@@ -299,6 +310,14 @@ private:
 	bool asBind(VivaGPUVM *vm);
 	/* jobs */
 	void addImplicitDep(OSArray *deps, VivaGPUFence *f, VivaGPUFence *self);
+	/* K0j: promise-aware waits of connection `vm` */
+	bool vmHasPromise(VivaGPUVM *vm);
+	bool dependsOnPromiseOf(VivaGPUFence *f, VivaGPUVM *vm, uint32_t *budget);
+	void collectWait(VivaGPUFence *f, VivaGPUVM *vm, OSArray *out, uint32_t depth);
+	void addImplicitDepFor(OSArray *deps, VivaGPUFence *f, VivaGPUFence *self, VivaGPUVM *vm);
+	void discardJob(VivaGPUJob *job, IOReturn error);
+	void unlinkQueued(uint32_t slot, VivaGPUJob *job, VivaGPUJob *prev);
+	VivaGPUJob *nextStartable(uint32_t slot, bool forArm);
 	void kick(void);
 	void startJob(uint32_t slot, VivaGPUJob *job);
 	void jsWrite(uint32_t slot, VivaGPUJob *job, uint32_t config);
@@ -427,6 +446,8 @@ private:
 	 */
 	OSArray *fPromises;                 /* K0i: pending promises (their timeout, in jobTimer) */
 	uint64_t fPromisesMade, fPromisesTimedOut;
+	uint64_t fPromiseBypass, fQueueBypass, fJobsDiscarded;      /* K0j */
+	uint32_t fArmWait;                  /* nextStartable(forArm): the slots the armed job waits for */
 	void promiseTimeouts(void);
 	uint32_t fGenericWaiters;
 	uint64_t fWakeFence, fWakeGeneric, fSleeps, fSleepsSpurious;
