@@ -174,7 +174,7 @@ void
 viva_wlan_input(mbuf_t m)
 {
 	ifnet_t ifp = wn.ifp;
-	if (ifp == NULL || mbuf_pkthdr_len(m) < ETHER_HDR_LEN) {
+	if (ifp == NULL || mbuf_pkthdr_len(m) < ETHER_HDR_LEN || mbuf_len(m) < ETHER_HDR_LEN) {
 		mbuf_freem(m);
 		return;
 	}

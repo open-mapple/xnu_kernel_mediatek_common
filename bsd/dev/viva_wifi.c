@@ -1812,16 +1812,19 @@ data_rx(const uint8_t *eth, uint32_t len)
 		sj.rxDrops++;
 		return;
 	}
+	/* one mbuf with a 2 KiB cluster, lengths set explicitly (as sweet_usb.c; viva_wlan_input strips 14 bytes) */
 	mbuf_t m = NULL;
-	if (mbuf_allocpacket(MBUF_DONTWAIT, len, NULL, &m) != 0) {
+	if (mbuf_gethdr(MBUF_DONTWAIT, MBUF_TYPE_DATA, &m) != 0) {
 		sj.rxDrops++;
 		return;
 	}
-	if (mbuf_copyback(m, 0, len, eth, MBUF_DONTWAIT) != 0) {
+	if (mbuf_mclget(MBUF_DONTWAIT, MBUF_TYPE_DATA, &m) != 0 || !(mbuf_flags(m) & MBUF_EXT) || mbuf_maxlen(m) < len) {
 		mbuf_freem(m);
 		sj.rxDrops++;
 		return;
 	}
+	memcpy(mbuf_data(m), eth, len);
+	mbuf_setlen(m, len);
 	mbuf_pkthdr_setlen(m, len);
 	if (vn.rxTail) {
 		mbuf_setnextpkt(vn.rxTail, m);
