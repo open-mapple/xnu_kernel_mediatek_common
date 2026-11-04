@@ -186,6 +186,10 @@ static const struct {
 	{ 0x1526, 0x007f, 0x40 },       /* BUCK_VGPU_ELR0: RG_BUCK_VGPU_VOSEL, <= 0.9 V */
 	{ 0x1bc8, 0x0001, 0x01 },       /* LDO_VSRAM_GPU_CON0: RG_LDO_VSRAM_GPU_EN */
 	{ 0x1bf4, 0x007f, 0x50 },       /* LDO_VSRAM_CON3: RG_LDO_VSRAM_GPU_VOSEL, <= 1.0 V */
+	/* CONNSYS (bsd/dev/viva_wifi.c, mt6781.c consys_hw_vcn18_ctrl): VCN18 enable/mode bits only, no voltage */
+	{ 0x1c58, 0x0003, 0x03 },       /* LDO_VCN18_CON0: RG_LDO_VCN18_EN, RG_LDO_VCN18_LP */
+	{ 0x1c5a, 0x0003, 0x03 },       /* LDO_VCN18_OP_EN: SW_OP_EN, HW0_OP_EN */
+	{ 0x1c60, 0x0002, 0x01 },       /* LDO_VCN18_OP_CFG: HW0_OP_CFG */
 };
 
 IOReturn
@@ -272,6 +276,16 @@ VivaDTNub::publishChildren(IOService *parent, IORegistryEntry *dtEntry)
 		nub->release();
 	}
 	OSSafeReleaseNULL(children);
+}
+
+/* bsd/dev/viva_wifi.c: the whitelisted regulator fields (writeRegulator). */
+extern "C" int
+viva_pwrap_write_regulator(uint32_t addr, uint32_t mask, uint32_t value)
+{
+	if (gVivaPwrap == NULL) {
+		return -1;
+	}
+	return gVivaPwrap->writeRegulator(addr, mask, value) == kIOReturnSuccess ? 0 : -2;
 }
 
 extern "C" int
