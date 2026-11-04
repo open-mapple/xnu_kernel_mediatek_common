@@ -1485,6 +1485,19 @@ OSKext::iokitDaemonAvailable(void)
 	if (PE_parse_boot_argn("-restore", &notused, sizeof(notused))) {
 		return false;
 	}
+	/*
+	 * SWEET/viva: the iOS root has no IOKit daemon (kernelmanagerd is macOS
+	 * only) and every driver is built into the kernel. With a daemon expected,
+	 * StartIOKitMatching keeps the service root busy until the daemon checks
+	 * in, so IOKit never goes quiet: MobileGestalt (_MGWaitForDevices, e.g.
+	 * WifiAddress/UniqueDeviceID) then waits forever, and lsd hangs in
+	 * InstalledContentLibrary when it registers a plugin. Behave like an iOS
+	 * kernel built without kextd. Boot-arg sweetiokitd=1 restores the wait.
+	 */
+	int sweet_iokitd = 0;
+	if (!PE_parse_boot_argn("sweetiokitd", &sweet_iokitd, sizeof(sweet_iokitd)) || !sweet_iokitd) {
+		return false;
+	}
 	return true;
 }
 
