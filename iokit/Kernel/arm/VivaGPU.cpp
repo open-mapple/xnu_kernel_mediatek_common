@@ -3358,6 +3358,12 @@ VivaGPUAccelerator::signalFence(VivaGPUFence *fence, IOReturn error, uint64_t at
 		if (idx != (unsigned int)-1) {
 			fPromises->removeObject(idx);   /* fPromises = pending promises only (vmHasPromise stays short) */
 		}
+		/*
+		 * 0135: the surfaces it covered may now be idle. A promise resolved with a fence that had already signalled
+		 * (the replay's last job done before its TRANSFER) used to wake nobody: the display found the frame only at
+		 * the next vsync tick and switched it one frame after that.
+		 */
+		sweet_fb_gpu_done();
 	}
 	fenceWake(fence);
 	OSArray *followers = fence->followers;
