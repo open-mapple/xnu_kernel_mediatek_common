@@ -948,6 +948,31 @@ vl_vivad_out(uint8_t *out, uint32_t max)
  *   reboot            watchdog software reset (back through preloader/LK)
  * peek/poke have no guard: an address in a gated block can hang the bus.
  */
+/* "stat" (also kern.viva_link, bsd/dev/viva_sysctl.c): uptime, link and log counters. */
+void viva_link_stat(char *out, size_t len);
+
+void
+viva_link_stat(char *out, size_t len)
+{
+	uint64_t ns;
+	size_t o = 0;
+	if (len == 0) {
+		return;
+	}
+	out[0] = 0;
+	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+#define ST(...) do { if (o < len) o += (size_t)snprintf(out + o, len - o, __VA_ARGS__); } while (0)
+	ST("uptime %llu ms, %s speed, address %u\n", ns / NSEC_PER_MSEC, vl.hs ? "high" : "full",
+	    vl.musb ? rd8(vl.musb, MUSB_FADDR) : 0);
+	ST("log: total %llu bytes, sent up to %llu (%llu bytes this link)\n", sweet_log_position(), vl.log_pos,
+	    vl.log_bytes);
+	ST("usb: %llu resets, %llu setups, %llu commands, %llu IN packets, %llu OUT packets\n", vl.resets, vl.setups,
+	    vl.cmds, vl.tx_pkts, vl.rx_pkts);
+	ST("vivad: %s (last opener pid %d), %llu output bytes dropped%s\n", vd_readers ? "waiting for commands" :
+	    "not reading", vd_pid, vd_out_dropped, vd_node ? "" : ", /dev/vivalink not created yet");
+#undef ST
+}
+
 static void
 vl_command(void)
 {
@@ -967,16 +992,9 @@ vl_command(void)
 	if (IS("ping")) {
 		vl_reply("pong\n");
 	} else if (IS("stat")) {
-		uint64_t ns;
-		absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
-		vl_reply("uptime %llu ms, %s speed, address %u\n", ns / NSEC_PER_MSEC,
-		    vl.hs ? "high" : "full", rd8(vl.musb, MUSB_FADDR));
-		vl_reply("log: total %llu bytes, sent up to %llu (%llu bytes this link)\n",
-		    sweet_log_position(), vl.log_pos, vl.log_bytes);
-		vl_reply("usb: %llu resets, %llu setups, %llu commands, %llu IN packets, %llu OUT packets\n",
-		    vl.resets, vl.setups, vl.cmds, vl.tx_pkts, vl.rx_pkts);
-		vl_reply("vivad: %s (last opener pid %d), %llu output bytes dropped%s\n", vd_readers ? "waiting for commands" :
-		    "not reading", vd_pid, vd_out_dropped, vd_node ? "" : ", /dev/vivalink not created yet");
+		static char stat_reply[1024];
+		viva_link_stat(stat_reply, sizeof(stat_reply));
+		vl_reply("%s", stat_reply);
 	} else if (IS("peek") && vl_arg(&rest, &a)) {
 		uint64_t words = 1;
 		(void)vl_arg(&rest, &words);

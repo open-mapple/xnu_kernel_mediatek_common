@@ -413,6 +413,7 @@ private:
 	bool     fDvfs, fDvfsArmed;
 	uint32_t fDvfsFast, fLoadPct;
 	uint64_t fBusyStart, fBusyNs, fWindowStart, fDvfsUpMs, fDvfsUps, fDvfsDowns;
+	uint64_t fBusyTotal;            /* KA1 busy_ns: absolute time with a job running, since boot */
 	bool     fDvfsBoost;                /* 0137 vivagpuboost: fastest OPP while the display waits for frames */
 	uint32_t fDvfsSeenWaits;
 	uint64_t fDvfsBoosts;

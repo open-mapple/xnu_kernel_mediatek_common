@@ -409,6 +409,138 @@ sweet_ufs_read_part(const char *name, uint64_t off, void *buf, uint32_t len, uin
 	return error;
 }
 
+/*
+ * KA2 (gpu/docs/RICHIESTE-KERNEL.md): the boot-args of the next boot = cmdline[608] at +0x48 of the SWEETXNU
+ * payload that tools/viva-mkboot.sh puts at the start of the ramdisk of boot_a / boot_b (header v2, ramdisk at
+ * page_size * (1 + ceil(kernel_size / page_size))). The one write outside the root partition this driver does:
+ * only to a GPT partition named exactly "boot_a" or "boot_b" on the root's LUN, only the one 4 KiB block that holds
+ * +0x48..+0x2a8 (read-modify-write, the rest of the block unchanged), after checking the Android header, the
+ * offset, the magic and the version; then the block is read back and compared. Boot-arg vivanobootargswrite=1
+ * refuses writes. Errors: EINVAL (string), ENOENT (partition, header, magic), EIO.
+ */
+#define PAYLOAD_CMDLINE         0x48
+#define PAYLOAD_CMDLINE_LEN     608
+
+int sweet_ufs_bootargs(const char *part, bool write, char *cmdline, size_t len);
+
+/* WRITE(10) of the bounce buffer's first block to lba, which must lie inside [first, first + nblocks). */
+static int
+ufs_write_block_in(uint64_t first, uint64_t nblocks, uint64_t lba)
+{
+	if (nblocks == 0 || lba < first || lba - first >= nblocks || lba > UINT32_MAX) {
+		printf("SWEET UFS: refusing boot-args write at 0x%llx (partition 0x%llx + 0x%llx)\n", lba, first, nblocks);
+		return EPERM;
+	}
+	uint8_t cdb[10] = {
+		0x2a, 0,
+		(uint8_t)(lba >> 24), (uint8_t)(lba >> 16), (uint8_t)(lba >> 8), (uint8_t)lba,
+		0, 0, 1, 0
+	};
+	return ufs_scsi(cdb, sizeof(cdb), UFS_BLOCK, true);
+}
+
+int
+sweet_ufs_bootargs(const char *part, bool write, char *cmdline, size_t len)
+{
+	uint8_t *b = (uint8_t *)(su.dma + DMA_BOUNCE);
+	static uint8_t blk[UFS_BLOCK];
+	uint64_t first = 0, nblocks = 0;
+	int error;
+
+	if (strcmp(part, "boot_a") != 0 && strcmp(part, "boot_b") != 0) {
+		return ENOENT;
+	}
+	if (!su.ready) {
+		return ENXIO;
+	}
+	if (write) {
+		uint32_t no = 0;
+		PE_parse_boot_argn("vivanobootargswrite", &no, sizeof(no));
+		size_t n = strnlen(cmdline, len);
+		if (no || n == len || n >= PAYLOAD_CMDLINE_LEN) {
+			return no ? EPERM : EINVAL;
+		}
+		for (size_t i = 0; i < n; i++) {
+			if (cmdline[i] < 0x20 || cmdline[i] > 0x7e) {
+				return EINVAL;
+			}
+		}
+	}
+	lck_mtx_lock(&sweet_ufs_lock);
+	error = ufs_lookup_partition(part, &first, &nblocks);
+	if (error) {
+		error = ENOENT;
+		goto out;
+	}
+	/* Android boot header v2 */
+	if ((error = ufs_read_blocks(first, 1)) != 0) {
+		error = EIO;
+		goto out;
+	}
+	uint32_t ksize, rsize, page, version;
+	memcpy(&ksize, b + 8, 4);
+	memcpy(&rsize, b + 16, 4);
+	memcpy(&page, b + 36, 4);
+	memcpy(&version, b + 40, 4);
+	if (memcmp(b, "ANDROID!", 8) != 0 || version != 2 || (page != 2048 && page != 4096) ||
+	    rsize < PAYLOAD_CMDLINE + PAYLOAD_CMDLINE_LEN) {
+		printf("SWEET UFS: %s: not a v2 boot image with a payload (version %u, page %u, ramdisk %u)\n", part, version,
+		    page, rsize);
+		error = ENOENT;
+		goto out;
+	}
+	uint64_t roff = (uint64_t)page * (1 + (ksize + page - 1) / page);
+	uint64_t at = roff + PAYLOAD_CMDLINE, lba = first + at / UFS_BLOCK;
+	uint32_t in = (uint32_t)(at % UFS_BLOCK);
+	if (in + PAYLOAD_CMDLINE_LEN > UFS_BLOCK || roff / UFS_BLOCK != at / UFS_BLOCK ||
+	    lba - first >= nblocks) {
+		printf("SWEET UFS: %s: payload at 0x%llx spans blocks\n", part, roff);
+		error = ENOENT;
+		goto out;
+	}
+	if ((error = ufs_read_blocks(lba, 1)) != 0) {
+		error = EIO;
+		goto out;
+	}
+	uint32_t pver;
+	uint32_t pin = (uint32_t)(roff % UFS_BLOCK);
+	memcpy(&pver, b + pin + 8, 4);
+	if (memcmp(b + pin, "SWEETXNU", 8) != 0 || pver != 1) {
+		printf("SWEET UFS: %s: no SWEETXNU v1 payload in the ramdisk\n", part);
+		error = ENOENT;
+		goto out;
+	}
+	if (!write) {
+		size_t n = MIN(len - 1, (size_t)PAYLOAD_CMDLINE_LEN);
+		memcpy(cmdline, b + in, n);
+		cmdline[n] = 0;
+		cmdline[strnlen(cmdline, n)] = 0;
+		goto out;
+	}
+	memcpy(blk, b, UFS_BLOCK);
+	bzero(blk + in, PAYLOAD_CMDLINE_LEN);
+	memcpy(blk + in, cmdline, strlen(cmdline));
+	memcpy(b, blk, UFS_BLOCK);
+	error = ufs_write_block_in(first, nblocks, lba);
+	if (!error) {
+		error = ufs_sync_cache();
+	}
+	if (!error) {
+		error = ufs_read_blocks(lba, 1);
+	}
+	if (!error && memcmp(b, blk, UFS_BLOCK) != 0) {
+		error = EIO;
+	}
+	printf("SWEET UFS: %s: next boot-args %s (block 0x%llx): \"%s\"\n", part, error ? "NOT written" : "written", lba,
+	    cmdline);
+	if (error && error != EPERM) {
+		error = EIO;
+	}
+out:
+	lck_mtx_unlock(&sweet_ufs_lock);
+	return error;
+}
+
 static int
 ufs_take_over_host(void)
 {

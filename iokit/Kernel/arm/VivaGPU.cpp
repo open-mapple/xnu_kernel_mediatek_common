@@ -2612,6 +2612,7 @@ VivaGPUAccelerator::completeJob(uint32_t slot, IOReturn error, uint32_t status, 
 	job->vm->running--;
 	if (fRunning[0] == NULL && fRunning[1] == NULL && fBusyStart != 0) {
 		fBusyNs += at > fBusyStart ? at - fBusyStart : 0;       /* absolute-time units */
+		fBusyTotal += at > fBusyStart ? at - fBusyStart : 0;
 		fBusyStart = 0;
 	}
 	if (error == kIOReturnSuccess && at > job->startAt) {
@@ -3256,6 +3257,7 @@ VivaGPUAccelerator::dvfsSample(void)
 	uint64_t now = mach_absolute_time(), busy = fBusyNs, window = now - fWindowStart;
 	if (fBusyStart != 0) {
 		busy += now - fBusyStart;
+		fBusyTotal += now - fBusyStart;
 		fBusyStart = now;
 	}
 	fBusyNs = 0;
@@ -4007,6 +4009,46 @@ VivaGPUAccelerator::linkCommand(const char *args, char *out, size_t outLen)
 			}
 		} else if (strncmp(args, "clocks", 6) == 0) {
 			clocksDump(o, end);
+		} else if (strncmp(args, "kv", 2) == 0) {
+			/* KA1 (gpu/docs/RICHIESTE-KERNEL.md): stable key=value lines for Viva Manager */
+			uint32_t cur = fPowered ? fClockOpp : fOpp, tvg, tvs;
+			oppSels(cur, &tvg, &tvs);
+			uint64_t busy = fBusyTotal, bns;
+			if (fBusyStart != 0) {
+				busy += mach_absolute_time() - fBusyStart;
+			}
+			absolutetime_to_nanoseconds(busy, &bns);
+			say(o, end, "powered=%d\nmode=%d\ngpu_id=0x%08x\nmhz=%u\nopp_min_mhz=%u\nopp_max_mhz=%u\ndvfs=%d\n",
+			    fPowered ? 1 : 0, fMode, fGpuId, gVivaOpp[cur].khz / 1000, gVivaOpp[fOpp].khz / 1000,
+			    gVivaOpp[MIN(fDvfsFast, fOpp)].khz / 1000, fDvfs ? 1 : 0);
+			say(o, end, "load_pct=%u\ndvfs_ups=%llu\ndvfs_downs=%llu\ndvfs_boosts=%llu\njobs=%llu\nrunning=%d\n"
+			    "queued=%d\n", fLoadPct, fDvfsUps, fDvfsDowns, fDvfsBoosts, fJobs,
+			    (fRunning[0] != NULL) + (fRunning[1] != NULL), (fQueue[0] != NULL) + (fQueue[1] != NULL));
+			say(o, end, "job_faults=%llu\nmmu_faults=%llu\ngpu_faults=%llu\ntimeouts=%llu\nresets=%llu\nheap_grows=%llu\n",
+			    fJobFaults, fMmuFaults, fGpuFaults, fTimeouts, fResets, fHeapGrows);
+			say(o, end, "mem_kib=%lld\nmem_peak_kib=%lld\nmem_limit_mib=%lld\nmem_proc_mib=%lld\nmem_refusals=%llu\n"
+			    "busy_ns=%llu\nvgpu_mv=%u\nvsram_mv=%u\n", fMemory >> 10, fMemPeak >> 10, fMemLimit >> 20,
+			    fProcLimit >> 20, fMemRefused, bns, UV(tvg) / 1000, UV(tvs) / 1000);
+			for (VivaGPUVM *v = fVMs; v != NULL; v = v->nextVM) {
+				bool seen = false;
+				for (VivaGPUVM *w = fVMs; w != v; w = w->nextVM) {
+					seen = seen || w->pid == v->pid;
+				}
+				if (seen) {
+					continue;
+				}
+				int64_t bytes = 0, imported = 0;
+				uint32_t bos = 0;
+				for (VivaGPUVM *w = v; w != NULL; w = w->nextVM) {
+					if (w->pid == v->pid) {
+						bytes += w->bytes;
+						imported += w->imported;
+						bos += w->bos;
+					}
+				}
+				say(o, end, "proc.%d.name=%s\nproc.%d.kib=%lld\nproc.%d.bos=%u\nproc.%d.imported_kib=%lld\n", v->pid,
+				    v->proc, v->pid, bytes >> 10, v->pid, bos, v->pid, imported >> 10);
+			}
 		} else if (strncmp(args, "fastkick", 8) == 0) {
 			if (strncmp(args, "fastkick on", 11) == 0) {
 				fFastKick = true;
@@ -4133,7 +4175,11 @@ extern "C" void
 viva_gpu_link(const char *args, char *out, size_t outLen)
 {
 	if (gVivaGPU == NULL) {
-		snprintf(out, outLen, "gpu: driver not running (boot-arg vivagpu=1 or 2)\n");
+		while (*args == ' ') {
+			args++;
+		}
+		snprintf(out, outLen, strncmp(args, "kv", 2) == 0 ? "powered=0\nmode=0\n" :
+		    "gpu: driver not running (boot-arg vivagpu=1 or 2)\n");
 		return;
 	}
 	gVivaGPU->linkCommand(args, out, outLen);

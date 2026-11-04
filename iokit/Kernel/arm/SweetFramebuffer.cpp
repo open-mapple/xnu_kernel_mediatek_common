@@ -1693,6 +1693,20 @@ AppleCLCD::dispCommand(const char *args, char *out, size_t len)
 		}
 		fDirty = true;
 		disp_say(&p, end, "double buffer off: copies go to LK's buffer on screen\n");
+	} else if (strncmp(args, "kv", 2) == 0) {
+		/* KA1 (gpu/docs/RICHIESTE-KERNEL.md): stable key=value lines for Viva Manager */
+		IOLockLock(fLock);
+		uint64_t r = absUsFB(fLatReady.n ? fLatReady.sum / fLatReady.n : 0);
+		uint64_t f = absUsFB(fLatFlip.n ? fLatFlip.sum / fLatFlip.n : 0);
+		uint64_t swaps = fLatSwap.n;
+		IOLockUnlock(fLock);
+		disp_say(&p, end, "width=%u\nheight=%u\nlogical_width=%u\nlogical_height=%u\nscanout=%d\nscanout_live=%d\n",
+		    fWidth, fHeight, fLogicalW, fLogicalH, fScanOn ? 1 : 0, fShown.buf < 0 ? 1 : 0);
+		disp_say(&p, end, "frames_scanned=%llu\nframes_copied=%llu\nswaps=%llu\ngpu_waits=%llu\nframes_forced=%llu\n"
+		    "copies=%llu\ncopy_avg_us=%llu\n", fScanFrames, fScanFallbacks, swaps, fGpuWaits, fGpuForced, fCopies,
+		    fCopies ? fCopyNs / fCopies / 1000 : 0);
+		disp_say(&p, end, "lat_swap_gpu_avg_us=%llu\nlat_chosen_screen_avg_us=%llu\nearly_shown=%llu\nflip=%d\n"
+		    "swapwait_busy=%llu\n", r, f, fEarlyShown, fFlipReady ? 1 : 0, fSwapWaitBusy);
 	} else {
 		disp_say(&p, end, "display %ux%u (shown as %ux%u), scanout %s%s, layer %s, %llu frames scanned out, "
 		    "%llu copied%s%s\n", fWidth, fHeight, fLogicalW, fLogicalH, fScanOn ? "on" : "off",
