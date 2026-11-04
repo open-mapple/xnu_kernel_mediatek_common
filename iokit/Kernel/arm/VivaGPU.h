@@ -84,6 +84,10 @@ public:
 	OSArray   *followers;   /* promises linked to this fence: signalled with it */
 	/* K0j: what it waits for while unsignalled (its job's dependencies; a resolved promise: the fence it follows) */
 	OSArray   *deps;
+	/* K0j cache: "depends on a pending promise of k0jVM", valid while k0jEpoch == the accelerator's fK0jEpoch */
+	uint64_t   k0jEpoch;
+	VivaGPUVM *k0jVM;
+	bool       k0jDep;
 };
 
 /* A GPU address space: AArch64 4K page tables plus the VA allocator for [VGPU_VA_START, VGPU_VA_END). */
@@ -447,7 +451,9 @@ private:
 	OSArray *fPromises;                 /* K0i: pending promises (their timeout, in jobTimer) */
 	uint64_t fPromisesMade, fPromisesTimedOut;
 	uint64_t fPromiseBypass, fQueueBypass, fJobsDiscarded;      /* K0j */
-	uint32_t fArmWait;                  /* nextStartable(forArm): the slots the armed job waits for */
+	uint32_t fArmWait;
+	uint64_t fK0jEpoch;                 /* bumped when a promise is made, resolved or signalled, or a job dropped */
+	uint64_t fK0jVisits, fK0jCached;    /* graph nodes walked / answered from the cache */                  /* nextStartable(forArm): the slots the armed job waits for */
 	void promiseTimeouts(void);
 	uint32_t fGenericWaiters;
 	uint64_t fWakeFence, fWakeGeneric, fSleeps, fSleepsSpurious;
