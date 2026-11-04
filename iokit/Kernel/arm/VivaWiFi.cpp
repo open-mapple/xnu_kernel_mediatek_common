@@ -76,6 +76,19 @@ viva_wifi_reserve(void)
 	IOLog("VIVA WIFI: reserved EMI %s 0x%llx, DMA %s 0x%llx\n", e ? "at" : "FAILED", emi, d ? "at" : "FAILED", dma);
 }
 
+/* The DMA memory mapped write-combined (normal uncached), for the ring descriptors (viva_wifi.c desc()). */
+static IOMemoryMap *gVivaWiFiDMAUncached;
+
+extern "C" void *
+viva_wifi_dma_uncached(void)
+{
+	if (gVivaWiFiDMAUncached == NULL && gVivaWiFiDMA != NULL) {
+		gVivaWiFiDMAUncached = gVivaWiFiDMA->createMappingInTask(kernel_task, 0,
+		    kIOMapAnywhere | kIOMapWriteCombineCache, 0, 0);
+	}
+	return gVivaWiFiDMAUncached ? (void *)gVivaWiFiDMAUncached->getVirtualAddress() : NULL;
+}
+
 /* Clean + invalidate a range of the DMA memory (before the device reads it, and before the CPU reads its writes). */
 extern "C" void
 viva_wifi_dma_flush(uint32_t offset, uint32_t len)
