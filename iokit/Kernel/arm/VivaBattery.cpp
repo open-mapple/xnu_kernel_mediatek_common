@@ -181,6 +181,7 @@ static uint32_t gVivaLPMGpuMHz = 550, gVivaLPMDuty = 10;
 
 extern "C" int viva_usb_host_configured(void);           /* bsd/dev/viva_usb.c */
 extern "C" void viva_gpu_set_dvfs_cap(uint32_t mhz);      /* VivaGPU.cpp: 0 = no cap */
+extern "C" void viva_cpufreq_set_lowpower(int on);        /* osfmk/arm64/viva_cpufreq.c: CPU ceilings */
 extern "C" void sweet_fb_set_duty_cap(uint32_t pct);      /* SweetFramebuffer.cpp: 0 = no cap */
 
 static uint32_t
@@ -203,6 +204,7 @@ viva_power_apply(void)
 {
 	bool on = gVivaLowPower != 0;
 	viva_gpu_set_dvfs_cap(on ? gVivaLPMGpuMHz : 0);
+	viva_cpufreq_set_lowpower(on);
 	sweet_fb_set_duty_cap(on ? gVivaLPMDuty : 0);
 	IOLog("VIVA POWER: low power mode %s (GPU ceiling %u MHz, panel copy duty %u %%)\n", on ? "ON" : "off",
 	    on ? gVivaLPMGpuMHz : 0, on ? gVivaLPMDuty : 0);

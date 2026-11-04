@@ -54,6 +54,7 @@
 OSDefineMetaClassAndStructors(VivaPwrap, IOService);
 
 extern "C" void viva_wifi_reserve(void);        /* VivaWiFi.cpp: CONNSYS memory, before the scanout fragments it */
+extern "C" void viva_cpufreq_start(void);       /* osfmk/arm64/viva_cpufreq.c: CPU DVFS needs the PMIC */
 
 static VivaPwrap *gVivaPwrap;
 
@@ -98,6 +99,7 @@ VivaPwrap::start(IOService *provider)
 
 	viva_wifi_reserve();
 	gVivaPwrap = this;
+	viva_cpufreq_start();
 	registerService();
 	VivaDTNub::publishChildren(this, provider);
 	return true;
@@ -189,6 +191,9 @@ static const struct {
 	{ 0x1526, 0x007f, 0x40 },       /* BUCK_VGPU_ELR0: RG_BUCK_VGPU_VOSEL, <= 0.9 V */
 	{ 0x1bc8, 0x0001, 0x01 },       /* LDO_VSRAM_GPU_CON0: RG_LDO_VSRAM_GPU_EN */
 	{ 0x1bf4, 0x007f, 0x50 },       /* LDO_VSRAM_CON3: RG_LDO_VSRAM_GPU_VOSEL, <= 1.0 V */
+	/* CPU DVFS (osfmk/arm64/viva_cpufreq.c): Vproc only, Vsram tracks it in hardware; the OPP tables' maxima */
+	{ 0x13a6, 0x007f, 0x63 },       /* BUCK_VPROC11_ELR0: RG_BUCK_VPROC11_VOSEL (A76), <= 1.11875 V */
+	{ 0x1426, 0x007f, 0x55 },       /* BUCK_VPROC12_ELR0: RG_BUCK_VPROC12_VOSEL (A55 + CCI), <= 1.03125 V */
 	/* CONNSYS (bsd/dev/viva_wifi.c, mt6781.c consys_hw_vcn18_ctrl): VCN18 enable/mode bits only, no voltage */
 	{ 0x1c58, 0x0003, 0x03 },       /* LDO_VCN18_CON0: RG_LDO_VCN18_EN, RG_LDO_VCN18_LP */
 	{ 0x1c5a, 0x0003, 0x03 },       /* LDO_VCN18_OP_EN: SW_OP_EN, HW0_OP_EN */
@@ -237,8 +242,10 @@ VivaPwrap::writeRegulator(uint32_t addr, uint32_t mask, uint32_t value)
 	if (ret == kIOReturnSuccess && (readPMIC(addr, &now) != kIOReturnSuccess || (now & mask) != value)) {
 		ret = kIOReturnIOError;
 	}
-	IOLog("VIVA PWRAP: regulator 0x%04x 0x%04x -> 0x%04x (reads 0x%04x) %s\n", addr, old, v, now,
-	    ret == kIOReturnSuccess ? "ok" : "FAILED");
+	if (ret != kIOReturnSuccess || (addr != 0x13a6 && addr != 0x1426)) {   /* CPU DVFS steps are not logged */
+		IOLog("VIVA PWRAP: regulator 0x%04x 0x%04x -> 0x%04x (reads 0x%04x) %s\n", addr, old, v, now,
+		    ret == kIOReturnSuccess ? "ok" : "FAILED");
+	}
 	return ret;
 }
 

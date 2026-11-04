@@ -229,6 +229,7 @@ extern int viva_i2c_xfer_bus(uint32_t bus, uint8_t addr, const uint8_t *wbuf, ui
 extern void viva_battery_link(const char *args, char *out, size_t outLen);   /* iokit/Kernel/arm/VivaBattery.cpp */
 extern void viva_wifi_link(const char *args, char *out, size_t outLen);      /* bsd/dev/viva_wifi.c */
 extern void viva_gpu_link(const char *args, char *out, size_t outLen);       /* iokit/Kernel/arm/VivaGPU.cpp */
+extern void viva_cpufreq_link(const char *args, char *out, size_t outLen);   /* osfmk/arm64/viva_cpufreq.c */
 extern void viva_disp_link(const char *args, char *out, size_t outLen);      /* iokit/Kernel/arm/SweetFramebuffer.cpp */
 extern int sweet_console_muted;                                             /* osfmk/console/serial_console.c */
 
@@ -935,6 +936,7 @@ vl_vivad_out(uint8_t *out, uint32_t max)
  *   bat [poll|lpm on|off]  battery (VivaBattery.cpp): gauge, charger registers, Low Power Mode
  *   wifi [status|detect|on|wmt|fw|cap|off]  CONNSYS (viva_wifi.c): state (read only), A-die detection, power on with RAM patches / off
  *   gpu [ARGS]        Mali driver (VivaGPU.cpp): status, mfg, on, off, regs, freq, selftest [fault], probe, publish
+ *   cpu [ARGS]        CPU DVFS (viva_cpufreq.c): status, gov on|off, set|max ll|big|cci MHz, fast on|off, reset
  *   push SIZE MODE FNV PATH  receive a file (raw OUT data follows; written to PATH.vivapush, renamed when
  *                     its FNV-1a matches; missing directories are created)
  *   pull PATH         send a file ('F' frames)
@@ -1069,6 +1071,10 @@ vl_command(void)
 		static char bat_reply[4000];
 		viva_battery_link(rest, bat_reply, sizeof(bat_reply));
 		vl_reply("%s", bat_reply);
+	} else if (IS("cpu")) {
+		static char cpu_reply[4000];
+		viva_cpufreq_link(rest, cpu_reply, sizeof(cpu_reply));
+		vl_reply("%s", cpu_reply);
 	} else if (IS("gpu")) {
 		static char gpu_reply[4000];  /* vl.reply holds 4096 */
 		viva_gpu_link(rest, gpu_reply, sizeof(gpu_reply));
@@ -1121,7 +1127,7 @@ vl_command(void)
 			delay(5000);
 		}
 	} else if (IS("help")) {
-		vl_reply("ping | stat | peek PA [WORDS] | poke PA VALUE | pmic ADDR [N] | i2c DEV REG N | i2cw DEV REG B.. | i2c8[w] BUS DEV REG N|B.. | bat [poll|lpm on|off] | wifi [status|detect|on|wmt|fw|cap|off] | gpu [status|mfg|on|off|regs|freq [MHz]|selftest [fault]|probe|publish] | disp [regs|scanout on|off] | push SIZE MODE FNV PATH | pull PATH | run ARGS.. | vivad ps|kill ID|tests | rewind [BYTES] | console [on|off] | panic [TEXT] | reboot\n");
+		vl_reply("ping | stat | peek PA [WORDS] | poke PA VALUE | pmic ADDR [N] | i2c DEV REG N | i2cw DEV REG B.. | i2c8[w] BUS DEV REG N|B.. | bat [poll|lpm on|off] | wifi [status|detect|on|wmt|fw|cap|off] | cpu [status|gov on|off|set|max ll|big|cci MHz|fast on|off] | gpu [status|mfg|on|off|regs|freq [MHz]|selftest [fault]|probe|publish] | disp [regs|scanout on|off] | push SIZE MODE FNV PATH | pull PATH | run ARGS.. | vivad ps|kill ID|tests | rewind [BYTES] | console [on|off] | panic [TEXT] | reboot\n");
 	} else {
 		vl_reply("unknown command: %s (try help)\n", c);
 	}
