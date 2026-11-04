@@ -303,7 +303,7 @@ ufs_sync_cache(void)
 }
 
 static int
-ufs_find_partition(const char *want)
+ufs_lookup_partition(const char *want, uint64_t *firstp, uint64_t *nblocksp)
 {
 	const uint8_t *b = (const uint8_t *)(su.dma + DMA_BOUNCE);
 	int error = ufs_read_blocks(1, 1);
@@ -348,12 +348,65 @@ ufs_find_partition(const char *want)
 		if (last < first) {
 			return ENXIO;
 		}
-		su.first_block = first;
-		su.nblocks = last - first + 1;
+		*firstp = first;
+		*nblocksp = last - first + 1;
 		return 0;
 	}
 	printf("SWEET UFS: no GPT partition named \"%s\"\n", want);
 	return ENOENT;
+}
+
+static int
+ufs_find_partition(const char *want)
+{
+	return ufs_lookup_partition(want, &su.first_block, &su.nblocks);
+}
+
+/*
+ * Read-only access to another GPT partition of the root's LUN (USB link "pull part:NAME", e.g. nvdata for the WiFi
+ * calibration/MAC file). Reads only: there is no write path here, and ufs_write_blocks() still checks the root
+ * partition's bounds. *sizep gets the partition size; len 0 only looks it up.
+ */
+int sweet_ufs_read_part(const char *name, uint64_t off, void *buf, uint32_t len, uint64_t *sizep);
+
+int
+sweet_ufs_read_part(const char *name, uint64_t off, void *buf, uint32_t len, uint64_t *sizep)
+{
+	static char cached[37];
+	static uint64_t cfirst, cblocks;
+	int error = 0;
+
+	if (!su.ready) {
+		return ENXIO;
+	}
+	lck_mtx_lock(&sweet_ufs_lock);
+	if (strcmp(cached, name) != 0) {
+		cached[0] = 0;
+		error = ufs_lookup_partition(name, &cfirst, &cblocks);
+		if (!error) {
+			strlcpy(cached, name, sizeof(cached));
+		}
+	}
+	uint64_t bytes = cblocks * UFS_BLOCK;
+	if (!error && sizep) {
+		*sizep = bytes;
+	}
+	if (!error && (off > bytes || len > bytes - off)) {
+		error = EINVAL;
+	}
+	for (uint32_t done = 0; !error && done < len;) {
+		uint64_t pos = off + done;
+		uint32_t skip = (uint32_t)(pos % UFS_BLOCK);
+		uint32_t want = MIN(len - done, BOUNCE_SIZE - skip);
+		uint32_t blocks = (skip + want + UFS_BLOCK - 1) / UFS_BLOCK;
+		error = ufs_read_blocks(cfirst + pos / UFS_BLOCK, blocks);
+		if (!error) {
+			memcpy((char *)buf + done, (const char *)(su.dma + DMA_BOUNCE) + skip, want);
+			done += want;
+		}
+	}
+	lck_mtx_unlock(&sweet_ufs_lock);
+	return error;
 }
 
 static int

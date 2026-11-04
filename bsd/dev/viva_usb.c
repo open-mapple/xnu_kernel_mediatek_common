@@ -713,12 +713,32 @@ vl_push_data(void)
 	}
 }
 
-/* "pull PATH": the file as 'F' frames, then a reply line with its size and checksum. */
+extern int sweet_ufs_read_part(const char *name, uint64_t off, void *buf, uint32_t len, uint64_t *sizep);
+
+/*
+ * "pull PATH": the file as 'F' frames, then a reply line with its size and checksum. "pull part:NAME" reads a GPT
+ * partition of the UFS root LUN instead (read only, at most 256 MiB; e.g. part:nvdata).
+ */
 static void
 vl_pull_start(char *rest)
 {
 	while (*rest == ' ') {
 		rest++;
+	}
+	if (strncmp(rest, "part:", 5) == 0) {
+		uint64_t size = 0;
+		int err = sweet_ufs_read_part(rest + 5, 0, NULL, 0, &size);
+		if (err || size == 0 || size > (256ull << 20)) {
+			vl_reply("pull %s: error %d (size %llu)\n", rest, err, size);
+			return;
+		}
+		vpull.vp = NULLVP;
+		vpull.off = 0;
+		vpull.size = size;
+		vpull.fnv = 2166136261u;
+		vpull.active = true;
+		strlcpy(vpush.path, rest, sizeof(vpush.path));
+		return;
 	}
 	if (rest[0] != '/' || rootvnode == NULLVP) {
 		vl_reply("pull: absolute path needed (and a mounted root)\n");
@@ -754,13 +774,17 @@ vl_pull_chunk(uint8_t *out, uint32_t max)
 	vfs_context_t ctx = vfs_context_kernel();
 	uint32_t n = (uint32_t)MIN((uint64_t)max, vpull.size - vpull.off);
 	int resid = 0, err = 0;
-	if (n > 0) {
+	if (n > 0 && vpull.vp == NULLVP) {
+		err = sweet_ufs_read_part(vpush.path + 5, vpull.off, out, n, NULL);
+	} else if (n > 0) {
 		err = vn_rdwr(UIO_READ, vpull.vp, (caddr_t)out, (int)n, (off_t)vpull.off, UIO_SYSSPACE, IO_NOAUTH,
 		    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
 		n -= (uint32_t)resid;
 	}
 	if (err || n == 0) {
-		vnode_close(vpull.vp, FREAD, ctx);
+		if (vpull.vp != NULLVP) {
+			vnode_close(vpull.vp, FREAD, ctx);
+		}
 		vpull.active = false;
 		vl_reply("pull %s: %llu bytes, fnv1a 0x%08x%s\n", vpush.path, vpull.off, vpull.fnv, err ? " (read error)" : "");
 		return 0;

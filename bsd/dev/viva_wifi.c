@@ -37,6 +37,10 @@
  *   wifi cap       step 4 (firmware ready): CMD_ID_GET_NIC_CAPABILITY_V2 (0x8A) on TX ring 15 (WIFI_CMD: 32-byte TXD +
  *                  32-byte command header, wlan_lib.c wlanQueryNicCapabilityV2), event 0xEC on RX ring 1 (20-byte RXD +
  *                  12-byte event header + {u16 count, rsv, TLVs (u32 tag, u32 len, body)}): HW/SW version, MAC, PHY caps.
+ *   wifi init      step 5: basic config, NVRAM (WIFI_FW_DIR/WIFI from nvdata, else the vendor default + a random
+ *                  locally administered MAC), domain info, DBDC off, RX filter, BSS 0 activated
+ *                  (MT6781-WIFI-CMDS.md §2-§3).
+ *   wifi scan [2g] [SSID]  SCAN_REQ_V2, beacons/probe responses into a table until SCAN_DONE, listed by RSSI.
  *   wifi off       CONN CPU back in reset, MTCMOS off, rails and pinmux as before "wifi on".
  *
  * PMIC writes go through VivaPwrap::writeRegulator (VCN18/VCN33/VCN28 enable/mode bits, VCN33 = 3.3 V only).
@@ -51,6 +55,7 @@
 #include <sys/vnode_internal.h>
 #include <sys/fcntl.h>
 #include <sys/uio.h>
+#include <sys/random.h>
 
 extern int viva_pwrap_read(uint32_t addr, uint32_t *value);                                  /* VivaPwrap.cpp */
 extern int viva_pwrap_write_regulator(uint32_t addr, uint32_t mask, uint32_t value);
@@ -1183,16 +1188,125 @@ close:
 
 /* ---- step 4: normal commands (firmware running) ---- */
 
-/* WIFI_CMD (nic_cmd_event.h, asicFillCmdTxdInfo) on TX ring 15; the matching event (same seq) into ev. */
+/* Station state after "wifi init" (bsd/dev/viva_wifi.c is still driven from the USB link). */
+#define WL_MAX_BSS              48
+#define WL_IE_MAX               512
+
+struct wl_bss {
+	uint8_t  bssid[6], ssid[32], ssid_len, ch;
+	int8_t   rssi;
+	uint16_t capinfo, bintval;
+	uint16_t ie_len;
+	uint8_t  ie[WL_IE_MAX];
+	uint32_t seen;                  /* scan generation */
+};
+
+static struct {
+	bool     cap, init;
+	uint8_t  mac[6];
+	uint8_t  scanSeq, scanGen;
+	uint32_t nbss, frames, dataFrames;
+	struct wl_bss bss[WL_MAX_BSS];
+} wl;
+
+/*
+ * Received packets (MT6781-WIFI-CMDS.md §5): dispatched on the RXD packet type, never on the ring. 0xE000 = event
+ * (12-byte header at +20), 0xE001 = frame forwarded by the MCU (beacons, probe/auth/assoc responses, EAPOL),
+ * type 2 = data from the MAC. The frame starts after the RXD (20), the optional groups (G4 16, G1 16, G2 8, G3 24,
+ * in that order) and 2 bytes of padding if RXD byte 6 bit 6 is set.
+ */
+#define PKT_EVENT               1
+#define PKT_FRAME               2
+#define PKT_DATA                3
+
+static int
+rx_classify(const uint8_t *b, uint32_t n, uint32_t *foff)
+{
+	if (n < 20) {
+		return 0;
+	}
+	uint16_t ptype = (uint16_t)(b[2] | b[3] << 8);
+	if ((ptype & 0xe00f) == 0xe000) {
+		return n >= 32 ? PKT_EVENT : 0;
+	}
+	uint32_t type = ptype >> 13;
+	if ((ptype & 0xe00f) != 0xe001 && type != 2) {
+		return 0;                               /* TX status, RX vector, MSDU report: not used */
+	}
+	uint32_t off = 20 + ((ptype & (1u << 12)) ? 16 : 0) + ((ptype & (1u << 9)) ? 16 : 0) +
+	    ((ptype & (1u << 10)) ? 8 : 0) + ((ptype & (1u << 11)) ? 24 : 0) + ((b[6] & 0x40) ? 2 : 0);
+	uint32_t total = (uint32_t)(b[0] | b[1] << 8);
+	if (total > n) {
+		total = n;
+	}
+	if (off >= total) {
+		return 0;
+	}
+	*foff = off;
+	return type == 2 ? PKT_DATA : PKT_FRAME;
+}
+
+/* RSSI (dBm) of a received frame from G3 RXV cycle 4 (RCPI0/1, the larger, ignoring > 220), 0 if no G3. */
+static int
+rx_rssi(const uint8_t *b)
+{
+	uint16_t ptype = (uint16_t)(b[2] | b[3] << 8);
+	if (!(ptype & (1u << 11))) {
+		return 0;
+	}
+	uint32_t g3 = 20 + ((ptype & (1u << 12)) ? 16 : 0) + ((ptype & (1u << 9)) ? 16 : 0) + ((ptype & (1u << 10)) ? 8 : 0);
+	int r0 = b[g3 + 12], r1 = b[g3 + 13], r = 0;
+	if (r0 <= 220) {
+		r = r0;
+	}
+	if (r1 <= 220 && r1 > r) {
+		r = r1;
+	}
+	return r / 2 - 110;
+}
+
+static void wifi_frame(const uint8_t *b, uint32_t n, uint32_t foff, int kind);     /* scan table, join, EAPOL */
+
+/* Next packet from RX ring 1, then RX ring 0, within us microseconds; frames and data go to wifi_frame(). */
+static uint32_t
+rx_next(uint8_t *buf, uint32_t max, uint32_t us, int *kind)
+{
+	uint32_t got = wfdma_rx(1, buf, max, us / 2);
+	if (got == 0) {
+		got = wfdma_rx(0, buf, max, us / 2);
+	}
+	*kind = 0;
+	if (got) {
+		uint32_t foff = 0;
+		*kind = rx_classify(buf, MIN(got, max), &foff);
+		if (*kind == PKT_FRAME || *kind == PKT_DATA) {
+			wifi_frame(buf, MIN(got, max), foff, *kind);
+		}
+	}
+	return got;
+}
+
+static uint8_t wcmd_pkt[64 + 2048];
+
+/*
+ * WIFI_CMD (nic_cmd_event.h, asicFillCmdTxdInfo) on TX ring 15. eid != 0: wait for that event into ev (returns its
+ * length). eid 0 (set commands: the stock driver expects no answer): only drain what comes back for 30 ms, logging
+ * events (an unknown CID may get INIT_EVENT_ID_CMD_RESULT 0xFD); returns 0 if the DMA took it.
+ */
 static int
 wifi_cmd(uint8_t cid, bool set, const void *payload, uint32_t plen, uint8_t eid, uint8_t *ev, uint32_t evmax,
     uint32_t ms, char *out, size_t len, size_t *po)
 {
 	size_t o = *po;
-	uint8_t pkt[64 + 512];
+	uint8_t *pkt = wcmd_pkt;
 	uint32_t total = 64 + plen;
-	if (plen > 512) {
+	static uint8_t scratch[RX_BUF_LEN];
+	if (plen > 2048) {
 		return -1;
+	}
+	if (ev == NULL) {
+		ev = scratch;
+		evmax = sizeof(scratch);
 	}
 	bzero(pkt, 64);
 	pkt[0] = (uint8_t)total;
@@ -1208,7 +1322,9 @@ wifi_cmd(uint8_t cid, bool set, const void *payload, uint32_t plen, uint8_t eid,
 	pkt[38] = set ? 1 : 0;
 	pkt[39] = ++wd.seq;
 	pkt[42] = 3;                                    /* S2D_INDEX_CMD_H2N_H2C */
-	memcpy(pkt + 64, payload, plen);
+	if (plen) {
+		memcpy(pkt + 64, payload, plen);
+	}
 	uint8_t seq = wd.seq;
 	int ret = -1;
 	if (!wfdma_tx(15, pkt, total)) {
@@ -1216,24 +1332,32 @@ wifi_cmd(uint8_t cid, bool set, const void *payload, uint32_t plen, uint8_t eid,
 		    rd(WF_TX_RING(15) + 12));
 		goto done;
 	}
-	for (int k = 0; k < 16; k++) {
-		uint32_t got = 0;
-		for (uint32_t t = 0; t < ms && got == 0; t += 10) {
-			if ((got = wfdma_rx(1, ev, evmax, 5000)) == 0) {
-				got = wfdma_rx(0, ev, evmax, 5000);
-			}
-		}
+	if (eid == 0) {
+		ret = 0;
+		ms = 30;
+	}
+	for (uint32_t t = 0; t < ms;) {
+		int kind;
+		uint32_t got = rx_next(ev, evmax, 10000, &kind);
 		if (got == 0) {
-			say("cmd 0x%02x seq %u: no event in %u ms (rx1 didx %u)\n", cid, seq, ms, rd(WF_RX_RING(1) + 12));
-			goto done;
+			t += 10;
+			continue;
 		}
-		uint16_t ptype = (uint16_t)(ev[2] | ev[3] << 8);
+		if (kind != PKT_EVENT) {
+			continue;
+		}
 		uint8_t *e = ev + 20;
-		if ((ptype & 0xe00f) == 0xe000 && e[4] == eid) {
+		if (eid != 0 && e[4] == eid) {
 			ret = (int)got;
 			goto done;
 		}
-		say("cmd 0x%02x: other packet (%u bytes, type 0x%04x, eid 0x%02x seq %u)\n", cid, got, ptype, e[4], e[5]);
+		if (e[4] != 0x07) {                     /* EVENT_ID_SLEEPY_INFO: ignored, we stay in driver own */
+			say("cmd 0x%02x: event 0x%02x seq %u (%u bytes): %02x %02x %02x %02x\n", cid, e[4], e[5], got,
+			    e[12], e[13], e[14], e[15]);
+		}
+	}
+	if (eid != 0) {
+		say("cmd 0x%02x seq %u: no event 0x%02x in %u ms (rx1 didx %u)\n", cid, seq, eid, ms, rd(WF_RX_RING(1) + 12));
 	}
 done:
 	*po = o;
@@ -1249,6 +1373,9 @@ wifi_cap(char *out, size_t len, size_t o)
 	}
 	static uint8_t ev[2048];
 	int n = wifi_cmd(0x8a, false, NULL, 0, 0xec, ev, sizeof(ev), 3000, out, len, &o);
+	if (n > 0) {
+		wl.cap = true;
+	}
 	if (n < 36) {
 		say("cap: no NIC_CAPABILITY_V2 event\n");
 		return o;
@@ -1294,6 +1421,363 @@ wifi_cap(char *out, size_t len, size_t o)
 	return o;
 }
 
+/* ---- step 5: station bring-up and scan (MT6781-WIFI-CMDS.md §2-§4) ---- */
+
+#define CID_DUMMY               0x00
+#define CID_BASIC_CONFIG        0x02
+#define CID_SCAN_REQ_V2         0x03
+#define CID_SET_RX_FILTER       0x0a
+#define CID_SET_DOMAIN_INFO     0x0f
+#define CID_BSS_ACTIVATE_CTRL   0x11
+#define CID_SET_DBDC_PARMS      0x28
+#define CID_SET_NVRAM_SETTINGS  0x48
+#define EID_SCAN_DONE           0x0d
+#define NVRAM_SIZE              2048
+#define NVRAM_FILE              "WIFI"                          /* nvdata APCFG/APRDEB/WIFI, copied by hand */
+#define NVRAM_DEFAULT           "stWifiCfgDefault_6631.bin"     /* vendor default (MAC zero) */
+
+static int
+read_file(const char *name, uint8_t *buf, uint32_t max)
+{
+	char path[160];
+	snprintf(path, sizeof(path), "%s%s", WIFI_FW_DIR, name);
+	vfs_context_t ctx = vfs_context_kernel();
+	vnode_t vp = NULLVP;
+	int resid = 0, err = vnode_open(path, FREAD, 0, 0, &vp, ctx);
+	if (err != 0) {
+		return -err;
+	}
+	err = vn_rdwr(UIO_READ, vp, (caddr_t)buf, (int)max, 0, UIO_SYSSPACE, IO_NOAUTH, vfs_context_ucred(ctx), &resid,
+	    vfs_context_proc(ctx));
+	vnode_close(vp, FREAD, ctx);
+	return err ? -err : (int)(max - (uint32_t)resid);
+}
+
+static bool
+mac_valid(const uint8_t *m)
+{
+	static const uint8_t zero[6], ff[6] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
+	return memcmp(m, zero, 6) != 0 && memcmp(m, ff, 6) != 0 && !(m[0] & 1);
+}
+
+/* CMD_SET_DOMAIN_INFO V1 (56 B), country from the NVRAM, the default group's tables (rlm_domain.c:744-806). */
+static void
+domain_info(uint8_t *d, uint16_t cc, bool passive)
+{
+	static const uint8_t act[6][5] = { { 81, 1, 1, 1, 13 }, { 115, 2, 4, 36, 4 }, { 118, 2, 4, 52, 4 },
+		                           { 121, 2, 4, 100, 12 }, { 125, 2, 4, 149, 5 }, { 0 } };
+	static const uint8_t pas[6][5] = { { 81, 1, 1, 1, 0 }, { 82, 1, 1, 14, 0 }, { 115, 2, 4, 36, 0 },
+		                           { 118, 2, 4, 52, 4 }, { 121, 2, 4, 100, 12 }, { 125, 2, 4, 149, 0 } };
+	bzero(d, 56);
+	d[0] = (uint8_t)cc;
+	d[1] = (uint8_t)(cc >> 8);
+	d[2] = passive ? 1 : 0;
+	for (int i = 0; i < 6; i++) {
+		memcpy(d + 4 + 8 * i, passive ? pas[i] : act[i], 5);
+	}
+}
+
+static size_t
+wifi_init(char *out, size_t len, size_t o)
+{
+	if (!vw.on || (rd(WF_READY) & 0x6) != 0x6) {
+		say("init: WiFi firmware not running (wifi on, wifi wmt, wifi fw)\n");
+		return o;
+	}
+	static uint8_t nv[NVRAM_SIZE];
+	uint8_t p[64];
+	const char *src = NVRAM_FILE;
+	int n = read_file(NVRAM_FILE, nv, sizeof(nv));
+	if (n != NVRAM_SIZE) {
+		src = NVRAM_DEFAULT;
+		n = read_file(NVRAM_DEFAULT, nv, sizeof(nv));
+	}
+	if (n != NVRAM_SIZE) {
+		say("init: no NVRAM (%s%s or %s: %d); push one\n", WIFI_FW_DIR, NVRAM_FILE, NVRAM_DEFAULT, n);
+		return o;
+	}
+	if (mac_valid(nv + 4)) {
+		memcpy(wl.mac, nv + 4, 6);
+	} else {
+		/* no factory MAC: a locally administered one, the same until the next "wifi init" */
+		read_random(wl.mac, 6);
+		wl.mac[0] = (uint8_t)((wl.mac[0] & 0xfc) | 0x02);
+		memcpy(nv + 4, wl.mac, 6);                     /* as Android's wlan_assistant patches it in */
+	}
+	uint16_t cc = (uint16_t)(nv[10] << 8 | nv[11]);
+	say("init: NVRAM %s (version 0x%04x), MAC %02x:%02x:%02x:%02x:%02x:%02x%s, country %c%c\n", src, nv[0] | nv[1] << 8,
+	    wl.mac[0], wl.mac[1], wl.mac[2], wl.mac[3], wl.mac[4], wl.mac[5], src == NVRAM_FILE ? " (factory)" : " (random)",
+	    nv[10] ? nv[10] : '0', nv[11] ? nv[11] : '0');
+
+	int err = 0;
+	err |= wifi_cmd(CID_DUMMY, true, NULL, 0, 0, NULL, 0, 0, out, len, &o);
+	if (!wl.cap) {
+		o = wifi_cap(out, len, o);
+	}
+	bzero(p, sizeof(p));
+	err |= wifi_cmd(CID_BASIC_CONFIG, true, p, 12, 0, NULL, 0, 0, out, len, &o);           /* 802.3 data path */
+	err |= wifi_cmd(CID_SET_NVRAM_SETTINGS, true, nv, NVRAM_SIZE, 0, NULL, 0, 0, out, len, &o);
+	domain_info(p, cc, true);
+	err |= wifi_cmd(CID_SET_DOMAIN_INFO, true, p, 56, 0, NULL, 0, 0, out, len, &o);
+	domain_info(p, cc, false);
+	err |= wifi_cmd(CID_SET_DOMAIN_INFO, true, p, 56, 0, NULL, 0, 0, out, len, &o);
+	bzero(p, 40);
+	p[4] = 1;                                       /* ucCmdVer */
+	p[6] = 40;                                      /* u2CmdLen; ucDbdcEn 0 */
+	err |= wifi_cmd(CID_SET_DBDC_PARMS, true, p, 40, 0, NULL, 0, 0, out, len, &o);
+	bzero(p, 68);
+	p[0] = 0x0b;                                    /* directed | multicast | broadcast */
+	err |= wifi_cmd(CID_SET_RX_FILTER, true, p, 68, 0, NULL, 0, 0, out, len, &o);
+	uint8_t act[12] = { 0, 1, 0, 1 };               /* BSS 0 active, AIS, own MAC index 1 */
+	memcpy(act + 4, wl.mac, 6);
+	act[10] = 4;                                    /* broadcast/multicast WTBL entry */
+	err |= wifi_cmd(CID_BSS_ACTIVATE_CTRL, true, act, sizeof(act), 0, NULL, 0, 0, out, len, &o);
+	wl.init = (err == 0);
+	say("init: %s (basic config, NVRAM, domain x2, DBDC off, RX filter, BSS 0 active). Next: wifi scan\n",
+	    wl.init ? "done" : "a command was not taken");
+	return o;
+}
+
+static const uint8_t *
+ie_find(const uint8_t *ie, uint32_t len, uint8_t id, const uint8_t *oui4)
+{
+	for (uint32_t i = 0; i + 2 <= len && i + 2 + ie[i + 1] <= len; i += 2 + ie[i + 1]) {
+		if (ie[i] == id && (oui4 == NULL || (ie[i + 1] >= 4 && memcmp(ie + i + 2, oui4, 4) == 0))) {
+			return ie + i;
+		}
+	}
+	return NULL;
+}
+
+/* Beacon / probe response into the scan table (newest data wins, keyed by BSSID). */
+static void
+scan_frame(const uint8_t *b, const uint8_t *f, uint32_t flen)
+{
+	if (flen < 36) {
+		return;
+	}
+	const uint8_t *bssid = f + 16, *ie = f + 36;
+	uint32_t ielen = flen - 36;
+	struct wl_bss *e = NULL;
+	for (uint32_t i = 0; i < wl.nbss; i++) {
+		if (memcmp(wl.bss[i].bssid, bssid, 6) == 0) {
+			e = &wl.bss[i];
+			break;
+		}
+	}
+	if (e == NULL) {
+		if (wl.nbss < WL_MAX_BSS) {
+			e = &wl.bss[wl.nbss++];
+		} else {
+			for (uint32_t i = 0; i < WL_MAX_BSS; i++) {     /* replace the oldest */
+				if (e == NULL || wl.bss[i].seen < e->seen) {
+					e = &wl.bss[i];
+				}
+			}
+		}
+		bzero(e, sizeof(*e));
+		memcpy(e->bssid, bssid, 6);
+	}
+	e->seen = wl.scanGen;
+	e->rssi = (int8_t)rx_rssi(b);
+	e->ch = b[5] > 241 ? (uint8_t)(b[5] - 241) : b[5];
+	e->bintval = (uint16_t)(f[32] | f[33] << 8);
+	e->capinfo = (uint16_t)(f[34] | f[35] << 8);
+	const uint8_t *ds = ie_find(ie, ielen, 3, NULL), *ssid = ie_find(ie, ielen, 0, NULL);
+	if (ds && ds[1] >= 1) {
+		e->ch = ds[2];
+	}
+	if (ssid && ssid[1] <= 32 && (ssid[1] > 0 || e->ssid_len == 0)) {
+		e->ssid_len = ssid[1];
+		memcpy(e->ssid, ssid + 2, ssid[1]);
+	}
+	e->ie_len = (uint16_t)MIN(ielen, (uint32_t)WL_IE_MAX);
+	memcpy(e->ie, ie, e->ie_len);
+}
+
+/* Other management frames and EAPOL: only counted for now (no join yet). */
+static uint32_t wl_otherMgmt, wl_eapol;
+
+static void
+join_frame(__unused const uint8_t *b, __unused const uint8_t *f, __unused uint32_t flen)
+{
+	wl_otherMgmt++;
+}
+
+static void
+eapol_rx(__unused const uint8_t *eth, __unused uint32_t len)
+{
+	wl_eapol++;
+}
+
+/* RX dispatch for frames and data (called from rx_next). */
+static void
+wifi_frame(const uint8_t *b, uint32_t n, uint32_t foff, int kind)
+{
+	const uint8_t *f = b + foff;
+	uint32_t total = MIN((uint32_t)(b[0] | b[1] << 8), n), flen = total - foff;
+	if (b[6] & 0x80) {                              /* translated to 802.3: DA, SA, type */
+		wl.dataFrames++;
+		if (flen >= 14 && f[12] == 0x88 && f[13] == 0x8e) {
+			eapol_rx(f, flen);
+		}
+		return;
+	}
+	if (kind != PKT_FRAME || flen < 24) {
+		wl.dataFrames++;
+		return;
+	}
+	wl.frames++;
+	uint8_t fc = f[0];
+	if (fc == 0x80 || fc == 0x50) {
+		scan_frame(b, f, flen);
+	} else if ((fc & 0x0c) == 0) {
+		join_frame(b, f, flen);
+	} else if ((fc & 0x0c) == 0x08 && flen >= 24 + 8 + 4) {
+		/* 802.11 data (not translated): LLC/SNAP AA AA 03 00 00 00, type 0x888E = EAPOL */
+		uint32_t h = 24 + ((fc & 0x80) ? 2 : 0);
+		const uint8_t *l = f + h;
+		if (flen >= h + 8 && l[0] == 0xaa && l[1] == 0xaa && l[6] == 0x88 && l[7] == 0x8e) {
+			uint8_t eth[14 + 512];
+			uint32_t plen = MIN(flen - h - 8, (uint32_t)512);
+			memcpy(eth, f + 4, 6);                  /* DA = addr1 */
+			memcpy(eth + 6, f + 10, 6);             /* SA = addr2 (from the AP, to-DS 0) */
+			eth[12] = 0x88;
+			eth[13] = 0x8e;
+			memcpy(eth + 14, l + 8, plen);
+			eapol_rx(eth, 14 + plen);
+		}
+	}
+}
+
+static const char *
+bss_security(const struct wl_bss *e)
+{
+	static const uint8_t wpa_oui[4] = { 0x00, 0x50, 0xf2, 0x01 };
+	const uint8_t *rsn = ie_find(e->ie, e->ie_len, 48, NULL);
+	if (rsn && rsn[1] >= 20) {
+		/* AKM list after version (2), group (4), pairwise count + suites */
+		uint32_t pc = rsn[8] | rsn[9] << 8, a = 10 + 4 * pc;
+		bool psk = false, sae = false, eap = false;
+		if (a + 2 <= (uint32_t)rsn[1] + 2) {
+			uint32_t ac = rsn[a] | rsn[a + 1] << 8;
+			for (uint32_t i = 0; i < ac && a + 2 + 4 * i + 4 <= (uint32_t)rsn[1] + 2; i++) {
+				uint8_t t = rsn[a + 2 + 4 * i + 3];
+				psk |= (t == 2 || t == 6);
+				sae |= (t == 8);
+				eap |= (t == 1 || t == 5);
+			}
+		}
+		return psk && sae ? "WPA2/WPA3" : psk ? "WPA2-PSK" : sae ? "WPA3-SAE" : eap ? "WPA2-EAP" : "RSN?";
+	}
+	if (ie_find(e->ie, e->ie_len, 0xdd, wpa_oui)) {
+		return "WPA";
+	}
+	return (e->capinfo & 0x10) ? "WEP" : "open";
+}
+
+static int
+wifi_do_scan(const char *ssid, bool only2g, char *out, size_t len, size_t *po)
+{
+	static uint8_t req[1188];
+	static uint8_t ev[RX_BUF_LEN];
+	size_t o = *po;
+	bzero(req, sizeof(req));
+	req[0] = ++wl.scanSeq;
+	req[1] = 0;                                     /* BSS 0 */
+	req[2] = 1;                                     /* active */
+	req[3] = 1;                                     /* wildcard SSID */
+	if (ssid && *ssid) {
+		uint32_t sl = (uint32_t)MIN(strlen(ssid), (size_t)32);
+		req[3] = 4;                                 /* specified + wildcard */
+		req[4] = 1;
+		memcpy(req + 8, &sl, 4);
+		memcpy(req + 12, ssid, sl);
+	}
+	req[6] = 0x02;                                  /* DBDC scan disabled */
+	req[7] = 1;                                     /* auVersion */
+	if (only2g) {
+		req[158] = 4;                           /* specified channels 1-13 */
+		req[159] = 13;
+		for (int c = 1; c <= 13; c++) {
+			req[160 + 2 * (c - 1)] = 1;
+			req[161 + 2 * (c - 1)] = (uint8_t)c;
+		}
+	}
+	memset(req + 1112, 0xff, 6);                    /* aucBSSID */
+	wl.scanGen++;
+	uint32_t frames0 = wl.frames;
+	int ret = -1;
+	if (wifi_cmd(CID_SCAN_REQ_V2, true, req, sizeof(req), 0, NULL, 0, 0, out, len, &o) != 0) {
+		goto done;
+	}
+	for (uint32_t t = 0; t < 15000;) {
+		int kind;
+		uint32_t got = rx_next(ev, sizeof(ev), 10000, &kind);
+		if (got == 0) {
+			t += 10;
+			continue;
+		}
+		if (kind == PKT_EVENT) {
+			uint8_t *e = ev + 20, *d = ev + 32;
+			if (e[4] == EID_SCAN_DONE && d[0] == wl.scanSeq) {
+				say("scan: done (state %u, %u channels, %u beacons/responses received)\n", d[5], d[4],
+				    wl.frames - frames0);
+				ret = 0;
+				goto done;
+			}
+			if (e[4] != 0x07) {
+				say("scan: event 0x%02x (%u bytes)\n", e[4], got);
+			}
+		}
+	}
+	say("scan: no SCAN_DONE in 15 s (%u frames received)\n", wl.frames - frames0);
+done:
+	*po = o;
+	return ret;
+}
+
+static size_t
+wifi_scan(const char *args, char *out, size_t len, size_t o)
+{
+	if (!wl.init) {
+		say("scan: wifi init first\n");
+		return o;
+	}
+	while (*args == ' ') {
+		args++;
+	}
+	bool only2g = strncmp(args, "2g", 2) == 0;
+	if (only2g) {
+		args += 2;
+		while (*args == ' ') {
+			args++;
+		}
+	}
+	(void)wifi_do_scan(args, only2g, out, len, &o);
+	/* strongest first */
+	uint8_t order[WL_MAX_BSS], m = 0;
+	for (uint32_t i = 0; i < wl.nbss; i++) {
+		if (wl.bss[i].seen == wl.scanGen) {
+			order[m++] = (uint8_t)i;
+		}
+	}
+	for (uint32_t i = 1; i < m; i++) {
+		for (uint32_t j = i; j > 0 && wl.bss[order[j]].rssi > wl.bss[order[j - 1]].rssi; j--) {
+			uint8_t t = order[j];
+			order[j] = order[j - 1];
+			order[j - 1] = t;
+		}
+	}
+	say("scan: %u networks\n", m);
+	for (uint32_t i = 0; i < m; i++) {
+		const struct wl_bss *e = &wl.bss[order[i]];
+		say("%4d dBm ch %3u %02x:%02x:%02x:%02x:%02x:%02x %-9s %.*s\n", e->rssi, e->ch, e->bssid[0], e->bssid[1],
+		    e->bssid[2], e->bssid[3], e->bssid[4], e->bssid[5], bss_security(e), e->ssid_len, e->ssid);
+	}
+	return o;
+}
+
 void
 viva_wifi_link(const char *args, char *out, size_t len)
 {
@@ -1312,6 +1796,13 @@ viva_wifi_link(const char *args, char *out, size_t len)
 	} else if (strncmp(args, "wmt", 3) == 0) {
 		printf("VIVA WIFI: WMT over STP/BTIF\n");
 		o = wifi_wmt(out, len, o);
+		printf("%s", out);
+	} else if (strncmp(args, "init", 4) == 0) {
+		printf("VIVA WIFI: station init\n");
+		o = wifi_init(out, len, o);
+		printf("%s", out);
+	} else if (strncmp(args, "scan", 4) == 0) {
+		o = wifi_scan(args + 4, out, len, o);
 		printf("%s", out);
 	} else if (strncmp(args, "cap", 3) == 0) {
 		o = wifi_cap(out, len, o);
