@@ -1513,7 +1513,7 @@ wifi_init(char *out, size_t len, size_t o)
 		return o;
 	}
 	static uint8_t nv[NVRAM_SIZE];
-	uint8_t p[64];
+	uint8_t p[80];                                  /* largest: SET_RX_FILTER, 68 bytes (64 overflowed: 0148 panic) */
 	const char *src = NVRAM_FILE;
 	int n = read_file(NVRAM_FILE, nv, sizeof(nv));
 	if (n != NVRAM_SIZE) {
