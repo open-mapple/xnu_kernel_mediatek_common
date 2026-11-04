@@ -232,6 +232,13 @@ extern void viva_gpu_link(const char *args, char *out, size_t outLen);       /* 
 extern void viva_disp_link(const char *args, char *out, size_t outLen);      /* iokit/Kernel/arm/SweetFramebuffer.cpp */
 extern int sweet_console_muted;                                             /* osfmk/console/serial_console.c */
 
+/* VivaBattery.cpp: a USB host has configured the link (the cable is a computer, not a charger). */
+int
+viva_usb_host_configured(void)
+{
+	return vl.configured ? 1 : 0;
+}
+
 static void
 vl_sleep_ms(unsigned ms)
 {
