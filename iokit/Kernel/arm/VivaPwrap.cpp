@@ -53,6 +53,8 @@
 
 OSDefineMetaClassAndStructors(VivaPwrap, IOService);
 
+extern "C" void viva_wifi_reserve(void);        /* VivaWiFi.cpp: CONNSYS memory, before the scanout fragments it */
+
 static VivaPwrap *gVivaPwrap;
 
 bool
@@ -94,6 +96,7 @@ VivaPwrap::start(IOService *provider)
 	    (hw & 0xff00) == 0x6600 ? "MT6366" : (hw & 0xff00) == 0x5800 ? "MT6358" : "unknown",
 	    top, topint, con, mask, sta, raw, ret);
 
+	viva_wifi_reserve();
 	gVivaPwrap = this;
 	registerService();
 	VivaDTNub::publishChildren(this, provider);
