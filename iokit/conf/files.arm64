@@ -24,6 +24,7 @@ iokit/Kernel/arm/VivaGPU.cpp                                     optional iokitc
 iokit/Kernel/arm/VivaGPUUserClient.cpp                           optional iokitcpp
 iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
 iokit/Kernel/arm/VivaBattery.cpp                                 optional iokitcpp
+iokit/Kernel/arm/VivaWiFi.cpp                                    optional iokitcpp
 iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
 iokit/Kernel/arm/hid/VivaKeypad.cpp                              optional iokitcpp
 iokit/Kernel/arm/hid/VivaPMICKeys.cpp                            optional iokitcpp

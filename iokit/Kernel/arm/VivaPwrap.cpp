@@ -190,6 +190,14 @@ static const struct {
 	{ 0x1c58, 0x0003, 0x03 },       /* LDO_VCN18_CON0: RG_LDO_VCN18_EN, RG_LDO_VCN18_LP */
 	{ 0x1c5a, 0x0003, 0x03 },       /* LDO_VCN18_OP_EN: SW_OP_EN, HW0_OP_EN */
 	{ 0x1c60, 0x0002, 0x01 },       /* LDO_VCN18_OP_CFG: HW0_OP_CFG */
+	/* CONNSYS with an MT6631 A-die (consys_hw_vcn33_ctrl, co-clock efuse PALDO VCN28) */
+	{ 0x1d1c, 0x0003, 0x03 },       /* LDO_VCN33_CON0_0: RG_LDO_VCN33_EN_0, LP */
+	{ 0x1d1e, 0x0003, 0x03 },       /* LDO_VCN33_OP_EN: SW_OP_EN, HW0_OP_EN */
+	{ 0x1d24, 0x0002, 0x01 },       /* LDO_VCN33_OP_CFG: HW0_OP_CFG */
+	{ 0x1e28, 0x0300, 0x01 },       /* VCN33_ANA_CON0: VOSEL[9:8], only 1 = 3.3 V (LK leaves 3 = 3.5 V) */
+	{ 0x1d88, 0x0001, 0x01 },       /* LDO_VCN28_CON0: RG_LDO_VCN28_EN */
+	{ 0x1d8a, 0x0002, 0x01 },       /* LDO_VCN28_OP_EN: HW0_OP_EN */
+	{ 0x1d90, 0x0002, 0x01 },       /* LDO_VCN28_OP_CFG: HW0_OP_CFG */
 };
 
 IOReturn
