@@ -15,7 +15,12 @@
  *   5  SwapEnd, struct 0x46c: +0x50 swap id, +0x54 IOSurface id per layer
  *      (4 layers), +0x64 rect a / +0xc4 rect b per layer (int x,y,w,h),
  *      +0x104 enabled layer mask
- *   6  SwapWait, 7 GetID, 8 GetDisplaySize -> [w, h],
+ *   6  SwapWait [swap id, options, timeout ms]: CoreAnimation (IOMFBDisplay::can_update_) renders into a
+ *      framebuffer page again only once SwapWait(its swap, 0x80000000) returns 0. options[2:0]: 0 retired (not
+ *      queued, not waiting for the frame end, not the surface the layer reads), 1 displayed (not queued, not
+ *      waiting), 2 nothing queued or waiting; bit 31 = do not block (kIOReturnBusy). Apple:
+ *      IOMobileFramebufferLegacy swap_wait_gated (gpu/docs/ANALISI-SCANOUT-RE.md). 7 GetID,
+ *      8 GetDisplaySize -> [w, h],
  *   12 RequestPowerChange [state]: 0 = display off (backboardd, power
  *      button / auto-lock), else on. Off fades the panel out over a few
  *      vsyncs (halving each pixel) and keeps it black until on again;
@@ -168,6 +173,7 @@ public:
 	IOLock       *fLock;            /* swaps and client list */
 	OSArray      *fClients;
 	uint32_t      fSwapID;
+	uint64_t      fSwapWaitBusy, fSwapWaitSlept;      /* SwapWait answered busy / had to block */
 	bool          fConsolePaused;
 	uint8_t       fPending[SWEET_FB_SWAP_REC_SIZE];     /* latest swap (redrawn when the display comes on) */
 	bool          fDirty;
@@ -210,7 +216,9 @@ public:
 		uint32_t      addr, pitch, pitchMsb;
 		int           buf;            /* panel buffer 0/1, -1 = an IOSurface (scanout) */
 		SweetSurface *surface;        /* retained while the layer may read it */
+		uint32_t      swap;           /* the swap whose surface the layer reads (scanout), 0 = a panel buffer */
 	};
+	volatile uint32_t fShownSwap, fNextSwap;      /* fShown.swap / fNext.swap (valid), read without fScanLock */
 	Target        fShown, fNext;
 	bool          fNextValid;
 	/* K0d double buffer and frame end (see the top) */
@@ -240,6 +248,7 @@ public:
 	void layerApply(const Target &t);
 	void show(const Target &t);
 	void dropNext(void);
+	bool swapDone(uint32_t swap, uint32_t op);
 	bool flipSetup(char **out, char *end);
 	bool vblankCalibrate(char **out, char *end);
 	uint64_t vblankPoll(uint64_t budget, const Target *t, bool *applied);
@@ -392,10 +401,15 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
 	fb->vblankTick();               /* first: a pending layer switch happens at this frame end */
 	uint64_t now = mach_absolute_time();
 	uint64_t count = ++fb->fVsyncCount;
+	/* args 4/5: the refresh period (QuartzCore predicts the next vblank as time + period) */
+	uint64_t period = fb->fPeriod;
+	if (period == 0) {
+		nanoseconds_to_absolutetime(16666667, &period);
+	}
 	uint64_t values[6] = {
 		(uint32_t)count, (uint32_t)(count >> 32),
 		(uint32_t)now, (uint32_t)(now >> 32),
-		0, 0,
+		(uint32_t)period, (uint32_t)(period >> 32),
 	};
 
 	IOLockLock(fb->fLock);
@@ -1124,6 +1138,7 @@ AppleCLCD::scanout(const uint8_t *rec)
 	t.pitch = (fLkPitch & ~0xffffu) | (s->bytesPerRow & 0xffff);
 	t.buf = -1;
 	t.surface = s;                          /* keeps the memory alive while the OVL reads it */
+	t.swap = get32(rec, 0x50);
 	if (fShown.buf >= 0 || fScanWhy != NULL) {
 		IOLog("SWEET FB: scanout: %s reads surface %u at 0x%08x (pitch %u)%s\n", fScanLayer, s->id, t.addr,
 		    s->bytesPerRow, fFlipReady ? " from the next frame end" : "");
@@ -1155,6 +1170,7 @@ AppleCLCD::bufTarget(int buf)
 	t.pitchMsb = fLkPitchMsb;
 	t.buf = buf;
 	t.surface = NULL;
+	t.swap = 0;
 	return t;
 }
 
@@ -1177,6 +1193,10 @@ AppleCLCD::layerApply(const Target &t)
 	layerWrite(t);
 	SweetSurface *old = fShown.surface;
 	fShown = t;
+	fShownSwap = t.swap;
+	if (fNextValid && fNext.swap == t.swap) {
+		fNextSwap = 0;
+	}
 	OSSafeReleaseNULL(old);
 }
 
@@ -1191,6 +1211,7 @@ AppleCLCD::show(const Target &t)
 	dropNext();
 	fNext = t;
 	fNextValid = true;
+	fNextSwap = t.swap;
 }
 
 void
@@ -1199,6 +1220,39 @@ AppleCLCD::dropNext(void)
 	if (fNextValid) {
 		OSSafeReleaseNULL(fNext.surface);
 		fNextValid = false;
+	}
+	fNextSwap = 0;
+}
+
+/*
+ * SwapWait condition (see the top): op 0 retired, 1 displayed, 2 nothing queued or waiting. A copied frame never
+ * holds its surface (the layer reads a panel buffer), so it is retired once it leaves the queue.
+ */
+bool
+AppleCLCD::swapDone(uint32_t swap, uint32_t op)
+{
+	bool queued = false;
+	IOLockLock(fLock);
+	for (uint32_t i = 0; i < fQueueCount; i++) {
+		if (op == 2 || get32(fQueue[i], 0x50) == swap) {
+			queued = true;
+			break;
+		}
+	}
+	IOLockUnlock(fLock);
+	uint32_t next = fNextSwap, shown = fShownSwap;
+	if (queued) {
+		return false;
+	}
+	switch (op) {
+	case 0:
+		return swap == 0 || (next != swap && shown != swap);
+	case 1:
+		return next != swap;
+	case 2:
+		return next == 0;
+	default:
+		return true;
 	}
 }
 
@@ -1444,6 +1498,7 @@ AppleCLCD::vblankTick(void)
 	if (applied) {
 		layerApply(fNext);      /* written at the frame end already: bookkeeping */
 		fNextValid = false;
+		fNextSwap = 0;
 		fFlips++;
 	} else if (at != 0) {
 		fFlipUnsure++;          /* held up while polling: switch at the next frame end */
@@ -1456,6 +1511,7 @@ AppleCLCD::vblankTick(void)
 			IOLog("SWEET FB: double buffer off: no frame end in 8 tries\n");
 			layerApply(fNext);
 			fNextValid = false;
+			fNextSwap = 0;
 		}
 	}
 	IOLockUnlock(fScanLock);
@@ -1549,6 +1605,8 @@ AppleCLCD::dispCommand(const char *args, char *out, size_t len)
 		    "(sweetfb_gpuwait=%u)\n", fGpuWaits, fGpuRecopies, fGpuForced, fGpuWaitMax);
 		disp_say(&p, end, "early present (K0g, sweetfb_early) %s: %llu tries, %llu frames shown before their tick\n",
 		    fEarly ? "on" : "off", fEarlyRuns, fEarlyShown);
+		disp_say(&p, end, "SwapWait: %llu busy answers (CA keeps the page), %llu blocking waits; layer reads swap %u, "
+		    "next swap %u\n", fSwapWaitBusy, fSwapWaitSlept, fShownSwap, fNextSwap);
 		uint64_t pns = 0, polls = fPolls ? fPolls : 1, pollNs;
 		absolutetime_to_nanoseconds(fPeriod, &pns);
 		absolutetime_to_nanoseconds(fPollAbs / polls, &pollNs);
@@ -1716,7 +1774,32 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
 			IOLog("SWEET FB: display %s\n", off ? "off" : "on");
 		}
 		break;
-	case kSweetFBSwapWait:
+	case kSweetFBSwapWait: {
+		uint32_t swap = args->scalarInputCount > 0 ? (uint32_t)args->scalarInput[0] : 0;
+		uint32_t opts = args->scalarInputCount > 1 ? (uint32_t)args->scalarInput[1] : 0;
+		uint32_t ms = args->scalarInputCount > 2 ? (uint32_t)args->scalarInput[2] : 0;
+		uint32_t op = opts & 7;
+		if (fFB->swapDone(swap, op)) {
+			break;
+		}
+		if (opts & 0x80000000u) {
+			ret = kIOReturnBusy;
+			fFB->fSwapWaitBusy++;
+			break;
+		}
+		/* block (the calling thread only): re-check every millisecond, at most the timeout or 5 s */
+		ms = (ms == 0 || ms > 5000) ? 5000 : ms;
+		ret = kIOReturnTimeout;
+		for (uint32_t t = 0; t < ms; t++) {
+			IOSleep(1);
+			if (fFB->swapDone(swap, op)) {
+				ret = kIOReturnSuccess;
+				break;
+			}
+		}
+		fFB->fSwapWaitSlept++;
+		break;
+	}
 	default:
 		break;
 	}
