@@ -559,6 +559,10 @@ IOTimerEventSource::wakeAtTime(uint32_t options, AbsoluteTime inAbstime, Absolut
 		if (kIOTimeOptionsContinuous & options) {
 			tcoptions |= THREAD_CALL_CONTINUOUS;
 		}
+		/* viva 0139: a leeway only ever widens the coalescing slop (MAX); critical urgency has none */
+		if (kIOTimeOptionsSysCritical & options) {
+			tcoptions |= THREAD_CALL_DELAY_SYS_CRITICAL;
+		}
 
 		if (reserved) {
 			if (kPassive & flags) {

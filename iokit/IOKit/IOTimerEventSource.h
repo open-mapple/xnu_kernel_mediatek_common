@@ -90,10 +90,12 @@ enum{
  *       @abstract Constants defining behavior of a scheduled call from IOTimerEventSource.
  *       @constant kIOTimeOptionsWithLeeway Use the leeway parameter to the call.
  *       @constant kIOTimeOptionsContinuous Use mach_continuous_time() to generate the callback.
+ *       @constant kIOTimeOptionsSysCritical No timer coalescing slop (viva 0139: the display vsync tick).
  */
 enum{
 	kIOTimeOptionsWithLeeway = 0x00000020,
 	kIOTimeOptionsContinuous = 0x00000100,
+	kIOTimeOptionsSysCritical = 0x00000200,
 };
 
 /*!

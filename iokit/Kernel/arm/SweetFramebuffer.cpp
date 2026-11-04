@@ -607,11 +607,12 @@ AppleCLCD::rearm(IOTimerEventSource *timer)
 		next += ((now + fLead + min - next) / step + 1) * step;
 	}
 	/*
-	 * 0136: no leeway. Without kIOTimeOptionsWithLeeway the thread call gets the default timer coalescing slop, and
-	 * a tick more than fLead late lands after the frame end: the pending switch then waited a whole frame (0135 on
-	 * the phone: ~2 ticks deferred per switch, chosen -> on screen 27-32 ms).
+	 * 0136/0139: no coalescing. The thread call otherwise gets the default timer coalescing slop (up to ~1 ms for a
+	 * deadline 16 ms away), and a tick more than fLead late lands after the frame end: the pending switch then waits
+	 * a whole frame. A zero leeway does not help (the slop is MAX(slop, leeway); 0136 on the phone: ticks avg 35 us
+	 * after the frame end, ~2.4 deferred per switch, chosen -> on screen 38 ms); critical urgency has no slop.
 	 */
-	timer->wakeAtTime(kIOTimeOptionsWithLeeway, next - fLead, 0);
+	timer->wakeAtTime(kIOTimeOptionsSysCritical, next - fLead, 0);
 }
 
 void
