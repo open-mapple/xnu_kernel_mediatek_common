@@ -5,6 +5,7 @@
  * remap register infracfg_ao 0x10001380[19:0] = PA >> 16: one physically contiguous range, below 4 GiB (the DT's
  * alloc-ranges keep it 32-bit), 16 MiB aligned like the DT asks (64 KiB, the remap granularity, as a fallback).
  * Cacheable; viva_wifi_emi_flush() pushes the CPU's writes out before the MCU reads them.
+ * viva_wifi_dma_alloc(): the WFDMA rings and buffers (any contiguous range below 4 GiB; the WFDMA takes 36 bits).
  */
 #include <pexpert/arm64/board_config.h>
 
@@ -34,6 +35,34 @@ viva_wifi_emi_alloc(uint32_t size, uint64_t *pa)
 	}
 	*pa = gVivaWiFiEMI->getPhysicalSegment(0, NULL, kIOMemoryMapperNone);
 	return gVivaWiFiEMI->getBytesNoCopy();
+}
+
+static IOBufferMemoryDescriptor *gVivaWiFiDMA;
+
+extern "C" void *
+viva_wifi_dma_alloc(uint32_t size, uint64_t *pa)
+{
+	if (gVivaWiFiDMA == NULL) {
+		gVivaWiFiDMA = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+		    kIODirectionInOut | kIOMemoryPhysicallyContiguous, size, 0x00000000fffff000ull);
+		if (gVivaWiFiDMA == NULL) {
+			return NULL;
+		}
+	}
+	if (gVivaWiFiDMA->getLength() < size) {
+		return NULL;
+	}
+	*pa = gVivaWiFiDMA->getPhysicalSegment(0, NULL, kIOMemoryMapperNone);
+	return gVivaWiFiDMA->getBytesNoCopy();
+}
+
+/* Clean + invalidate a range of the DMA memory (before the device reads it, and before the CPU reads its writes). */
+extern "C" void
+viva_wifi_dma_flush(uint32_t offset, uint32_t len)
+{
+	if (gVivaWiFiDMA != NULL) {
+		gVivaWiFiDMA->performOperation(kIOMemoryIncoherentIOFlush, offset, len);
+	}
 }
 
 /* CPU writes out to DRAM (clean + invalidate) before CONNSYS reads; also before the CPU reads what it wrote. */
