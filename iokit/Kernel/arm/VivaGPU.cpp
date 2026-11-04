@@ -420,6 +420,8 @@ VivaGPUFence::create(bool isSignalled)
 		f->k0jEpoch = 0;
 		f->k0jVM = NULL;
 		f->k0jDep = false;
+		f->k0jWalk = 0;
+		f->k0jCollect = 0;
 	}
 	return f;
 }
@@ -1035,6 +1037,9 @@ VivaGPUAccelerator::free(void)
 		fCallLock = NULL;
 	}
 	OSSafeReleaseNULL(fPromises);
+	if (fK0jStack != NULL) {
+		IODelete(fK0jStack, K0jFrame, kVivaK0jDepth);
+	}
 	if (fProbeLock != NULL) {
 		IOLockFree(fProbeLock);
 	}
@@ -3125,8 +3130,9 @@ VivaGPUAccelerator::callStats(char **out, char *end)
 	    "waiters now\n", any ? "" : " none yet", fSleeps, fSleepsSpurious, fWakeFence, fWakeGeneric, fGenericWaiters);
 	say(out, end, "surface promises (K0i): %llu made, %u pending, %llu timed out; K0j: %llu waits past an own "
 	    "promise, %llu jobs started ahead of another connection's, %llu queued jobs dropped at close, dependency walk "
-	    "%llu nodes + %llu cached\n", fPromisesMade, fPromises != NULL ? fPromises->getCount() : 0, fPromisesTimedOut,
-	    fPromiseBypass, fQueueBypass, fJobsDiscarded, fK0jVisits, fK0jCached);
+	    "%llu nodes + %llu cached in %llu walks (%llu cut short)\n", fPromisesMade,
+	    fPromises != NULL ? fPromises->getCount() : 0, fPromisesTimedOut, fPromiseBypass, fQueueBypass, fJobsDiscarded,
+	    fK0jVisits, fK0jCached, fK0jWalk, fK0jCut);
 }
 
 /*
@@ -3473,7 +3479,13 @@ VivaGPUAccelerator::vmHasPromise(VivaGPUVM *vm)
 	return false;
 }
 
-/* Gated: does unsignalled `f` wait, through job dependencies and resolved promises, for a pending promise of vm? */
+/*
+ * Gated: does unsignalled `f` wait, through job dependencies and resolved promises, for a pending promise of vm?
+ * 0128: depth-first with an explicit stack. The recursive version went one 64-byte kernel frame per fence, and with
+ * the asynchronous replay the chains of unfinished jobs passed 250 fences: "Invalid kernel stack pointer (probable
+ * overflow)" with dependsOnPromiseOf all down the backtrace. Each node is entered once per walk (a DAG with shared
+ * dependencies used to be walked once per path; a cycle, until the budget ran out). The budget counts distinct nodes.
+ */
 bool
 VivaGPUAccelerator::dependsOnPromiseOf(VivaGPUFence *f, VivaGPUVM *vm, uint32_t *budget)
 {
@@ -3488,18 +3500,79 @@ VivaGPUAccelerator::dependsOnPromiseOf(VivaGPUFence *f, VivaGPUVM *vm, uint32_t 
 		return f->k0jDep;       /* nothing about promises changed since it was worked out */
 	}
 	if (*budget == 0) {
+		fK0jCut++;
 		return false;           /* too deep to tell: wait as before (the promise timeout is the backstop) */
 	}
+	if (fK0jStack == NULL && (fK0jStack = IONew(K0jFrame, kVivaK0jDepth)) == NULL) {
+		return false;
+	}
+	uint64_t walk = ++fK0jWalk;
+	uint32_t sp = 0;
+	bool dep = false, cut = false;
 	(*budget)--;
 	fK0jVisits++;
-	bool dep = false;
-	for (unsigned int i = 0; !dep && f->deps != NULL && i < f->deps->getCount(); i++) {
-		dep = dependsOnPromiseOf((VivaGPUFence *)f->deps->getObject(i), vm, budget);
+	f->k0jWalk = walk;
+	fK0jStack[0].f = f;
+	fK0jStack[0].next = 0;
+	fK0jStack[0].cond = false;
+	sp = 1;
+	while (sp != 0) {
+		K0jFrame *top = &fK0jStack[sp - 1];
+		VivaGPUFence *n = top->f;
+		if (n->deps == NULL || top->next >= n->deps->getCount()) {
+			/* all of n's dependencies said no */
+			if (!top->cond) {
+				n->k0jEpoch = fK0jEpoch;
+				n->k0jVM = vm;
+				n->k0jDep = false;
+			}
+			sp--;
+			if (top->cond && sp != 0) {
+				fK0jStack[sp - 1].cond = true;
+			}
+			continue;
+		}
+		VivaGPUFence *d = (VivaGPUFence *)n->deps->getObject(top->next++);
+		if (d == NULL || d->signalled) {
+			continue;
+		}
+		if (d->promise && d->owner == vm) {
+			dep = true;
+			break;
+		}
+		if (d->k0jEpoch == fK0jEpoch && d->k0jVM == vm) {
+			fK0jCached++;
+			if (d->k0jDep) {
+				dep = true;
+				break;
+			}
+			continue;
+		}
+		if (d->k0jWalk == walk) {
+			top->cond = true;       /* on the path (a cycle) or already seen without a final answer */
+			continue;
+		}
+		if (*budget == 0 || sp == kVivaK0jDepth) {
+			top->cond = true;
+			cut = true;
+			continue;
+		}
+		(*budget)--;
+		fK0jVisits++;
+		d->k0jWalk = walk;
+		fK0jStack[sp].f = d;
+		fK0jStack[sp].next = 0;
+		fK0jStack[sp].cond = false;
+		sp++;
 	}
-	if (dep || *budget != 0) {      /* a "no" cut short by the budget is not cached */
-		f->k0jEpoch = fK0jEpoch;
-		f->k0jVM = vm;
-		f->k0jDep = dep;
+	if (dep) {
+		for (uint32_t i = 0; i < sp; i++) {     /* the path to the promise: all of it depends on it */
+			fK0jStack[i].f->k0jEpoch = fK0jEpoch;
+			fK0jStack[i].f->k0jVM = vm;
+			fK0jStack[i].f->k0jDep = true;
+		}
+	} else if (cut) {
+		fK0jCut++;
 	}
 	return dep;
 }
@@ -3515,6 +3588,12 @@ VivaGPUAccelerator::collectWait(VivaGPUFence *f, VivaGPUVM *vm, OSArray *out, ui
 	if (f == NULL || f->signalled || (f->promise && f->owner == vm)) {
 		return;
 	}
+	if (depth == 0) {
+		fK0jCollect++;
+	} else if (f->k0jCollect == fK0jCollect) {
+		return;                 /* 0128: reached already through another dependency (a diamond, not a new path) */
+	}
+	f->k0jCollect = fK0jCollect;
 	uint32_t budget = 512;
 	if (depth >= 16 || !dependsOnPromiseOf(f, vm, &budget)) {
 		if (out->getNextIndexOfObject(f, 0) == (unsigned int)-1) {

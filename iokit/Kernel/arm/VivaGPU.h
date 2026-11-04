@@ -47,6 +47,7 @@ class VivaPwrap;
  * uses it runs, and dropping those dirty lines loses its writes (stale job descriptors: GPU faults, missing tiles).
  */
 enum { kVivaCacheClean, kVivaCacheFlush };
+enum { kVivaK0jDepth = 512 };          /* dependsOnPromiseOf stack frames (= its largest budget) */
 /*
  * Userspace's CLOCK_MONOTONIC in ns, the clock of every absolute timeout of the UAPI (Mesa: os_time_get_nano). On
  * Darwin it is NOT mach_continuous_time: Libc computes it as gettimeofday - kern.boottime, so it follows the calendar
@@ -88,6 +89,8 @@ public:
 	uint64_t   k0jEpoch;
 	VivaGPUVM *k0jVM;
 	bool       k0jDep;
+	uint64_t   k0jWalk;     /* last dependsOnPromiseOf walk that reached it (0128: each node once per walk) */
+	uint64_t   k0jCollect;  /* last collectWait that reached it */
 };
 
 /* A GPU address space: AArch64 4K page tables plus the VA allocator for [VGPU_VA_START, VGPU_VA_END). */
@@ -454,6 +457,12 @@ private:
 	uint32_t fArmWait;
 	uint64_t fK0jEpoch;                 /* bumped when a promise is made, resolved or signalled, or a job dropped */
 	uint64_t fK0jVisits, fK0jCached;    /* graph nodes walked / answered from the cache */                  /* nextStartable(forArm): the slots the armed job waits for */
+	uint64_t fK0jWalk, fK0jCut, fK0jCollect;       /* 0128: walks / cut short by the budget; collectWait */
+	struct K0jFrame {
+		VivaGPUFence *f;
+		uint32_t      next;     /* next index in f->deps */
+		bool          cond;     /* its "no" leaned on a node still on the path or cut short: not cached */
+	} *fK0jStack;                       /* 0128: dependsOnPromiseOf's explicit stack (was recursion: stack overflow) */
 	void promiseTimeouts(void);
 	uint32_t fGenericWaiters;
 	uint64_t fWakeFence, fWakeGeneric, fSleeps, fSleepsSpurious;

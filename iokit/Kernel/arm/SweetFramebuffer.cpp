@@ -110,6 +110,7 @@ enum {
 #define SWEET_FB_SWAP_REC_SIZE          0x46c
 #define SWEET_FB_LAYERS                 4
 #define SWEET_FB_QUEUE                  4       /* swaps waiting for the GPU (K0c) */
+#define SWEET_FB_LK_BUFFERS             3       /* panel buffers LK reserves (K0d uses one besides its own) */
 #define SWEET_FB_NOTIFY_TYPES           8
 #define SWEET_FB_NOTIFY_VSYNC           5
 #define SWEET_FB_VSYNC_US               16667
@@ -212,7 +213,7 @@ public:
 	Target        fShown, fNext;
 	bool          fNextValid;
 	/* K0d double buffer and frame end (see the top) */
-	uintptr_t     fBufKVA[2];     /* 0 = LK's buffer (fPixels), 1 = the next one in LK's memory */
+	uintptr_t     fBufKVA[2];     /* 0 = LK's buffer (fPixels), 1 = another one in LK's memory (flipSetup) */
 	uint64_t      fBufPA[2];
 	IOMemoryMap  *fBuf1Map;
 	bool          fFlipAllowed;   /* sweetfb_flip */
@@ -1223,32 +1224,51 @@ AppleCLCD::layerReads(uint64_t lo, uint64_t hi)
 }
 
 /*
- * fScanLock. Double buffering: LK's layer must read LK's buffer (fPhys), LK's next buffer must be read by no other
- * layer, and the OVL must report frame ends. Otherwise fFlipWhy says why and everything stays as before.
+ * fScanLock. Double buffering: LK's layer must read LK's buffer (fPhys), one of LK's other buffers must be read by no
+ * other layer, and the OVL must report frame ends. Otherwise fFlipWhy says why and everything stays as before.
+ * LK reserves SWEET_FB_LK_BUFFERS panel buffers back to back (live DT mblock-18-framebuffer: 0x7bc10000, 0x1df0000
+ * bytes = 3 x 1088 x 2400 x 4). 0128: some boots LK leaves OVL0 L1 enabled on its second buffer (seen after a panic
+ * reboot: L1 1080x2400 pitch 4320 at 0x7c606000); the double buffer was then off and every copy went to the buffer on
+ * screen (tearing bands while scrolling). The third buffer is used instead.
  */
 bool
 AppleCLCD::flipSetup(char **out, char *end)
 {
 	fFlipReady = false;
 	dropNext();
-	uint64_t size = (uint64_t)fRowBytes * fHeight, pa1 = fPhys + size;
+	uint64_t size = (uint64_t)fRowBytes * fHeight, pa1 = 0;
 	const char *why = NULL;
 	if (fScanOvl < 0 && !findLKLayer(out, end)) {
 		why = "LK's layer not found";
 	} else if (fLkAddr != fPhys) {
 		why = "LK's layer does not read the boot framebuffer";
-	} else if (pa1 + size > (1ull << 32)) {
-		why = "LK's next buffer above 4 GiB";
-	} else if (layerReads(pa1, pa1 + size)) {
-		why = "another OVL layer reads LK's next buffer";
 	} else {
+		why = "another OVL layer reads each of LK's other buffers";
+		for (uint32_t k = 1; k < SWEET_FB_LK_BUFFERS; k++) {
+			uint64_t pa = fPhys + size * k;
+			if (pa + size > (1ull << 32)) {
+				why = "LK's other buffers above 4 GiB";
+				break;
+			}
+			if (!layerReads(pa, pa + size)) {
+				pa1 = pa;
+				why = NULL;
+				break;
+			}
+		}
+	}
+	if (why == NULL) {
+		if (fBuf1Map != NULL && fBufPA[1] != pa1) {
+			fBuf1Map->release();    /* "disp flip on" after LK's layers changed: another buffer now */
+			fBuf1Map = NULL;
+		}
 		if (fBuf1Map == NULL) {
 			IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(pa1, size, kIODirectionInOut);
 			fBuf1Map = md != NULL ? md->map(kIOMapWriteCombineCache) : NULL;
 			OSSafeReleaseNULL(md);
 		}
 		if (fBuf1Map == NULL) {
-			why = "LK's next buffer not mappable";
+			why = "LK's other buffer not mappable";
 		} else {
 			fBufKVA[1] = (uintptr_t)fBuf1Map->getVirtualAddress();
 			fBufPA[1] = pa1;
