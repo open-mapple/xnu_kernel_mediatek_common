@@ -162,6 +162,25 @@ sweet_surface_before_device_read(SweetSurface *s)
 	return OSCompareAndSwap(1, 0, &s->cpuDirty) ? sweet_surface_clean(s) : 0;
 }
 
+/* New contents for whoever compares seeds (the Metal driver copies a surface in again only when it moved). */
+void
+sweet_surface_seed_bump(SweetSurface *s)
+{
+	if (s->state != NULL) {
+		OSIncrementAtomic((volatile SInt32 *)((uint8_t *)s->state->getBytesNoCopy() + SWEET_SURFACE_STATE_SEED));
+	}
+}
+
+/* The kernel wrote the pixels with the CPU (scaler): like an IOSurfaceUnlock after a write lock. */
+void
+sweet_surface_cpu_wrote(SweetSurface *s)
+{
+	if (OSDynamicCast(IOBufferMemoryDescriptor, s->memory) != NULL) {
+		OSCompareAndSwap(0, 1, &s->cpuDirty);
+	}
+	sweet_surface_seed_bump(s);
+}
+
 uint64_t
 sweet_surface_before_cpu_access(SweetSurface *s)
 {

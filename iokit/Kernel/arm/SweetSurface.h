@@ -92,6 +92,9 @@ SweetSurface *sweet_surface_create_physical(uint64_t phys, uint32_t width,
 uint64_t sweet_surface_before_device_read(SweetSurface *surface);
 uint64_t sweet_surface_before_cpu_access(SweetSurface *surface);
 void sweet_surface_device_wrote(SweetSurface *surface);
+/* new seed (contents changed outside a lock); cpu_wrote = CPU-dirty + new seed (the kernel wrote it, VivaScaler) */
+void sweet_surface_seed_bump(SweetSurface *surface);
+void sweet_surface_cpu_wrote(SweetSurface *surface);
 
 /*
  * viva GPU (VivaGPU.cpp), any thread but the GPU's work loop: no GPU job using the surface is pending (true when

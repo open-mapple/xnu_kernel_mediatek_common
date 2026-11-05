@@ -27,6 +27,10 @@ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitc
 iokit/Kernel/arm/VivaBattery.cpp                                 optional iokitcpp
 iokit/Kernel/arm/VivaWiFi.cpp                                    optional iokitcpp
 iokit/Kernel/arm/VivaWLAN.cpp                                    optional iokitcpp
+iokit/Kernel/arm/VivaScaler.cpp                                  optional iokitcpp
+iokit/Kernel/arm/VivaMDP.cpp                                     optional iokitcpp
+iokit/Kernel/arm/VivaJPEGHW.cpp                                  optional iokitcpp
+iokit/Kernel/arm/VivaJPEG.cpp                                    optional iokitcpp
 iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
 iokit/Kernel/arm/hid/VivaKeypad.cpp                              optional iokitcpp
 iokit/Kernel/arm/hid/VivaPMICKeys.cpp                            optional iokitcpp
