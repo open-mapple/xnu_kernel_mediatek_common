@@ -54,6 +54,7 @@
 #include <libkern/c++/OSNumber.h>
 #include <libkern/c++/OSUnserialize.h>
 #include <sys/proc.h>
+#include <pexpert/pexpert.h>
 
 enum {
 	kSweetSurfaceCreate             = 0,
@@ -105,6 +106,21 @@ static uint64_t      sweet_surface_contig;      /* bytes of contiguous (scanout)
 #define SWEET_SURFACE_CONTIG_MAX        (96ull << 20)
 #define SWEET_SURFACE_WIRED_MAX         (1536ull << 20)
 
+/*
+ * 0184 display page pool (SweetSurface.h). Lock-free: a buffer is published before the count that covers it, and a
+ * slot is taken / given back with a compare-and-swap (a surface may be freed with the table lock held).
+ */
+#define SWEET_SURFACE_POOL_MAX          8
+static IOBufferMemoryDescriptor *sweet_surface_pool[SWEET_SURFACE_POOL_MAX];
+static volatile UInt32 sweet_surface_pool_used[SWEET_SURFACE_POOL_MAX];
+static int           sweet_surface_pool_rc[SWEET_SURFACE_POOL_MAX];      /* retain count with only the pool holding it */
+static volatile UInt32 sweet_surface_pool_count;
+static uint32_t      sweet_surface_pool_size;
+static uint64_t      sweet_surface_from_pool, sweet_surface_from_contig, sweet_surface_sparse;
+/* 0184 (P6) */
+static int           sweet_surface_pitch64 = -1;        /* vivasurfpitch, read at the first create */
+static uint64_t      sweet_surface_pitch_rounds;
+
 OSDefineMetaClassAndStructors(SweetSurface, OSObject);
 
 void
@@ -113,11 +129,15 @@ SweetSurface::free()
 	if (OSDynamicCast(IOBufferMemoryDescriptor, memory) != NULL) {
 		OSAddAtomic64(-(SInt64)allocSize, (volatile SInt64 *)&sweet_surface_wired);
 	}
-	if (contig) {
+	if (contig && poolSlot < 0) {
 		OSAddAtomic64(-(SInt64)allocSize, (volatile SInt64 *)&sweet_surface_contig);
 	}
 	OSSafeReleaseNULL(kernelMap);
 	OSSafeReleaseNULL(memory);
+	if (poolSlot >= 0) {
+		/* the pool keeps its own reference: the buffer is free again once the surface's is gone */
+		OSCompareAndSwap(1, 0, &sweet_surface_pool_used[poolSlot]);
+	}
 	OSSafeReleaseNULL(state);
 	OSSafeReleaseNULL(values);
 	OSSafeReleaseNULL(gpuFence);
@@ -295,6 +315,7 @@ sweet_surface_alloc(void)
 		OSSafeReleaseNULL(s);
 		return NULL;
 	}
+	s->poolSlot = -1;
 	s->state = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
 	    kIODirectionInOut | kIOMemoryKernelUserShared, page_size, page_size);
 	if (s->state == NULL) {
@@ -428,6 +449,35 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
 	}
 
 	uint64_t alloc = sweet_dict_u32(props, "IOSurfaceAllocSize", 0);
+	/*
+	 * 0184 (P6 of gpu/docs/ANALISI-PRESTAZIONI-2026-11-06.md): a client pitch that is not a multiple of 64 (CA's
+	 * home snapshot 1125x2436 with 4512, LA08 230x186 with 480) cannot be imported by the GPU, which copied such
+	 * surfaces in and out at every use (10.7 MB each way, 23 ms stalls on the GPU queue). Single-plane surfaces get
+	 * the pitch rounded up: clients read it back from the lock result (+0x28; CA, ImageIO, IOSurface.framework).
+	 * Not when an explicit IOSurfaceAllocSize would no longer hold the rows (the client laid the memory out
+	 * itself), nor with an offset or a parent. Boot-arg vivasurfpitch=0: never.
+	 */
+	if (sweet_surface_pitch64 < 0) {
+		int on = 1;
+		PE_parse_boot_argn("vivasurfpitch", &on, sizeof(on));
+		sweet_surface_pitch64 = on != 0;
+	}
+	if (sweet_surface_pitch64 && planes == NULL && s->offset == 0 && s->parentID == 0 &&
+	    (s->bytesPerRow & (SWEET_SURFACE_ROW_ALIGN - 1)) != 0 && props->getObject("IOSurfaceBytesPerRow") != NULL) {
+		uint64_t row = ((uint64_t)s->bytesPerRow + SWEET_SURFACE_ROW_ALIGN - 1) & ~(uint64_t)(SWEET_SURFACE_ROW_ALIGN - 1);
+		uint64_t rend = row * sweet_div_up(s->height, s->elementHeight);
+		bool ok = row <= UINT32_MAX && (alloc == 0 || rend <= alloc);
+		static volatile SInt32 logged;
+		if (OSIncrementAtomic(&logged) < 16) {
+			IOLog("SWEET SURF: %ux%u fmt 0x%x pitch %u %s %llu%s\n", s->width, s->height, s->pixelFormat,
+			    s->bytesPerRow, ok ? "->" : "kept (alloc size", ok ? row : alloc, ok ? "" : ")");
+		}
+		if (ok) {
+			s->bytesPerRow = (uint32_t)row;
+			end = rend;
+			OSIncrementAtomic64((volatile SInt64 *)&sweet_surface_pitch_rounds);
+		}
+	}
 	if (alloc < end) {
 		alloc = end;
 	}
@@ -759,6 +809,84 @@ IOSurfaceRootUserClient::returnSurface(SweetSurface *s, IOExternalMethodArgument
 	return ret;
 }
 
+uint32_t
+sweet_surface_pool_init(uint32_t w, uint32_t h, uint32_t count)
+{
+	static volatile UInt32 busy;
+	count = count > SWEET_SURFACE_POOL_MAX ? SWEET_SURFACE_POOL_MAX : count;
+	/* room for any 64-byte aligned pitch up to 256 bytes wider than the row */
+	uint32_t size = (uint32_t)round_page((uint64_t)((w * 4 + 255) & ~255u) * h);
+	uint32_t have = sweet_surface_pool_count, made = 0;
+	if ((have != 0 && sweet_surface_pool_size != size) || !OSCompareAndSwap(0, 1, &busy)) {
+		return have;            /* another size already, or another caller is filling it */
+	}
+	for (uint32_t i = have; i < count; i++) {
+		IOBufferMemoryDescriptor *mem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+		    kIODirectionInOut | kIOMemoryKernelUserShared | kIOMemoryPhysicallyContiguous, size, 0x00000000ffffc000ull);
+		if (mem == NULL) {
+			break;
+		}
+		sweet_surface_pool[i] = mem;
+		sweet_surface_pool_rc[i] = mem->getRetainCount();      /* the pool's own + the kernel mapping's */
+		sweet_surface_pool_size = size;
+		OSSynchronizeIO();
+		sweet_surface_pool_count = i + 1;
+		made++;
+	}
+	busy = 0;
+	IOLog("SWEET SURF: display page pool: %u buffers of %u KiB for %ux%u (%u new, vivafbpool=%u)\n",
+	    have + made, size >> 10, w, h, made, count);
+	return have + made;
+}
+
+void
+sweet_surface_pool_stats(uint32_t *buffers, uint32_t *inUse, uint64_t *fromPool, uint64_t *fromContig,
+    uint64_t *sparse, uint32_t *poolKiB)
+{
+	*buffers = sweet_surface_pool_count;
+	*inUse = 0;
+	for (uint32_t i = 0; i < *buffers; i++) {
+		*inUse += sweet_surface_pool_used[i] != 0;
+	}
+	*fromPool = sweet_surface_from_pool;
+	*fromContig = sweet_surface_from_contig;
+	*sparse = sweet_surface_sparse;
+	*poolKiB = sweet_surface_pool_size >> 10;
+}
+
+uint64_t
+sweet_surface_pitch_rounded(void)
+{
+	return sweet_surface_pitch_rounds;
+}
+
+/*
+ * 0184: a free pool buffer for `size` bytes (retained, slot in *slot), or NULL. A buffer someone else still
+ * holds (a mapping or an import that outlived its surface) is skipped.
+ */
+static IOBufferMemoryDescriptor *
+sweet_surface_pool_take(uint32_t size, int8_t *slot)
+{
+	uint32_t n = sweet_surface_pool_count;
+	if (size > sweet_surface_pool_size) {
+		return NULL;
+	}
+	for (uint32_t i = 0; i < n; i++) {
+		if (!OSCompareAndSwap(0, 1, &sweet_surface_pool_used[i])) {
+			continue;
+		}
+		IOBufferMemoryDescriptor *mem = sweet_surface_pool[i];
+		if (mem->getRetainCount() != sweet_surface_pool_rc[i]) {
+			sweet_surface_pool_used[i] = 0;
+			continue;
+		}
+		mem->retain();
+		*slot = (int8_t)i;
+		return mem;
+	}
+	return NULL;
+}
+
 IOReturn
 IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
 {
@@ -801,18 +929,28 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
 		IOBufferMemoryDescriptor *mem = NULL;
 		if ((uint64_t)OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_wired) +
 		    s->allocSize <= SWEET_SURFACE_WIRED_MAX) {
-			if (sweet_surface_scanout_w != 0 && s->width == sweet_surface_scanout_w &&
-			    s->height == sweet_surface_scanout_h && s->bytesPerElement == 4 && s->planeCount == 0 &&
-			    sweet_surface_contig + s->allocSize <= SWEET_SURFACE_CONTIG_MAX) {
+			bool display = sweet_surface_scanout_w != 0 && s->width == sweet_surface_scanout_w &&
+			    s->height == sweet_surface_scanout_h && s->bytesPerElement == 4 && s->planeCount == 0;
+			if (display) {
+				/* 0184: the boot-time pool first (fragmentation made the allocation below fail for 60 % of pages) */
+				mem = sweet_surface_pool_take(s->allocSize, &s->poolSlot);
+				if (mem != NULL) {
+					s->contig = true;
+					sweet_surface_from_pool++;
+				}
+			}
+			if (mem == NULL && display && sweet_surface_contig + s->allocSize <= SWEET_SURFACE_CONTIG_MAX) {
 				/* the display's DMA has no IOMMU here: one physical range below 4 GiB, 16 KiB aligned */
 				mem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task, kIODirectionInOut |
 				    kIOMemoryKernelUserShared | kIOMemoryPhysicallyContiguous, s->allocSize, 0x00000000ffffc000ull);
 				if (mem != NULL) {
 					OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_contig);
 					s->contig = true;
+					sweet_surface_from_contig++;
 				}
 			}
 			if (mem == NULL) {
+				sweet_surface_sparse += display;
 				mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
 				    kIODirectionInOut | kIOMemoryKernelUserShared, s->allocSize, page_size);
 			}

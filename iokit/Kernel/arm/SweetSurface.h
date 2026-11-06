@@ -50,6 +50,7 @@ public:
 
 	OSDictionary             *values;       /* IOSurfaceSetValue (non-bulk), under the surface table lock */
 	bool                      contig;       /* physically contiguous below 4 GiB (scanout candidate) */
+	int8_t                    poolSlot;     /* 0184: buffer of the display page pool, -1 = none */
 
 	/*
 	 * viva GPU (VivaGPU.cpp, under its gate): fence of the last GPU job that used the surface, from any
@@ -123,6 +124,24 @@ extern volatile uint32_t sweet_fb_gpu_waits;
  * 4-byte single-plane surfaces are allocated physically contiguous below 4 GiB when possible.
  */
 extern uint32_t sweet_surface_scanout_w, sweet_surface_scanout_h;
+
+/*
+ * 0184 (P2 of gpu/docs/ANALISI-PRESTAZIONI-2026-11-06.md): `count` (vivafbpool, default 4, at most 8) physically
+ * contiguous buffers below 4 GiB for w x h 4-byte surfaces, taken once at boot before memory fragments. Display-sized
+ * surfaces (sweet_surface_scanout_w/h) get one of them first, a fresh contiguous allocation second, sparse memory
+ * last; a buffer goes back to the pool when its surface is freed. Called by AppleCLCD when scanout is on; returns
+ * the buffers the pool has (it only grows). Stats: pool buffers, in use, and surfaces of display size created from
+ * the pool, from a contiguous allocation, sparse; *poolKiB = size of one buffer.
+ */
+uint32_t sweet_surface_pool_init(uint32_t w, uint32_t h, uint32_t count);
+void sweet_surface_pool_stats(uint32_t *buffers, uint32_t *inUse, uint64_t *fromPool, uint64_t *fromContig,
+    uint64_t *sparse, uint32_t *poolKiB);
+
+/*
+ * 0184 (P6): client bytes-per-row values rounded up to 64 (the GPU imports only 64-byte aligned pitches; others were
+ * copied in and out at every use). Boot-arg vivasurfpitch=0: as the client asked. Count of rounded surfaces.
+ */
+uint64_t sweet_surface_pitch_rounded(void);
 
 /* Send right for the surface in task (IOSurfaceLookupFromMachPort). */
 mach_port_name_t sweet_surface_port_in_task(SweetSurface *surface, task_t task);

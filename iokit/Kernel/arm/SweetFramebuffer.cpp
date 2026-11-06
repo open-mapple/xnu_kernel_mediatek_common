@@ -84,6 +84,7 @@
 
 extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
 extern "C" void (*sweet_fb_panic_hook)(void);   /* pexpert/arm/pe_serial.c */
+extern "C" void viva_cpufreq_ui_activity(void);        /* osfmk/arm64/viva_cpufreq.c: 0183 UI boost */
 
 #if defined(SWEET)
 #include <IOKit/IOService.h>
@@ -174,6 +175,19 @@ public:
 	OSArray      *fClients;
 	uint32_t      fSwapID;
 	uint64_t      fSwapWaitBusy, fSwapWaitSlept;      /* SwapWait answered busy / had to block */
+	uint32_t      fPoolWant;                          /* 0184: vivafbpool */
+	/*
+	 * 0184 (P3 of gpu/docs/ANALISI-PRESTAZIONI-2026-11-06.md): why SwapWait was not done, by what held the swap
+	 * when it was asked (WAIT_QUEUED: waiting for the GPU or a copy; WAIT_NEXT: chosen, switch at the next frame
+	 * end; WAIT_SHOWN: the layer reads its page; WAIT_OTHER), for busy answers and blocking waits; and how long
+	 * from the first "not done" until done (busy: the next SwapWait that said done; blocking: the wait itself).
+	 */
+	enum { WAIT_QUEUED, WAIT_NEXT, WAIT_SHOWN, WAIT_OTHER, WAIT_WHY };
+	uint64_t      fWaitBusyWhy[WAIT_WHY], fWaitSleptWhy[WAIT_WHY];
+	uint32_t      fBusySwap, fBusyWhy;            /* swap of the last busy answer, 0 = none open */
+	uint64_t      fBusyAt;
+	uint32_t      waitWhy(uint32_t swap);
+	void          waitResult(uint32_t swap, bool done);
 	bool          fConsolePaused;
 	uint8_t       fPending[SWEET_FB_SWAP_REC_SIZE];     /* latest swap (redrawn when the display comes on) */
 	bool          fDirty;
@@ -185,6 +199,7 @@ public:
 	 * SwapEnd, last vsync notification -> SwapEnd (CoreAnimation's render time); sums, counts and maxima in mach time.
 	 */
 	struct LatStat { uint64_t sum, n, max; } fLatReady, fLatFlip, fLatSwap, fLatRender;
+	LatStat       fLatWait[4];                    /* 0184: first "not done" -> done, per WAIT_* reason */
 	uint64_t      fLatReadyHist[5];               /* SwapEnd -> chosen in frames: <1, <2, <3, <4, more */
 	uint64_t      fLastSwapAt, fLastNotifyAt, fNextChosenAt;
 	uint64_t      fTickPresents;                  /* 0135: frames chosen at a tick before its frame end (scanout) */
@@ -402,6 +417,12 @@ AppleCLCD::start(IOService *provider)
 		sweet_surface_scanout_w = fLogicalW;
 		sweet_surface_scanout_h = fLogicalH;
 		fScanOn = true;
+		/* 0184: CoreAnimation's pages from a pool taken now, before memory fragments (vivafbpool, 0 = none) */
+		fPoolWant = 4;
+		PE_parse_boot_argn("vivafbpool", &fPoolWant, sizeof(fPoolWant));
+		if (fPoolWant != 0) {
+			sweet_surface_pool_init(fLogicalW, fLogicalH, fPoolWant);
+		}
 	}
 	gSweetFB = this;
 	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
@@ -723,6 +744,7 @@ AppleCLCD::swap(const uint8_t *rec)
 	}
 	fDirty = true;
 	IOLockUnlock(fLock);
+	viva_cpufreq_ui_activity();     /* 0183: frames are being drawn: CPU clusters out of the floor */
 	earlyKick();                    /* shown right away if the GPU has already finished it */
 	/* the format of every layer CoreAnimation sets (SwapSetLayer), logged when it changes */
 	uint32_t mask = get32(rec, 0x104);
@@ -1327,6 +1349,47 @@ AppleCLCD::swapDone(uint32_t swap, uint32_t op)
 	}
 }
 
+/* 0184: what holds a swap that SwapWait found not done. */
+uint32_t
+AppleCLCD::waitWhy(uint32_t swap)
+{
+	uint32_t why = WAIT_OTHER;
+	IOLockLock(fLock);
+	for (uint32_t i = 0; i < fQueueCount; i++) {
+		if (get32(fQueue[i], 0x50) == swap) {
+			why = WAIT_QUEUED;
+		}
+	}
+	IOLockUnlock(fLock);
+	if (why == WAIT_OTHER && swap != 0 && fNextSwap == swap) {
+		why = WAIT_NEXT;
+	} else if (why == WAIT_OTHER && swap != 0 && fShownSwap == swap) {
+		why = WAIT_SHOWN;
+	}
+	return why;
+}
+
+/* 0184: a non-blocking SwapWait(swap) answered done or busy. Counters only. */
+void
+AppleCLCD::waitResult(uint32_t swap, bool done)
+{
+	uint64_t now = mach_absolute_time();
+	if (!done) {
+		uint32_t why = waitWhy(swap);
+		fWaitBusyWhy[why]++;
+		if (fBusySwap != swap) {
+			fBusySwap = swap;
+			fBusyWhy = why;
+			fBusyAt = now;
+		}
+	} else if (fBusySwap == swap && swap != 0) {
+		IOLockLock(fLock);
+		latAdd(&fLatWait[fBusyWhy], now - fBusyAt);
+		IOLockUnlock(fLock);
+		fBusySwap = 0;
+	}
+}
+
 /* Any enabled OVL layer (except LK's) reading [lo, hi). */
 bool
 AppleCLCD::layerReads(uint64_t lo, uint64_t hi)
@@ -1649,6 +1712,15 @@ AppleCLCD::dispCommand(const char *args, char *out, size_t len)
 			fScanOn = true;
 			sweet_surface_scanout_w = fLogicalW;
 			sweet_surface_scanout_h = fLogicalH;
+			if (fPoolWant == 0) {
+				fPoolWant = 4;
+				PE_parse_boot_argn("vivafbpool", &fPoolWant, sizeof(fPoolWant));
+			}
+			if (fPoolWant != 0) {
+				IOLockUnlock(fScanLock);        /* allocates (may take a while): never under the display locks */
+				sweet_surface_pool_init(fLogicalW, fLogicalH, fPoolWant);
+				IOLockLock(fScanLock);
+			}
 			fDirty = true;
 			disp_say(&p, end, "scanout on (surfaces created from now on can be scanned out; CA allocates its "
 			    "framebuffers at start: boot with vivascanout=1)\n");
@@ -1666,6 +1738,11 @@ AppleCLCD::dispCommand(const char *args, char *out, size_t len)
 		bzero(&fLatSwap, sizeof(fLatSwap));
 		bzero(&fLatRender, sizeof(fLatRender));
 		bzero(fLatReadyHist, sizeof(fLatReadyHist));
+		bzero(fLatWait, sizeof(fLatWait));
+		bzero(fWaitBusyWhy, sizeof(fWaitBusyWhy));
+		bzero(fWaitSleptWhy, sizeof(fWaitSleptWhy));
+		fSwapWaitBusy = fSwapWaitSlept = 0;
+		fBusySwap = 0;
 		fTickPresents = 0;
 		fTickLate = fTickLateSum = fTickLateMax = fTickEarly = fTickEarlySum = fTickWidePolls = 0;
 		fFlips = fFlipEarly = fFlipMissed = fFlipUnsure = 0;
@@ -1707,6 +1784,16 @@ AppleCLCD::dispCommand(const char *args, char *out, size_t len)
 		    fCopies ? fCopyNs / fCopies / 1000 : 0);
 		disp_say(&p, end, "lat_swap_gpu_avg_us=%llu\nlat_chosen_screen_avg_us=%llu\nearly_shown=%llu\nflip=%d\n"
 		    "swapwait_busy=%llu\n", r, f, fEarlyShown, fFlipReady ? 1 : 0, fSwapWaitBusy);
+		{
+			uint32_t pb = 0, pu = 0, pk = 0;
+			uint64_t fp = 0, fc = 0, sp = 0;
+			sweet_surface_pool_stats(&pb, &pu, &fp, &fc, &sp, &pk);
+			disp_say(&p, end, "pool_buffers=%u\npool_in_use=%u\npages_pool=%llu\npages_contig=%llu\npages_sparse=%llu\n"
+			    "pitch_rounded=%llu\n", pb, pu, fp, fc, sp, sweet_surface_pitch_rounded());
+			disp_say(&p, end, "swapwait_busy_queued=%llu\nswapwait_busy_next=%llu\nswapwait_busy_shown=%llu\n"
+			    "swapwait_slept=%llu\n", fWaitBusyWhy[WAIT_QUEUED], fWaitBusyWhy[WAIT_NEXT], fWaitBusyWhy[WAIT_SHOWN],
+			    fSwapWaitSlept);
+		}
 	} else {
 		disp_say(&p, end, "display %ux%u (shown as %ux%u), scanout %s%s, layer %s, %llu frames scanned out, "
 		    "%llu copied%s%s\n", fWidth, fHeight, fLogicalW, fLogicalH, fScanOn ? "on" : "off",
@@ -1735,6 +1822,23 @@ AppleCLCD::dispCommand(const char *args, char *out, size_t len)
 		    fEarly ? "on" : "off", fEarlyRuns, fEarlyShown);
 		disp_say(&p, end, "SwapWait: %llu busy answers (CA keeps the page), %llu blocking waits; layer reads swap %u, "
 		    "next swap %u\n", fSwapWaitBusy, fSwapWaitSlept, fShownSwap, fNextSwap);
+		{
+			static const char *const kWhy[WAIT_WHY] = { "queued (GPU/copy)", "chosen, switch pending", "on screen", "other" };
+			uint64_t swaps = fLatSwap.n ? fLatSwap.n : 1;
+			disp_say(&p, end, "SwapWait not done (0184), per 100 swaps busy/blocking, first not-done -> done avg/max us:");
+			for (int w = 0; w < WAIT_WHY; w++) {
+				disp_say(&p, end, "%s %s %llu/%llu %llu/%llu", w ? ";" : "", kWhy[w], fWaitBusyWhy[w] * 100 / swaps,
+				    fWaitSleptWhy[w] * 100 / swaps, absUsFB(fLatWait[w].n ? fLatWait[w].sum / fLatWait[w].n : 0),
+				    absUsFB(fLatWait[w].max));
+			}
+			disp_say(&p, end, "\n");
+			uint32_t pb = 0, pu = 0, pk = 0;
+			uint64_t fp = 0, fc = 0, sp = 0;
+			sweet_surface_pool_stats(&pb, &pu, &fp, &fc, &sp, &pk);
+			disp_say(&p, end, "display pages (0184): pool %u x %u KiB (%u in use, vivafbpool), created from the pool %llu, "
+			    "contiguous %llu, sparse %llu; client pitches rounded to 64: %llu\n", pb, pk, pu, fp, fc, sp,
+			    sweet_surface_pitch_rounded());
+		}
 		uint64_t pns = 0, polls = fPolls ? fPolls : 1, pollNs;
 		absolutetime_to_nanoseconds(fPeriod, &pns);
 		absolutetime_to_nanoseconds(fPollAbs / polls, &pollNs);
@@ -1908,14 +2012,18 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
 		uint32_t ms = args->scalarInputCount > 2 ? (uint32_t)args->scalarInput[2] : 0;
 		uint32_t op = opts & 7;
 		if (fFB->swapDone(swap, op)) {
+			fFB->waitResult(swap, true);
 			break;
 		}
 		if (opts & 0x80000000u) {
 			ret = kIOReturnBusy;
 			fFB->fSwapWaitBusy++;
+			fFB->waitResult(swap, false);
 			break;
 		}
 		/* block (the calling thread only): re-check every millisecond, at most the timeout or 5 s */
+		uint32_t why = fFB->waitWhy(swap);
+		uint64_t t0 = mach_absolute_time();
 		ms = (ms == 0 || ms > 5000) ? 5000 : ms;
 		ret = kIOReturnTimeout;
 		for (uint32_t t = 0; t < ms; t++) {
@@ -1926,6 +2034,12 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
 			}
 		}
 		fFB->fSwapWaitSlept++;
+		fFB->fWaitSleptWhy[why]++;
+		if (ret == kIOReturnSuccess) {
+			IOLockLock(fFB->fLock);
+			AppleCLCD::latAdd(&fFB->fLatWait[why], mach_absolute_time() - t0);
+			IOLockUnlock(fFB->fLock);
+		}
 		break;
 	}
 	default:
