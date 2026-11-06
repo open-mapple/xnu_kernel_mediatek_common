@@ -46,6 +46,8 @@
 #include "VivaPMIC.h"
 #include "SweetSurface.h"
 
+extern "C" void viva_cpufreq_boost_stats(int *on, uint64_t *starts, uint64_t *ms, uint64_t *signals);  /* 0183 */
+
 #ifndef MIN
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #endif
@@ -4026,6 +4028,13 @@ VivaGPUAccelerator::linkCommand(const char *args, char *out, size_t outLen)
 			    (fRunning[0] != NULL) + (fRunning[1] != NULL), (fQueue[0] != NULL) + (fQueue[1] != NULL));
 			say(o, end, "job_faults=%llu\nmmu_faults=%llu\ngpu_faults=%llu\ntimeouts=%llu\nresets=%llu\nheap_grows=%llu\n",
 			    fJobFaults, fMmuFaults, fGpuFaults, fTimeouts, fResets, fHeapGrows);
+			{
+				int bon = 0;
+				uint64_t bstarts = 0, bms = 0, bsig = 0;
+				viva_cpufreq_boost_stats(&bon, &bstarts, &bms, &bsig);
+				say(o, end, "cpu_boost=%d\ncpu_boosts=%llu\ncpu_boost_ms=%llu\ncpu_boost_signals=%llu\n", bon, bstarts,
+				    bms, bsig);
+			}
 			say(o, end, "mem_kib=%lld\nmem_peak_kib=%lld\nmem_limit_mib=%lld\nmem_proc_mib=%lld\nmem_refusals=%llu\n"
 			    "busy_ns=%llu\nvgpu_mv=%u\nvsram_mv=%u\n", fMemory >> 10, fMemPeak >> 10, fMemLimit >> 20,
 			    fProcLimit >> 20, fMemRefused, bns, UV(tvg) / 1000, UV(tvs) / 1000);

@@ -32,6 +32,8 @@
 #include "SweetHIDTouch.h"
 #include "../VivaIO.h"
 
+extern "C" void viva_cpufreq_ui_activity(void);        /* osfmk/arm64/viva_cpufreq.c: 0183 UI boost */
+
 #define GT_REG_TEST             0x4100
 #define GT_EVENT_TOUCH          0x80
 #define GT_EVENT_REQUEST        0x40
@@ -300,6 +302,7 @@ VivaGT9896::handleEvent(void)
 	}
 
 	fEvents++;
+	viva_cpufreq_ui_activity();     /* 0183: the CPU clusters ramp while a finger is down */
 	uint32_t map = 0;
 	const uint8_t *c = buf + GT_HEAD_LEN;
 	for (uint32_t i = 0; i < n; i++, c += GT_BYTES_PER_COORD) {
