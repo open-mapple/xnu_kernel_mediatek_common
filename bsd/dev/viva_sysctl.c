@@ -11,6 +11,7 @@
  *   active slot's boot partition (androidboot.slot_suffix, else boot_b): read by everybody, written by root
  *   (bsd/dev/sweet_ufs.c sweet_ufs_bootargs: one 4 KiB block, checked, read back).
  * kern.viva_nextbootargs_orig: what that partition held the first time either sysctl was used (for "restore").
+ * kern.viva_linkstate (0182): USB state for the SpringBoard island: 0 no host, 1 standard, 2 Viva Link active.
  */
 #if defined(ARM64_BOARD_CONFIG_SWEET)
 #include <sys/param.h>
@@ -134,6 +135,20 @@ sysctl_viva_link SYSCTL_HANDLER_ARGS
 
 SYSCTL_PROC(_kern, OID_AUTO, viva_link, CTLTYPE_OPAQUE | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
     0, 0, sysctl_viva_link, "-", "viva link commands (KA1)");
+
+/* kern.viva_linkstate (0182): 0 no USB host, 1 a host configured the device (standard), 2 Viva Link active. */
+extern int viva_usb_state(void);                                            /* bsd/dev/viva_usb.c */
+
+static int
+sysctl_viva_linkstate SYSCTL_HANDLER_ARGS
+{
+#pragma unused(oidp, arg1, arg2)
+	int state = viva_usb_state();
+	return SYSCTL_OUT(req, &state, sizeof(state));
+}
+
+SYSCTL_PROC(_kern, OID_AUTO, viva_linkstate, CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED,
+    0, 0, sysctl_viva_linkstate, "I", "USB: 0 no host, 1 standard, 2 Viva Link active");
 
 /* ---- KA2 ---- */
 

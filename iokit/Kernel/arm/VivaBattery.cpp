@@ -33,8 +33,8 @@
  * WATCHDOG are ever written, read-modify-write, each one read back. Gauge
  * values outside 3800..4500 mV / 0..6000 mA, or an unknown PN: no writes.
  * Input limit (boot-arg vivachargein, default 2000 mA, 0 = off): D+/D- are on the USB PHY, so BC1.2 says "unknown
- * adapter" (500 mA); with no USB host on the link the cable is a wall charger and REG00 IINLIM goes to that value
- * (VINDPM protects a weak adapter); a host configuring the link brings it back to 500 mA.
+ * adapter" (500 mA); unless the Viva Link host tool is active (0182: its heartbeat, not just a configured USB host)
+ * REG00 IINLIM goes to that value (VINDPM protects a weak adapter or port); the tool brings it back to 500 mA.
  * Charge limit (boot-arg vivachargelimit=N, sysctl kern.viva_chargelimit,
  * default 100 = off): CHG_CONFIG off at N %, back on below N - 5 %.
  *
@@ -409,8 +409,8 @@ VivaBattery::maintainCharger(VivaBatterySample *s)
 	}
 	/*
 	 * Input limit. D+/D- go to the USB PHY (usb_switch GPIOs left as LK set them), so the charger's BC1.2 detection
-	 * sees an "unknown adapter" and stays at 500 mA. Without a USB host on the link it is a wall charger: 2000 mA
-	 * (fInputMa); the charger's VINDPM backs off if the adapter sags. With a host (or SDP/CDP detected): untouched.
+	 * sees an "unknown adapter" and stays at 500 mA. Unless the Viva Link tool is active it gets 2000 mA (fInputMa),
+	 * also from a computer (0182); the charger's VINDPM backs off if the source sags. SDP/CDP detected: untouched.
 	 */
 	uint32_t vbusStat = s->r[CHG_REG0B] >> 5;
 	bool pg = (s->r[CHG_REG0B] & 0x04) != 0;
@@ -419,7 +419,7 @@ VivaBattery::maintainCharger(VivaBatterySample *s)
 		uint32_t steps = MIN((fInputMa - 100) / 50, (uint32_t)R00_IINLIM);
 		chgUpdate(CHG_REG00, R00_IINLIM, (uint8_t)steps);
 	} else if (fInputMa != 0 && pg && viva_usb_host_configured() && (s->r[CHG_REG00] & R00_IINLIM) > 8) {
-		chgUpdate(CHG_REG00, R00_IINLIM, 8);            /* a computer after a charger: back to 500 mA */
+		chgUpdate(CHG_REG00, R00_IINLIM, 8);            /* the Viva Link tool came: back to 500 mA */
 	}
 	/* charge limit with 5 % hysteresis */
 	bool hold = fLimitHold;
@@ -643,6 +643,15 @@ void
 VivaBattery::lowPowerChanged(void)
 {
 	pollNow();
+}
+
+/* viva_usb.c: the Viva Link tool came or went (input limit). */
+extern "C" void
+viva_battery_usb_changed(void)
+{
+	if (gVivaBattery != NULL) {
+		gVivaBattery->pollNow();
+	}
 }
 
 bool
