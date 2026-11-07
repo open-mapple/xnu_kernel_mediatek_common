@@ -84,6 +84,14 @@
  * (vivapanelidle=ms) or with the display off, as ProMotion does; the switch is locked to frame ends. Default 60. With 120 or auto at boot the service also publishes
  * IOMFBDisplayRefresh (min refresh interval 8.333 ms), which QuartzCore reads when backboardd starts.
  *
+ * Brightness and Night Shift (0191). CoreBrightness sets IOMFBBrightnessLevel on this service (CFNumber, nits in 16.16
+ * fixed point; SetIOMFBBrightness in CoreBrightness, iOS 16.7): the panel takes DCS 51 HH LL, 0..2047 for its
+ * normal range (Xiaomi lcm_setbacklight_cmdq), sent through VM_CMD at the next vsync tick (fades coalesce);
+ * vivapanelnits (500) = the nits of level 2047; link "disp bl N". QuartzCore's color matrices arrive through
+ * selector 55 (IOMobileFramebufferSetMatrix: scalar = which matrix, 9 x int64 signed 32.32, row-major); their product goes to the
+ * display pipe's CCORR (0x1400b000, Xiaomi mtk_disp_ccorr.c: 3x3, 1.0 = 0x800 on MT6781, 13-bit signed, two per
+ * register; CFG bit 0 relay / bit 1 engine). Identity = relay (bypass).
+ *
  * The panel memory itself is published as an IOSurface and returned as the
  * default framebuffer surface. The kernel text console keeps drawing over
  * the GUI by default: boot-arg sweetfb_noconsole=1 stops drawing it from
@@ -242,8 +250,8 @@ public:
 
 	/* viva direct scanout (see the top) */
 	IOLock       *fScanLock;      /* scanout state: present() vs. the link command */
-	IOMemoryMap  *fDispMap[5];    /* OVL0, OVL0_2L, SMI larb0, larb1, DSI0 (0189) */
-	vm_offset_t   fDisp[5];
+	IOMemoryMap  *fDispMap[6];    /* OVL0, OVL0_2L, SMI larb0, larb1, DSI0 (0189), CCORR0 (0191) */
+	vm_offset_t   fDisp[6];
 	/* 0189 panel refresh (see the top) */
 	uint32_t      fPanelHz;       /* the panel's refresh now: 60 or 120 */
 	uint32_t      fHzMode;        /* 60, 120, 1 = auto */
@@ -256,6 +264,27 @@ public:
 	uint32_t      fHzSeq;         /* vivapanelseq / "disp hz seq N": where the porch goes relative to the commands */
 	bool panelSetHz(uint32_t hz);
 	void hzPolicy(void);
+	/* 0191 brightness and color matrix (see the top) */
+	IOMemoryMap  *fCcorrMap;
+	vm_offset_t   fCcorr;
+	uint32_t      fMaxNits;       /* vivapanelnits: nits at level 2047 */
+	volatile uint32_t fBlWant;    /* panel level to send at the next tick, 0xffffffff = none */
+	uint32_t      fBlLevel;       /* last level sent */
+	uint64_t      fBlSent, fMatrixCalls, fMatrixApplied;
+	int32_t       fMatrix[16][9]; /* per matrix type (Night Shift = 9), fixed point 1.0 = 0x800 */
+	bool          fMatrixUsed[16];
+	volatile bool fMatrixDirty;
+	volatile bool fSelTrace;      /* "disp seltrace on": log every user client call and swap record changes */
+	uint8_t       fTraceRec[SWEET_FB_SWAP_REC_SIZE];
+	uint32_t      fTraceLines;
+	bool dsiSendDcs(const uint8_t *b, uint32_t n, bool vbp, bool wait = true);
+	bool          fDcsInFlight;   /* a non-blocking DCS write was started (brightness) */
+	class AppleARMBacklight *fBacklight;
+	void backlightStart(void);
+	void traceProperties(const char *who, OSDictionary *dict);
+	void lightTick(void);
+	void setMatrix(uint32_t type, const uint64_t bits[9]);
+	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
 	int           fScanOvl;       /* OVL of LK's layer (0/1), -1 = not found */
 	uint32_t      fScanAddrReg, fScanPitchReg, fScanPitchMsbReg;
 	uint32_t      fLkAddr, fLkPitch, fLkPitchMsb;
@@ -323,6 +352,21 @@ public:
 OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
 
 static AppleCLCD *gSweetFB;     /* for the USB link "disp" command */
+
+/*
+ * 0191: CoreBrightness (CBDisplayContaineriOS findBacklight, iOS 16.7) matches IOPropertyMatch {backlight-control: true}
+ * and keeps the service that conforms to AppleARMBacklight; DisplayCreateWithID reads IODisplayParameters.brightness
+ * {min, max, value}. Without it there is no display module: no brightness, no Night Shift. Brightness writes come back
+ * through setProperties (logged with "disp seltrace on") and go to the panel through AppleCLCD.
+ */
+class AppleARMBacklight : public IOService {
+	OSDeclareDefaultStructors(AppleARMBacklight);
+public:
+	AppleCLCD *fFB;
+	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
+	void publishLevel(uint32_t level);
+};
+OSDefineMetaClassAndStructors(AppleARMBacklight, IOService);
 volatile uint32_t sweet_fb_gpu_waits;
 static volatile uint32_t gSweetFbDutyCap;       /* sweet_fb_set_duty_cap (Low Power Mode); 0 = sweetfb_duty */
 
@@ -436,6 +480,10 @@ AppleCLCD::start(IOService *provider)
 		fHzMode = 60;
 	}
 	fHzWant = fHzMode == 120 ? 120 : 0;     /* done at the first vsync tick with frame ends known */
+	fMaxNits = 500;
+	PE_parse_boot_argn("vivapanelnits", &fMaxNits, sizeof(fMaxNits));
+	fMaxNits = MIN(MAX(fMaxNits, 50u), 2000u);
+	fBlWant = 0xffffffffu;
 	fHzIdleMs = 500;
 	PE_parse_boot_argn("vivapanelidle", &fHzIdleMs, sizeof(fHzIdleMs));
 	fHzIdleMs = MIN(MAX(fHzIdleMs, 100u), 60000u);
@@ -464,6 +512,7 @@ AppleCLCD::start(IOService *provider)
 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
 	setProperty("external", false);
 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
+	setProperty("IOMFBBrightnessLevel", (unsigned long long)(200u << 16), 32);     /* 0191: 200 nits until set */
 	if (fHzMode != 60) {
 		/*
 		 * 0189: QuartzCore (CA::WindowServer::AppleDisplay, iOS 16.7) reads IOMFBDisplayRefresh at start:
@@ -486,6 +535,7 @@ AppleCLCD::start(IOService *provider)
 		OSSafeReleaseNULL(refresh);
 	}
 	registerService();
+	backlightStart();               /* 0191 */
 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
 	return true;
@@ -496,6 +546,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
 {
 	AppleCLCD *fb = (AppleCLCD *)owner;
 	fb->hzPolicy();                 /* 0189: a pending refresh switch happens here, on the work loop */
+	fb->lightTick();                /* 0191: brightness / color matrix changes */
 	uint64_t count = ++fb->fVsyncCount;
 	/*
 	 * 0135, scanout: look for a finished frame before the switch, so one found now is on screen at this frame end
@@ -1118,6 +1169,10 @@ AppleCLCD::present(const uint8_t *rec, bool force, uint64_t jobs)
 #define DSI_VFP_NL              0x028
 #define DSI_VM_CMD_CON          0x200   /* [0] enable, [1] long packet, [5] send in VFP, [15:8] type, [31:16] data/len */
 #define DSI_VM_CMD_DATA0        0x208
+#define DISP_CCORR0_PA          0x1400b000ull
+#define CCORR_CFG               0x020   /* bit 0 relay (bypass), bit 1 engine */
+#define CCORR_COEF(n)           (0x080 + 4 * (n))
+#define PANEL_LEVEL_MAX         2047
 #define PANEL_VFP_60            2452
 #define PANEL_VFP_120           20
 
@@ -1176,8 +1231,8 @@ sweet_fb_panic_show(void)
 bool
 AppleCLCD::dispMap(void)
 {
-	static const uint64_t pa[5] = { DISP_OVL0_PA, DISP_OVL0_2L_PA, SMI_LARB0_PA, SMI_LARB1_PA, DISP_DSI0_PA };
-	for (int i = 0; i < 5; i++) {
+	static const uint64_t pa[6] = { DISP_OVL0_PA, DISP_OVL0_2L_PA, SMI_LARB0_PA, SMI_LARB1_PA, DISP_DSI0_PA, DISP_CCORR0_PA };
+	for (int i = 0; i < 6; i++) {
 		if (fDispMap[i] != NULL) {
 			continue;
 		}
@@ -1509,6 +1564,12 @@ AppleCLCD::panelSetHz(uint32_t hz)
 		return false;
 	}
 	vm_offset_t d = fDisp[4];
+	if (fDcsInFlight) {             /* 0191: a brightness write still waiting for its blanking */
+		for (int k = 0; k < 1000 && !(disp_rd(d, DSI_INTSTA) & DSI_VM_CMD_DONE); k++) {
+			IODelay(50);
+		}
+		fDcsInFlight = false;
+	}
 	uint32_t vfp = disp_rd(d, DSI_VFP_NL);
 	if ((disp_rd(d, DSI_MODE_CTRL) & 3) == 0) {
 		fHzWhy = "DSI not in video mode";
@@ -1627,6 +1688,267 @@ AppleCLCD::hzPolicy(void)
 		}
 	}
 	IOLockUnlock(fScanLock);
+}
+
+/* 0191: one DCS write (1-3 bytes, write or long write) in the video-mode blanking. fScanLock. */
+bool
+AppleCLCD::dsiSendDcs(const uint8_t *b, uint32_t n, bool vbp, bool wait)
+{
+	if (!dispMap() || n == 0 || n > 4) {
+		return false;
+	}
+	vm_offset_t d = fDisp[4];
+	if (fDcsInFlight) {
+		/* the previous non-blocking write: still waiting for its blanking -> try again next tick */
+		if (!(disp_rd(d, DSI_INTSTA) & DSI_VM_CMD_DONE) && (disp_rd(d, DSI_START) & DSI_VM_CMD_START)) {
+			if (!wait) {
+				return false;
+			}
+			for (int k = 0; k < 1000 && !(disp_rd(d, DSI_INTSTA) & DSI_VM_CMD_DONE); k++) {
+				IODelay(50);
+			}
+		}
+		fDcsInFlight = false;
+	}
+	uint32_t timing = vbp ? 0x18u : 0x20u;          /* [4:3] VSA/VBP or [5] VFP */
+	uint32_t con;
+	if (n <= 2) {
+		con = ((n == 2 ? (uint32_t)b[1] : 0u) << 24) | ((uint32_t)b[0] << 16) | ((n == 2 ? 0x15u : 0x05u) << 8) | 1u | timing;
+	} else {
+		disp_wr(d, DSI_VM_CMD_DATA0, (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) |
+		    (n > 3 ? (uint32_t)b[3] << 24 : 0u));
+		con = (n << 16) | (0x39u << 8) | 2u | 1u | timing;
+	}
+	disp_wr(d, DSI_VM_CMD_CON, con);
+	disp_wr(d, DSI_INTSTA, disp_rd(d, DSI_INTSTA) & ~DSI_VM_CMD_DONE);
+	disp_wr(d, DSI_START, disp_rd(d, DSI_START) & ~DSI_VM_CMD_START);
+	disp_wr(d, DSI_START, disp_rd(d, DSI_START) | DSI_VM_CMD_START);
+	if (!wait) {
+		fDcsInFlight = true;            /* goes out in the next blanking; checked at the next write */
+		return true;
+	}
+	bool done = false;
+	for (int k = 0; k < 1000 && !done; k++) {
+		done = (disp_rd(d, DSI_INTSTA) & DSI_VM_CMD_DONE) != 0;
+		if (!done) {
+			IODelay(50);
+		}
+	}
+	disp_wr(d, DSI_START, disp_rd(d, DSI_START) & ~DSI_VM_CMD_START);
+	disp_wr(d, DSI_INTSTA, disp_rd(d, DSI_INTSTA) & ~DSI_VM_CMD_DONE);
+	return done;
+}
+
+/* 0191, vsync tick: pending brightness level and color matrix. */
+void
+AppleCLCD::lightTick(void)
+{
+	uint32_t bl = fBlWant;
+	bool matrix = fMatrixDirty;
+	if (bl == 0xffffffffu && !matrix) {
+		return;
+	}
+	IOLockLock(fScanLock);
+	if (bl != 0xffffffffu) {
+		uint8_t cmd[3] = { 0x51, (uint8_t)(bl >> 8), (uint8_t)bl };
+		if (bl == fBlLevel) {
+			fBlWant = 0xffffffffu;
+		} else if (dsiSendDcs(cmd, 3, false, false)) {      /* non-blocking: a fade must not hold the frames */
+			if (fBlWant == bl) {
+				fBlWant = 0xffffffffu;
+			}
+			fBlLevel = bl;
+			fBlSent++;
+			if (fBacklight != NULL) {
+				fBacklight->publishLevel(bl);
+			}
+		}
+	}
+	if (matrix) {
+		fMatrixDirty = false;
+		/* product of the matrices in type order, fixed point 1.0 = 0x800 */
+		int64_t m[9] = { 0x800, 0, 0, 0, 0x800, 0, 0, 0, 0x800 };
+		for (int t = 0; t < 16; t++) {
+			if (!fMatrixUsed[t]) {
+				continue;
+			}
+			int64_t r[9];
+			for (int i = 0; i < 3; i++) {
+				for (int j = 0; j < 3; j++) {
+					int64_t v = 0;
+					for (int k = 0; k < 3; k++) {
+						v += (int64_t)fMatrix[t][i * 3 + k] * m[k * 3 + j];
+					}
+					r[i * 3 + j] = v / 0x800;
+				}
+			}
+			memcpy(m, r, sizeof(m));
+		}
+		bool identity = true;
+		int32_t c[9];
+		for (int i = 0; i < 9; i++) {
+			c[i] = (int32_t)MIN(MAX(m[i], -4096ll), 4095ll);
+			identity = identity && c[i] == ((i % 4) == 0 ? 0x800 : 0);
+		}
+		fCcorr = dispMap() ? fDisp[5] : 0;
+		if (fCcorr != 0) {
+			disp_wr(fCcorr, CCORR_COEF(0), ((uint32_t)(c[0] & 0x1fff) << 16) | (uint32_t)(c[1] & 0x1fff));
+			disp_wr(fCcorr, CCORR_COEF(1), ((uint32_t)(c[2] & 0x1fff) << 16) | (uint32_t)(c[3] & 0x1fff));
+			disp_wr(fCcorr, CCORR_COEF(2), ((uint32_t)(c[4] & 0x1fff) << 16) | (uint32_t)(c[5] & 0x1fff));
+			disp_wr(fCcorr, CCORR_COEF(3), ((uint32_t)(c[6] & 0x0fff) << 16) | (uint32_t)(c[7] & 0x1fff));
+			disp_wr(fCcorr, CCORR_COEF(4), (uint32_t)(c[8] & 0x1fff) << 16);
+			uint32_t cfg = disp_rd(fCcorr, CCORR_CFG);
+			disp_wr(fCcorr, CCORR_CFG, identity ? ((cfg | 1u) & ~2u) : ((cfg & ~1u) | 2u));
+			fMatrixApplied++;
+		}
+	}
+	IOLockUnlock(fScanLock);
+}
+
+/* 0191: selector 55, a color matrix of the given type (row-major, signed 32.32 fixed point; seen on the phone). */
+void
+AppleCLCD::setMatrix(uint32_t type, const uint64_t bits[9])
+{
+	fMatrixCalls++;
+	if (type >= 16) {
+		return;
+	}
+	int32_t m[9];
+	bool identity = true;
+	for (int i = 0; i < 9; i++) {
+		int64_t v = ((int64_t)bits[i] + (1ll << 20)) >> 21;     /* 32.32 -> 1.0 = 0x800 */
+		m[i] = (int32_t)MIN(MAX(v, -0x4000ll), 0x4000ll);
+		identity = identity && m[i] == ((i % 4) == 0 ? 0x800 : 0);
+	}
+	if (fMatrixCalls <= 16) {
+		IOLog("SWEET FB: matrix %u: %d %d %d / %d %d %d / %d %d %d (1.0 = 2048)\n", type, m[0], m[1], m[2], m[3], m[4],
+		    m[5], m[6], m[7], m[8]);
+	}
+	memcpy(fMatrix[type], m, sizeof(m));
+	fMatrixUsed[type] = !identity;
+	fMatrixDirty = true;
+}
+
+/* 0191: the AppleARMBacklight nub (see its class). */
+void
+AppleCLCD::backlightStart(void)
+{
+	AppleARMBacklight *b = OSTypeAlloc(AppleARMBacklight);
+	if (b == NULL || !b->init()) {
+		OSSafeReleaseNULL(b);
+		return;
+	}
+	b->fFB = this;
+	b->setProperty("backlight-control", true);
+	b->publishLevel(0x219);         /* LK's level */
+	if (!b->attach(this)) {
+		b->release();
+		return;
+	}
+	b->registerService();
+	fBacklight = b;
+}
+
+void
+AppleARMBacklight::publishLevel(uint32_t level)
+{
+	OSDictionary *params = OSDictionary::withCapacity(1), *bright = OSDictionary::withCapacity(3);
+	OSNumber *mn = OSNumber::withNumber(0ull, 32), *mx = OSNumber::withNumber((unsigned long long)PANEL_LEVEL_MAX, 32);
+	OSNumber *v = OSNumber::withNumber((unsigned long long)level, 32);
+	if (params != NULL && bright != NULL && mn != NULL && mx != NULL && v != NULL) {
+		bright->setObject("min", mn);
+		bright->setObject("max", mx);
+		bright->setObject("value", v);
+		params->setObject("brightness", bright);
+		setProperty("IODisplayParameters", params);
+	}
+	OSSafeReleaseNULL(mn);
+	OSSafeReleaseNULL(mx);
+	OSSafeReleaseNULL(v);
+	OSSafeReleaseNULL(bright);
+	OSSafeReleaseNULL(params);
+}
+
+/* A brightness number as CoreBrightness may send it: a number, or a dictionary with "value". */
+static bool
+sweet_fb_brightness_value(OSObject *o, uint64_t *v)
+{
+	OSNumber *n = OSDynamicCast(OSNumber, o);
+	OSDictionary *d = OSDynamicCast(OSDictionary, o);
+	if (n == NULL && d != NULL) {
+		n = OSDynamicCast(OSNumber, d->getObject("value"));
+	}
+	if (n == NULL) {
+		return false;
+	}
+	*v = n->unsigned64BitValue();
+	return true;
+}
+
+IOReturn
+AppleARMBacklight::setProperties(OSObject *properties)
+{
+	OSDictionary *dict = OSDynamicCast(OSDictionary, properties);
+	if (dict == NULL || fFB == NULL) {
+		return kIOReturnBadArgument;
+	}
+	fFB->traceProperties("backlight", dict);
+	uint64_t v = 0;
+	OSDictionary *params = OSDynamicCast(OSDictionary, dict->getObject("IODisplayParameters"));
+	bool have = sweet_fb_brightness_value(dict->getObject("brightness"), &v) ||
+	    (params != NULL && sweet_fb_brightness_value(params->getObject("brightness"), &v));
+	if (!have) {
+		return kIOReturnSuccess;        /* accepted (logged), nothing for the panel */
+	}
+	uint32_t level = (uint32_t)MIN(v, (uint64_t)PANEL_LEVEL_MAX);
+	fFB->fBlWant = level;
+	publishLevel(level);
+	return kIOReturnSuccess;
+}
+
+/* 0191, "disp seltrace on": every property a client sets on us or the backlight nub. */
+void
+AppleCLCD::traceProperties(const char *who, OSDictionary *dict)
+{
+	if (!fSelTrace || dict == NULL || fTraceLines >= 400) {
+		return;
+	}
+	OSCollectionIterator *it = OSCollectionIterator::withCollection(dict);
+	OSSymbol *k;
+	char name[32];
+	proc_selfname(name, sizeof(name));
+	while (it != NULL && (k = OSDynamicCast(OSSymbol, it->getNextObject())) != NULL) {
+		OSObject *o = dict->getObject(k);
+		OSNumber *v = OSDynamicCast(OSNumber, o);
+		fTraceLines++;
+		IOLog("SWEET FB: trace %s %s set %s = %s%llu\n", name, who, k->getCStringNoCopy(),
+		    v ? "" : OSDynamicCast(OSDictionary, o) ? "(dictionary) " : "(other) ", v ? v->unsigned64BitValue() : 0);
+		OSDictionary *sub = OSDynamicCast(OSDictionary, o);
+		if (sub != NULL) {
+			traceProperties(who, sub);
+		}
+	}
+	OSSafeReleaseNULL(it);
+}
+
+/* 0191: CoreBrightness's IOMFBBrightnessLevel (nits << 16). */
+IOReturn
+AppleCLCD::setProperties(OSObject *properties)
+{
+	OSDictionary *dict = OSDynamicCast(OSDictionary, properties);
+	traceProperties("framebuffer", dict);
+	OSNumber *n = dict != NULL ? OSDynamicCast(OSNumber, dict->getObject("IOMFBBrightnessLevel")) : NULL;
+	if (n == NULL) {
+		return kIOReturnUnsupported;
+	}
+	uint64_t nits16 = n->unsigned32BitValue();
+	uint64_t level = (nits16 * PANEL_LEVEL_MAX + ((uint64_t)fMaxNits << 15)) / ((uint64_t)fMaxNits << 16);
+	if (nits16 != 0 && level == 0) {
+		level = 1;
+	}
+	fBlWant = (uint32_t)MIN(level, (uint64_t)PANEL_LEVEL_MAX);
+	setProperty("IOMFBBrightnessLevel", n);
+	return kIOReturnSuccess;
 }
 
 bool
@@ -2000,6 +2322,25 @@ AppleCLCD::dispCommand(const char *args, char *out, size_t len)
 		disp_say(&p, end, "panel %u Hz, mode %s (idle %u ms, seq %u)%s, %llu switches, %llu failures%s%s\n", fPanelHz,
 		    fHzMode == 1 ? "auto" : fHzMode == 120 ? "120" : "60", fHzIdleMs, fHzSeq, fHzWant ? " (switch pending)" : "", fHzSwitches,
 		    fHzFailures, fHzWhy ? ", last: " : "", fHzWhy ? fHzWhy : "");
+	} else if (strncmp(args, "seltrace", 8) == 0) {
+		fSelTrace = strncmp(args + 8, " on", 3) == 0;
+		fTraceLines = 0;
+		bzero(fTraceRec, sizeof(fTraceRec));
+		disp_say(&p, end, "user client trace %s (log: \"SWEET FB: trace\", at most 400 lines)\n", fSelTrace ? "on" : "off");
+	} else if (strncmp(args, "bl", 2) == 0) {
+		const char *a = args + 2;
+		while (*a == ' ') {
+			a++;
+		}
+		if (*a >= '0' && *a <= '9') {
+			uint32_t v = 0;
+			for (; *a >= '0' && *a <= '9'; a++) {
+				v = v * 10 + (uint32_t)(*a - '0');
+			}
+			fBlWant = MIN(v, (uint32_t)PANEL_LEVEL_MAX);
+		}
+		disp_say(&p, end, "panel brightness level %u of %u (%u nits max), %llu sent; color matrices %llu calls, %llu applied\n",
+		    fBlLevel, PANEL_LEVEL_MAX, fMaxNits, fBlSent, fMatrixCalls, fMatrixApplied);
 	} else if (strncmp(args, "kv", 2) == 0) {
 		/* KA1 (gpu/docs/RICHIESTE-KERNEL.md): stable key=value lines for Viva Manager */
 		IOLockLock(fLock);
@@ -2016,6 +2357,7 @@ AppleCLCD::dispCommand(const char *args, char *out, size_t len)
 		    "swapwait_busy=%llu\n", r, f, fEarlyShown, fFlipReady ? 1 : 0, fSwapWaitBusy);
 		disp_say(&p, end, "panel_hz=%u\nhz_mode=%u\nhz_switches=%llu\nhz_failures=%llu\n", fPanelHz, fHzMode,
 		    fHzSwitches, fHzFailures);
+		disp_say(&p, end, "brightness=%u\nbrightness_max=%u\nmatrix_calls=%llu\n", fBlLevel, PANEL_LEVEL_MAX, fMatrixCalls);
 		{
 			uint32_t pb = 0, pu = 0, pk = 0;
 			uint64_t fp = 0, fc = 0, sp = 0;
@@ -2175,6 +2517,36 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
 	uint64_t out[2] = { 0, 0 };
 	uint32_t outCount = 0;
 
+	if (fFB->fSelTrace && fFB->fTraceLines < 400) {
+		/* 0191: what QuartzCore / CoreBrightness call (swap records: only words that changed past the layer fields) */
+		char name[32];
+		proc_selfname(name, sizeof(name));
+		if (selector == kSweetFBSwapEnd && args->structureInputDescriptor == NULL && args->structureInputSize >= SWEET_FB_SWAP_REC_SIZE) {
+			const uint8_t *r = (const uint8_t *)args->structureInput;
+			for (uint32_t o = 0x108; o + 4 <= SWEET_FB_SWAP_REC_SIZE && fFB->fTraceLines < 400; o += 4) {
+				uint32_t v, was;
+				memcpy(&v, r + o, 4);
+				memcpy(&was, fFB->fTraceRec + o, 4);
+				if (v != was) {
+					fFB->fTraceLines++;
+					IOLog("SWEET FB: trace %s swap +0x%x 0x%08x -> 0x%08x\n", name, o, was, v);
+				}
+			}
+			memcpy(fFB->fTraceRec, r, SWEET_FB_SWAP_REC_SIZE);
+		} else if (selector != kSweetFBSwapBegin && selector != kSweetFBSwapWait) {
+			uint32_t w[8] = { 0 };
+			if (args->structureInputDescriptor == NULL && args->structureInput != NULL) {
+				memcpy(w, args->structureInput, MIN(args->structureInputSize, (uint32_t)sizeof(w)));
+			}
+			fFB->fTraceLines++;
+			IOLog("SWEET FB: trace %s sel %u scalars %u [0x%llx 0x%llx 0x%llx] struct %u [%08x %08x %08x %08x %08x %08x %08x %08x] out %u/%u\n",
+			    name, selector, args->scalarInputCount, args->scalarInputCount > 0 ? args->scalarInput[0] : 0,
+			    args->scalarInputCount > 1 ? args->scalarInput[1] : 0, args->scalarInputCount > 2 ? args->scalarInput[2] : 0,
+			    args->structureInputSize, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], args->scalarOutputCount,
+			    args->structureOutputSize);
+		}
+	}
+
 	switch (selector) {
 	case kSweetFBGetLayerDefaultSurface:
 		out[0] = sweet_surface_port_in_task(fFB->fSurface, fTask);
@@ -2240,6 +2612,14 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
 			IOLog("SWEET FB: display %s\n", off ? "off" : "on");
 		}
 		break;
+	case 55: {      /* 0191: IOMobileFramebufferSetMatrix(type, 3x3 signed 32.32) */
+		if (args->scalarInputCount >= 1 && args->structureInputDescriptor == NULL && args->structureInputSize >= 72) {
+			uint64_t bits[9];
+			memcpy(bits, args->structureInput, sizeof(bits));
+			fFB->setMatrix((uint32_t)args->scalarInput[0], bits);
+		}
+		break;
+	}
 	case kSweetFBSwapWait: {
 		uint32_t swap = args->scalarInputCount > 0 ? (uint32_t)args->scalarInput[0] : 0;
 		uint32_t opts = args->scalarInputCount > 1 ? (uint32_t)args->scalarInput[1] : 0;
