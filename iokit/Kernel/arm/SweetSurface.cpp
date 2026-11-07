@@ -455,18 +455,20 @@ sweet_surface_layout(SweetSurface *s, OSDictionary *props)
 	 * surfaces in and out at every use (10.7 MB each way, 23 ms stalls on the GPU queue). Single-plane surfaces get
 	 * the pitch rounded up: clients read it back from the lock result (+0x28; CA, ImageIO, IOSurface.framework).
 	 * Not when an explicit IOSurfaceAllocSize would no longer hold the rows (the client laid the memory out
-	 * itself), nor with an offset or a parent. Boot-arg vivasurfpitch=0: never.
+	 * itself), nor with an offset or a parent. Boot-arg vivasurfpitch=0: never; 2 (0187, to try): also those, the
+	 * allocation grown to the rounded rows (CA's 1125x2436 snapshot and 787x1705 switcher surfaces declare exactly
+	 * pitch x height and stayed unaligned: correct only if their writers read the pitch back).
 	 */
 	if (sweet_surface_pitch64 < 0) {
 		int on = 1;
 		PE_parse_boot_argn("vivasurfpitch", &on, sizeof(on));
-		sweet_surface_pitch64 = on != 0;
+		sweet_surface_pitch64 = on;
 	}
 	if (sweet_surface_pitch64 && planes == NULL && s->offset == 0 && s->parentID == 0 &&
 	    (s->bytesPerRow & (SWEET_SURFACE_ROW_ALIGN - 1)) != 0 && props->getObject("IOSurfaceBytesPerRow") != NULL) {
 		uint64_t row = ((uint64_t)s->bytesPerRow + SWEET_SURFACE_ROW_ALIGN - 1) & ~(uint64_t)(SWEET_SURFACE_ROW_ALIGN - 1);
 		uint64_t rend = row * sweet_div_up(s->height, s->elementHeight);
-		bool ok = row <= UINT32_MAX && (alloc == 0 || rend <= alloc);
+		bool ok = row <= UINT32_MAX && (alloc == 0 || rend <= alloc || sweet_surface_pitch64 == 2);
 		static volatile SInt32 logged;
 		if (OSIncrementAtomic(&logged) < 16) {
 			IOLog("SWEET SURF: %ux%u fmt 0x%x pitch %u %s %llu%s\n", s->width, s->height, s->pixelFormat,
