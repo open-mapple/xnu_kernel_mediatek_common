@@ -40,7 +40,7 @@
 #include <machine/machine_routines.h>
 #include <libkern/section_keywords.h>
 #include <sys/cdefs.h>
-#if defined(SWEET)
+#if defined(MT6781)
 #include <corecrypto/ccdigest.h>
 #include <corecrypto/ccsha2.h>
 #endif
@@ -97,7 +97,7 @@ typedef struct entropy_data {
 	// State for a SHA256 computation. This is used to accumulate
 	// entropy samples from across all CPUs. It is finalized when
 	// entropy is provided to the consumer of this module.
-#if defined(SWEET)
+#if defined(MT6781)
 	ccdigest_ctx_decl(CCSHA256_STATE_SIZE, CCSHA256_BLOCK_SIZE, sha256_ctx);
 #else
 	SHA256_CTX sha256_ctx;
@@ -478,11 +478,11 @@ entropy_health_test(uint32_t sample_count, entropy_sample_t *samples, __assert_o
 	return result;
 }
 
-/* SWEET uses the same built-in digest as early_random, without a kext. */
+/* MT6781 uses the same built-in digest as early_random, without a kext. */
 static void
 entropy_hash_init(void)
 {
-#if defined(SWEET)
+#if defined(MT6781)
 	ccdigest_init(&ccsha256_ltc_di, entropy_data.sha256_ctx);
 #else
 	SHA256_Init(&entropy_data.sha256_ctx);
@@ -492,7 +492,7 @@ entropy_hash_init(void)
 static void
 entropy_hash_update(const void *data, size_t nbytes)
 {
-#if defined(SWEET)
+#if defined(MT6781)
 	ccdigest_update(&ccsha256_ltc_di, entropy_data.sha256_ctx, nbytes, data);
 #else
 	SHA256_Update(&entropy_data.sha256_ctx, data, nbytes);
@@ -502,7 +502,7 @@ entropy_hash_update(const void *data, size_t nbytes)
 static void
 entropy_hash_final(void *out)
 {
-#if defined(SWEET)
+#if defined(MT6781)
 	ccdigest_final(&ccsha256_ltc_di, entropy_data.sha256_ctx, out);
 	ccdigest_ctx_clear(CCSHA256_STATE_SIZE, CCSHA256_BLOCK_SIZE, entropy_data.sha256_ctx);
 #else
@@ -523,8 +523,8 @@ entropy_provide(size_t *entropy_size, void *entropy, __unused void *arg)
 	*entropy_size = 0;
 
 	// Apple platforms need the corecrypto kext's SHA256 implementation.
-	// SWEET links the digest into the kernel instead.
-#if !defined(SWEET)
+	// MT6781 links the digest into the kernel instead.
+#if !defined(MT6781)
 	if (__improbable(!crypto_init)) {
 		return sample_count;
 	}

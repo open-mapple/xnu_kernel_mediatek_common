@@ -188,6 +188,23 @@ gotit:
 }
 
 boolean_t
+PE_parse_boot_argn_alias(
+	const char      *arg_string,
+	const char      *old_string,
+	void            *arg_ptr,
+	int                     max_len)
+{
+	if (PE_parse_boot_argn(arg_string, arg_ptr, max_len)) {
+		return TRUE;
+	}
+	if (PE_parse_boot_argn(old_string, arg_ptr, max_len)) {
+		printf("boot-arg %s is now %s (the old name goes at release 1)\n", old_string, arg_string);
+		return TRUE;
+	}
+	return FALSE;
+}
+
+boolean_t
 PE_parse_boot_argn(
 	const char      *arg_string,
 	void            *arg_ptr,

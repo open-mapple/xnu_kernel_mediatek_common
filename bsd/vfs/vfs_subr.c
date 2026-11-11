@@ -1257,14 +1257,14 @@ vfs_mountroot(void)
 
 		mp = vfs_rootmountalloc_internal(vfsp, "root_device");
 		mp->mnt_devvp = rootvp;
-#if defined(ARM64_BOARD_CONFIG_SWEET)
+#if defined(ARM64_BOARD_CONFIG_MT6781)
 		/*
-		 * SWEET has no data volume: /private/var lives on the root, so
-		 * boot-arg rootrw=1 mounts it read-write from the start.
+		 * MT6781 has no data volume: /private/var lives on the root, so
+		 * boot-arg mp_rootrw=1 mounts it read-write from the start.
 		 */
 		{
-			uint32_t rootrw = 0;
-			if (PE_parse_boot_argn("rootrw", &rootrw, sizeof(rootrw)) && rootrw) {
+			uint32_t mp_rootrw = 0;
+			if (PE_parse_boot_argn_alias("mp_rootrw", "rootrw", &mp_rootrw, sizeof(mp_rootrw)) && mp_rootrw) {
 				mp->mnt_flag &= ~MNT_RDONLY;
 			}
 		}

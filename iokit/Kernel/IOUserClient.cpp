@@ -2600,36 +2600,36 @@ is_io_service_match_property_table_bin(
 }
 
 static 
-#if defined(ARM64_BOARD_CONFIG_SWEET)
+#if defined(ARM64_BOARD_CONFIG_MT6781)
 /*
- * SWEET IOKit trace: registry and matching calls made by the processes
- * named in boot-arg sweetiolog (comma separated, default "backboardd,SpringBoard";
+ * IOKit trace: registry and matching calls made by the processes
+ * named in boot-arg mp_iokit_log (comma separated, default "backboardd,SpringBoard";
  * "-" turns it off) are printed as "IOK name: ...", at most 400 lines per
  * boot, to find out what a daemon looks for before it gives up.
  */
-static char sweet_iolog_names[128];
-static int sweet_iolog_parsed;
-static uint32_t sweet_iolog_lines;
+static char mapple_iolog_names[128];
+static int mapple_iolog_parsed;
+static uint32_t mapple_iolog_lines;
 
 static bool
-sweet_iolog(char *name, size_t len)
+mapple_iolog(char *name, size_t len)
 {
-	if (!sweet_iolog_parsed) {
-		if (!PE_parse_boot_argn("sweetiolog", sweet_iolog_names, sizeof(sweet_iolog_names))) {
-			strlcpy(sweet_iolog_names, "backboardd,SpringBoard", sizeof(sweet_iolog_names));
+	if (!mapple_iolog_parsed) {
+		if (!PE_parse_boot_argn_alias("mp_iokit_log", "sweetiolog", mapple_iolog_names, sizeof(mapple_iolog_names))) {
+			strlcpy(mapple_iolog_names, "backboardd,SpringBoard", sizeof(mapple_iolog_names));
 		}
-		sweet_iolog_parsed = 1;
+		mapple_iolog_parsed = 1;
 	}
-	if (sweet_iolog_lines >= 400) {
+	if (mapple_iolog_lines >= 400) {
 		return false;
 	}
 	proc_selfname(name, (int)len);
 	size_t n = strlen(name);
-	for (const char *t = sweet_iolog_names; *t;) {
+	for (const char *t = mapple_iolog_names; *t;) {
 		const char *end = strchr(t, ',');
 		size_t tl = end ? (size_t)(end - t) : strlen(t);
 		if (tl == n && n > 0 && strncmp(t, name, n) == 0) {
-			sweet_iolog_lines++;
+			mapple_iolog_lines++;
 			return true;
 		}
 		if (!end) {
@@ -2642,7 +2642,7 @@ sweet_iolog(char *name, size_t len)
 
 /* Compact XML of a matching dictionary, at most 240 characters. */
 static void
-sweet_iolog_dict(const char *name, const char *what, OSObject *dict, const char *result)
+mapple_iolog_dict(const char *name, const char *what, OSObject *dict, const char *result)
 {
 	OSSerialize *ser = OSSerialize::withCapacity(256);
 	const char *text = "?";
@@ -2675,9 +2675,9 @@ internal_io_service_get_matching_services(
 	if ((dict = OSDynamicCast( OSDictionary, obj))) {
 		IOTaskRegistryCompatibilityMatching(current_task(), dict);
 		OSIterator *found = IOService::getMatchingServices( dict );
-#if defined(ARM64_BOARD_CONFIG_SWEET)
+#if defined(ARM64_BOARD_CONFIG_MT6781)
 		char sname[32];
-		if (sweet_iolog(sname, sizeof(sname))) {
+		if (mapple_iolog(sname, sizeof(sname))) {
 			unsigned int count = 0;
 			if (found != NULL) {
 				while (found->getNextObject() != NULL) {
@@ -2687,7 +2687,7 @@ internal_io_service_get_matching_services(
 			}
 			char res[16];
 			snprintf(res, sizeof(res), "%u found", count);
-			sweet_iolog_dict(sname, "matching", dict, res);
+			mapple_iolog_dict(sname, "matching", dict, res);
 		}
 #endif
 		*existing = IOUserIterator::withIterator(found);
@@ -2775,10 +2775,10 @@ internal_io_service_get_matching_service(
 		IOTaskRegistryCompatibilityMatching(current_task(), dict);
 		*service = IOService::copyMatchingService( dict );
 		kr = *service ? kIOReturnSuccess : kIOReturnNotFound;
-#if defined(ARM64_BOARD_CONFIG_SWEET)
+#if defined(ARM64_BOARD_CONFIG_MT6781)
 		char sname[32];
-		if (sweet_iolog(sname, sizeof(sname))) {
-			sweet_iolog_dict(sname, "matching1", dict,
+		if (mapple_iolog(sname, sizeof(sname))) {
+			mapple_iolog_dict(sname, "matching1", dict,
 			    *service ? (*service)->getMetaClass()->getClassName() : "none");
 		}
 #endif
@@ -2885,11 +2885,11 @@ internal_io_service_add_notification(
 			continue;
 		}
 		IOTaskRegistryCompatibilityMatching(current_task(), dict);
-#if defined(ARM64_BOARD_CONFIG_SWEET)
+#if defined(ARM64_BOARD_CONFIG_MT6781)
 		{
 			char sname[32];
-			if (sweet_iolog(sname, sizeof(sname))) {
-				sweet_iolog_dict(sname, notification_type, dict, "notify");
+			if (mapple_iolog(sname, sizeof(sname))) {
+				mapple_iolog_dict(sname, notification_type, dict, "notify");
 			}
 		}
 #endif
@@ -3360,10 +3360,10 @@ is_io_registry_entry_from_path(
 	}
 
 	entry = IORegistryEntry::fromPath( path );
-#if defined(ARM64_BOARD_CONFIG_SWEET)
+#if defined(ARM64_BOARD_CONFIG_MT6781)
 	{
 		char sname[32];
-		if (sweet_iolog(sname, sizeof(sname))) {
+		if (mapple_iolog(sname, sizeof(sname))) {
 			IOLog("IOK %s: path %.200s -> %s\n", sname, path,
 			    entry ? entry->getMetaClass()->getClassName() : "none");
 		}
@@ -3631,12 +3631,12 @@ IOCopyPropertyCompatible(IORegistryEntry * regEntry, const char * name)
 	return obj;
 }
 
-#if defined(ARM64_BOARD_CONFIG_SWEET)
-/* viva GPU (iokit/Kernel/arm/VivaGPU.cpp): logs userspace reads of the accelerator's properties. */
-extern void viva_gpu_property_read(IORegistryEntry *entry, const char *key, bool found);
-#define VIVA_GPU_PROPERTY_READ(e, k, f) viva_gpu_property_read((e), (k), (f))
+#if defined(ARM64_BOARD_CONFIG_MT6781)
+/* Mapple GPU (iokit/Kernel/arm/MappleGPU.cpp): logs userspace reads of the accelerator's properties. */
+extern void mapple_gpu_property_read(IORegistryEntry *entry, const char *key, bool found);
+#define MAPPLE_GPU_PROPERTY_READ(e, k, f) mapple_gpu_property_read((e), (k), (f))
 #else
-#define VIVA_GPU_PROPERTY_READ(e, k, f) do { } while (0)
+#define MAPPLE_GPU_PROPERTY_READ(e, k, f) do { } while (0)
 #endif
 
 /* Routine io_registry_entry_get_property */
@@ -3666,7 +3666,7 @@ is_io_registry_entry_get_property_bytes(
 #endif
 
 	obj = IOCopyPropertyCompatible(entry, property_name);
-	VIVA_GPU_PROPERTY_READ(entry, property_name, obj != NULL);
+	MAPPLE_GPU_PROPERTY_READ(entry, property_name, obj != NULL);
 	if (!obj) {
 		return kIOReturnNoResources;
 	}
@@ -3735,7 +3735,7 @@ is_io_registry_entry_get_property(
 #endif
 
 	obj = IOCopyPropertyCompatible(entry, property_name);
-	VIVA_GPU_PROPERTY_READ(entry, property_name, obj != NULL);
+	MAPPLE_GPU_PROPERTY_READ(entry, property_name, obj != NULL);
 	if (!obj) {
 		return kIOReturnNotFound;
 	}
@@ -3784,7 +3784,7 @@ is_io_registry_entry_get_property_recursively(
 
 	obj = entry->copyProperty( property_name,
 	    IORegistryEntry::getPlane( plane ), options );
-	VIVA_GPU_PROPERTY_READ(entry, property_name, obj != NULL);
+	MAPPLE_GPU_PROPERTY_READ(entry, property_name, obj != NULL);
 	if (!obj) {
 		return kIOReturnNotFound;
 	}
@@ -3885,7 +3885,7 @@ is_io_registry_entry_get_properties_bin_buf(
 	if (!s) {
 		return kIOReturnNoMemory;
 	}
-	VIVA_GPU_PROPERTY_READ(entry, "*", true);
+	MAPPLE_GPU_PROPERTY_READ(entry, "*", true);
 
 
 	compatProperties = entry->copyProperty(gIOUserServicePropertiesKey);
@@ -3978,8 +3978,8 @@ is_io_registry_entry_get_property_bin_buf(
 	if (!sym) {
 		return kIOReturnNoMemory;
 	}
-#if defined(ARM64_BOARD_CONFIG_SWEET)
-	IORegistryEntry * vivaEntry = entry;     /* the loop below walks entry down the plane */
+#if defined(ARM64_BOARD_CONFIG_MT6781)
+	IORegistryEntry * gpuEntry = entry;     /* the loop below walks entry down the plane */
 #endif
 
 	err = kIOReturnNotFound;
@@ -4015,7 +4015,7 @@ is_io_registry_entry_get_property_bin_buf(
 	}
 
 	sym->release();
-	VIVA_GPU_PROPERTY_READ(vivaEntry, property_name, obj != NULL);
+	MAPPLE_GPU_PROPERTY_READ(gpuEntry, property_name, obj != NULL);
 	if (!obj) {
 		return err;
 	}
@@ -4194,10 +4194,10 @@ is_io_registry_entry_get_child_iterator(
 
 	*iterator = IOUserIterator::withIterator(entry->getChildIterator(
 		    IORegistryEntry::getPlane( plane )));
-#if defined(ARM64_BOARD_CONFIG_SWEET)
+#if defined(ARM64_BOARD_CONFIG_MT6781)
 	{
 		char sname[32];
-		if (sweet_iolog(sname, sizeof(sname))) {
+		if (mapple_iolog(sname, sizeof(sname))) {
 			IOLog("IOK %s: children of %s in %.32s\n", sname, entry->getName(), plane);
 		}
 	}
@@ -4417,10 +4417,10 @@ is_io_service_open_extended(
 #endif
 		res = service->newUserClient( owningTask, (void *) owningTask,
 		    connect_type, propertiesDict, &client );
-#if defined(ARM64_BOARD_CONFIG_SWEET)
+#if defined(ARM64_BOARD_CONFIG_MT6781)
 		{
 			char sname[32];
-			if (sweet_iolog(sname, sizeof(sname))) {
+			if (mapple_iolog(sname, sizeof(sname))) {
 				IOLog("IOK %s: open %s type %u -> 0x%x\n", sname,
 				    service->getMetaClass()->getClassName(), connect_type, res);
 			}

@@ -33,7 +33,7 @@
 #include "IOHIDEventData.h"
 #include "IOHIDUsageTables.h"
 #include "IOHIDPrivateKeys.h"
-/* SWEET: no <math.h> in the kernel; only NAN is used */
+/* no <math.h> in the kernel; only NAN is used */
 #ifndef NAN
 #define NAN __builtin_nanf("")
 #endif

@@ -691,16 +691,16 @@ bsd_init(void)
 	bsd_init_kprintf("calling vfsinit\n");
 	vfsinit();
 
-#if defined(ARM64_BOARD_CONFIG_SWEET)
-	/* AMFI's MAC policy is built in on SWEET (bsd/kern/sweet_amfi.c). */
-	extern void sweet_amfi_policy_register(void);
-	sweet_amfi_policy_register();
+#if defined(ARM64_BOARD_CONFIG_MT6781)
+	/* AMFI's MAC policy is built in on MT6781 (bsd/kern/amfi_stub.c). */
+	extern void amfi_stub_policy_register(void);
+	amfi_stub_policy_register();
 #endif
 
-#if SWEET_HFS
-	/* HFS is built in on SWEET: register it like its kext would, before mounting root. */
-	extern void sweet_hfs_register(void);
-	sweet_hfs_register();
+#if HFS_STAGED
+	/* HFS is built in on register it like its kext would, before mounting root. */
+	extern void hfs_staged_register(void);
+	hfs_staged_register();
 #endif
 
 #if CONFIG_PROC_UUID_POLICY
@@ -933,14 +933,14 @@ bsd_init(void)
 		if (require_rootauth) {
 			/* enforce sealedness */
 			int autherr = VNOP_IOCTL(rootvnode, FSIOC_KERNEL_ROOTAUTH, NULL, 0, vfs_context_kernel());
-#if defined(ARM64_BOARD_CONFIG_SWEET)
+#if defined(ARM64_BOARD_CONFIG_MT6781)
 			/*
-			 * SWEET has no chain of trust to extend: the kernel itself is
+			 * MT6781 has no chain of trust to extend: the kernel itself is
 			 * booted unsigned and there is no Image4/AMFI, and its HFS root
 			 * cannot be a sealed volume. Report it instead of panicking.
 			 */
 			if (autherr) {
-				printf("SWEET: root volume is not authenticated (error %d); continuing unsealed\n", autherr);
+				printf("root volume is not authenticated (error %d); continuing unsealed\n", autherr);
 			}
 #else
 			if (autherr) {

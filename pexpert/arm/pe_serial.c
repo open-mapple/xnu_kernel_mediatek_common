@@ -26,7 +26,7 @@
 #include <pexpert/arm/consistent_debug.h>
 #include <pexpert/arm64/board_config.h>
 #include <arm64/proc_reg.h>
-#include <arm64/sweet_early.h>
+#include <arm64/early_console.h>
 #include <pexpert/arm/protos.h>
 #include <kern/sched_prim.h>
 #if HIBERNATION
@@ -701,9 +701,9 @@ register_serial_functions(struct pe_serial_functions *fns)
 /*****************************************************************************/
 
 /*
- * sweet: framebuffer "serial" for boards with no usable UART (the Redmi Note
+ * Open Mapple: framebuffer "serial" for boards with no usable UART (the Redmi Note
  * 10 Pro's debug UART engine runs in SPI mode). kprintf output is drawn onto
- * the boot framebuffer described by the ADT node "sweet-fbcon":
+ * the boot framebuffer described by the ADT node "mapple-fbcon":
  *   reg    = <phys size>       absolute physical address, not arm-io relative
  *   width, height              pixels
  *   stride                     bytes per line, 32bpp
@@ -758,22 +758,22 @@ fbcon_transmit_ready(void)
 	return 1;
 }
 
-extern int sweet_console_muted;         /* osfmk/console/serial_console.c: set once the GUI presents */
+extern int mapple_console_muted;         /* osfmk/console/serial_console.c: set once the GUI presents */
 /*
  * Set by AppleCLCD when the display may scan out something other than this framebuffer (its second buffer, an
  * IOSurface): points the display back here, called once when a panic starts drawing.
  */
-void (*sweet_fb_panic_hook)(void);
+void (*mapple_fb_panic_hook)(void);
 
 static void
 fbcon_transmit_data(uint8_t c)
 {
-	if (sweet_console_muted && !panic_active()) {
+	if (mapple_console_muted && !panic_active()) {
 		return;                 /* kprintf comes straight here, not through the muted console */
 	}
-	if (sweet_fb_panic_hook != NULL && panic_active()) {
-		void (*hook)(void) = sweet_fb_panic_hook;
-		sweet_fb_panic_hook = NULL;
+	if (mapple_fb_panic_hook != NULL && panic_active()) {
+		void (*hook)(void) = mapple_fb_panic_hook;
+		mapple_fb_panic_hook = NULL;
 		hook();
 	}
 	if (c == '\r') {
@@ -815,14 +815,14 @@ fbcon_receive_data(void)
 	return 0;
 }
 
-SECURITY_READ_ONLY_LATE(static struct pe_serial_functions) sweet_fbcon_serial_functions =
+SECURITY_READ_ONLY_LATE(static struct pe_serial_functions) mapple_fbcon_serial_functions =
 {
 	.init = fbcon_init,
 	.transmit_ready = fbcon_transmit_ready,
 	.transmit_data = fbcon_transmit_data,
 	.receive_ready = fbcon_receive_ready,
 	.receive_data = fbcon_receive_data,
-	.device = SERIAL_SWEET_FBCON
+	.device = SERIAL_MAPPLE_FBCON
 };
 
 static void
@@ -833,7 +833,7 @@ fbcon_probe(void)
 	uint32_t const *val;
 	unsigned int size;
 
-	if (SecureDTFindEntry("name", "sweet-fbcon", &entry) != kSuccess ||
+	if (SecureDTFindEntry("name", "mapple-fbcon", &entry) != kSuccess ||
 	    SecureDTGetProperty(entry, "reg", (void const **)&reg, &size) != kSuccess || size < 16) {
 		return;
 	}
@@ -849,11 +849,11 @@ fbcon_probe(void)
 	if (!fbcon_width || !fbcon_height || fbcon_stride < fbcon_width * 4) {
 		return;
 	}
-	sweet_early_mark(17, "fbcon config read; mapping");
+	early_console_mark(17, "fbcon config read; mapping");
 	fbcon_base = (volatile uint32_t *)ml_io_map_wcomb(reg[0], reg[1]);
-	sweet_early_mark(18, "fbcon mapping returned");
+	early_console_mark(18, "fbcon mapping returned");
 	if (fbcon_base != NULL) {
-		register_serial_functions(&sweet_fbcon_serial_functions);
+		register_serial_functions(&mapple_fbcon_serial_functions);
 	}
 }
 

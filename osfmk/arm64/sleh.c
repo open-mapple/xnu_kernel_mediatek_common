@@ -1856,9 +1856,9 @@ sleh_irq(arm_saved_state_t *state)
 #endif
 
 
-#if defined(SWEET)
+#if defined(MT6781)
 	/*
-	 * sweet: TrustZone owns GIC Group 0, so the timer and IPIs that other
+	 * Open Mapple: TrustZone owns GIC Group 0, so the timer and IPIs that other
 	 * ARM64 targets take as FIQs arrive here as Group 1 IRQs.
 	 */
 	uint64_t iar = __builtin_arm_rsr64("ICC_IAR1_EL1");
@@ -1867,7 +1867,7 @@ sleh_irq(arm_saved_state_t *state)
 	if (intid >= 1020 && intid <= 1023) {
 		return; /* spurious */
 	}
-	if (intid == sweet_vtimer_intid) {
+	if (intid == mapple_vtimer_intid) {
 		sleh_interrupt_handler_prologue(state, DBG_INTR_TYPE_TIMER);
 		cdp->cpu_decrementer = -1; /* Large */
 		INTERRUPT_MASKED_DEBUG_START(rtclock_intr, DBG_INTR_TYPE_TIMER);
@@ -1903,7 +1903,7 @@ sleh_irq(arm_saved_state_t *state)
 	    cdp->interrupt_nub,
 	    cdp->interrupt_source);
 #endif
-#endif /* SWEET */
+#endif /* MT6781 */
 
 	entropy_collect();
 

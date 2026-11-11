@@ -954,13 +954,13 @@ ml_parse_cpu_topology(void)
 	const boolean_t cpus_boot_arg_present = PE_parse_boot_argn("cpus", &cpu_boot_arg, sizeof(cpu_boot_arg));
 	const boolean_t cpumask_boot_arg_present = PE_parse_boot_argn("cpumask", &cpumask_boot_arg, sizeof(cpumask_boot_arg));
 
-#if defined(SWEET)
-	/* Opt in to SMP: cpus=N (N <= SWEET_SMP_MAX_CPUS; cores 6-7 are the A76s). */
+#if defined(MT6781)
+	/* Opt in to SMP: cpus=N (N <= MAPPLE_SMP_MAX_CPUS; cores 6-7 are the A76s). */
 	if (!cpus_boot_arg_present || cpu_boot_arg == 0) {
 		cpu_boot_arg = 1;
 	}
-	if (cpu_boot_arg > SWEET_SMP_MAX_CPUS) {
-		cpu_boot_arg = SWEET_SMP_MAX_CPUS;
+	if (cpu_boot_arg > MAPPLE_SMP_MAX_CPUS) {
+		cpu_boot_arg = MAPPLE_SMP_MAX_CPUS;
 	}
 #endif
 
@@ -1087,7 +1087,7 @@ ml_parse_cpu_topology(void)
 		}
 #endif
 
-#if defined(SWEET)
+#if defined(MT6781)
 		/* Aff1 encodes the core on SM7150, not an Apple cluster ID. */
 		cpu->die_cluster_id = (int)ml_readprop(child, "die-cluster-id", 0);
 		cpu->cluster_core_id = (int)ml_readprop(child, "cluster-core-id", cpu->phys_id >> 8);
@@ -2180,17 +2180,17 @@ ml_get_decrementer(void)
 	return dec;
 }
 
-#if defined(SWEET)
+#if defined(MT6781)
 /*
- * sweet: arm_vm_init() calls this unconditionally; Apple's definition (it
+ * Open Mapple: arm_vm_init() calls this unconditionally; Apple's definition (it
  * enters the PPL/monitor) ships only in the closed per-SoC library. There is
- * no monitor on SWEET.
+ * no monitor on MT6781.
  */
 void
 ml_enable_monitor(void)
 {
 }
-#endif /* SWEET */
+#endif /* MT6781 */
 
 boolean_t
 ml_get_timer_pending(void)

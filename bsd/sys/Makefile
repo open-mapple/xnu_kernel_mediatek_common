@@ -44,7 +44,7 @@ DATAFILES = $(sort \
 	timeb.h times.h trace.h tty.h ttycom.h \
 	ttydefaults.h types.h ubc.h ucontext.h ucred.h uio.h un.h unistd.h unpcb.h \
 	user.h utfconv.h utsname.h vadvise.h vcmd.h \
-	vm.h vmmeter.h vmparam.h vnode_if.h vsock.h vstat.h wait.h xattr.h \
+	vm.h vmmeter.h vmparam.h vnode_if.h vsock.h mstat.h wait.h xattr.h \
 	_select.h _structs.h _types.h _endian.h domain.h protosw.h \
 	spawn.h timex.h commpage.h log_data.h \
 	$(EXTRA_DATAFILES))

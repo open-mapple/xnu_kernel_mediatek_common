@@ -1,0 +1,37 @@
+Open Mapple: the XNU kernel, common to MediaTek phones.
+
+- Apple's XNU (xnu-8796.141.3), libpthread (514.100.2) and HFS (627.100.6): Apple Public Source License 2.0
+  (APPLE_LICENSE). Changes to Apple's files are under the same licence, and Apple's notices stay in them.
+- ios-sweet (github.com/dipa-studio/ios-sweet) and ios-viva (github.com/Nik300/ios-viva): their patch series.
+  The files they add are MIT, Copyright (c) 2026 dipa-studio; their changes to Apple's files are APSL 2.0.
+- darwin-xnu-build (github.com/blacktop/darwin-xnu-build): its build fixes and patches. MIT, Copyright (c)
+  2023-2025 blacktop.
+- BearSSL (Thomas Pornin), libkern/crypto/sweet_bearssl/: MIT, its LICENSE.txt.
+
+A commit taken from another project names it in its Imported-from: line.
+Not in this repository: any file of iOS, any vendor firmware.
+
+The MIT licence of ios-sweet, ios-viva and darwin-xnu-build:
+
+MIT License
+
+Copyright (c) 2026 dipa-studio
+Copyright (c) 2023-2025 blacktop
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

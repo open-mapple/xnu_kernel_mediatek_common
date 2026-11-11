@@ -9705,12 +9705,12 @@ renameat(__unused proc_t p, struct renameat_args *uap, __unused int32_t *retval)
 	           uap->tofd, uap->to, UIO_USERSPACE, 0);
 }
 
-#if defined(ARM64_BOARD_CONFIG_SWEET)
-/* viva USB link "push" (bsd/dev/viva_usb.c): rename a file it wrote, as the kernel (replaces the target). */
-int viva_kern_rename(const char *from, const char *to);
+#if defined(ARM64_BOARD_CONFIG_MT6781)
+/* Mapple USB link "push" (bsd/dev/usb_link.c): rename a file it wrote, as the kernel (replaces the target). */
+int mapple_kern_rename(const char *from, const char *to);
 
 int
-viva_kern_rename(const char *from, const char *to)
+mapple_kern_rename(const char *from, const char *to)
 {
 	return renameat_internal(vfs_context_kernel(), AT_FDCWD, CAST_USER_ADDR_T(from), AT_FDCWD,
 	           CAST_USER_ADDR_T(to), UIO_SYSSPACE, 0);
@@ -14592,12 +14592,12 @@ fs_snapshot(__unused proc_t p, struct fs_snapshot_args *uap,
 	return error;
 }
 
-#if defined(ARM64_BOARD_CONFIG_SWEET)
-/* viva USB link "push": create a directory as the kernel (EEXIST if it is there). */
-int viva_kern_mkdir(const char *path, int mode);
+#if defined(ARM64_BOARD_CONFIG_MT6781)
+/* Mapple USB link "push": create a directory as the kernel (EEXIST if it is there). */
+int mapple_kern_mkdir(const char *path, int mode);
 
 int
-viva_kern_mkdir(const char *path, int mode)
+mapple_kern_mkdir(const char *path, int mode)
 {
 	struct vnode_attr va;
 	VATTR_INIT(&va);

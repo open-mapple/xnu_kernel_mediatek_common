@@ -1,5 +1,5 @@
 /*
- * sweet: arm64 kpc backend. Apple's osfmk/arm64/kpc.c programs the Apple
+ * Open Mapple: arm64 kpc backend. Apple's osfmk/arm64/kpc.c programs the Apple
  * PMU (implementation-defined system registers) and ships only in the KDK's
  * closed per-SoC library. xnu does not build without kperf, and kperf needs
  * kpc, so this backend reports no counters at all: every class is empty and

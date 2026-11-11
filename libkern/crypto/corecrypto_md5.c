@@ -17,14 +17,14 @@ setCount(MD5_CTX *ctx, uint64_t count)
 }
 
 /* Copy a ccdigest ctx into a legacy MD5 context */
-#if defined(ARM64_BOARD_CONFIG_SWEET)
+#if defined(ARM64_BOARD_CONFIG_MT6781)
 /*
- * SWEET has no corecrypto kext (g_crypto_funcs stays NULL). MD5 uses
- * BearSSL's portable implementation (libkern/crypto/sweet_md5.c), with
+ * MT6781 has no corecrypto kext (g_crypto_funcs stays NULL). MD5 uses
+ * BearSSL's portable implementation (libkern/crypto/bearssl_md5.c), with
  * MD5_CTX carrying exactly its state: chaining value, byte count and the
  * partial block, converted around each call like the corecrypto path does.
  */
-#include "sweet_bearssl/inc/bearssl_hash.h"
+#include "bearssl/inc/bearssl_hash.h"
 
 static void
 MD5ToBr(MD5_CTX *md5_ctx, br_md5_context *br_ctx)
@@ -71,7 +71,7 @@ MD5Final(unsigned char digest[MD5_DIGEST_LENGTH], MD5_CTX *ctx)
 	br_md5_out(&br_ctx, digest);
 }
 
-#else /* !ARM64_BOARD_CONFIG_SWEET */
+#else /* !ARM64_BOARD_CONFIG_MT6781 */
 
 static void
 DiToMD5(const struct ccdigest_info *di, struct ccdigest_ctx *di_ctx, MD5_CTX *md5_ctx)
@@ -125,4 +125,4 @@ MD5Final(unsigned char digest[MD5_DIGEST_LENGTH], MD5_CTX *ctx)
 	ccdigest_final(di, di_ctx, digest);
 }
 
-#endif /* !ARM64_BOARD_CONFIG_SWEET */
+#endif /* !ARM64_BOARD_CONFIG_MT6781 */

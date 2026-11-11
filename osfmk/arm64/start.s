@@ -143,8 +143,8 @@ LEXT(reset_vector)
 	adrp	x19, EXT(ResetHandlerData)@page			// Get address of the reset handler data
 	add		x19, x19, EXT(ResetHandlerData)@pageoff
 	mrs		x15, MPIDR_EL1						// Load MPIDR to get CPU number
-#if HAS_CLUSTER || defined(SWEET)
-	and		x0, x15, #0xFFFF					// Full Aff1:Aff0 (SWEET: core in Aff1)
+#if HAS_CLUSTER || defined(MT6781)
+	and		x0, x15, #0xFFFF					// Full Aff1:Aff0 (core in Aff1)
 #else
 	and		x0, x15, #0xFF						// CPU number is in MPIDR Affinity Level 0
 #endif
@@ -279,21 +279,21 @@ LEXT(LowExceptionVectorBase)
 LEXT(bootstrap_instructions)
 
 #endif /* defined(KERNEL_INTEGRITY_KTRR) || defined(KERNEL_INTEGRITY_CTRR) */
-#if defined(SWEET)
+#if defined(MT6781)
 /* PSCI CPU_ON entry (physical): x0=context_id, no stack, MMU/caches off.
  * Keep this separate from __start (which requires x0=boot_args PA).
  * Firmware may return at EL1 or EL2; check before accessing EL1 state.
  * The EL2 path assumes no resident hypervisor and CNTVOFF_EL2=0 on boot.
  */
 	.align 2
-	.globl EXT(sweet_secondary_entry)
-LEXT(sweet_secondary_entry)
+	.globl EXT(mapple_secondary_entry)
+LEXT(mapple_secondary_entry)
 	msr		DAIFSet, #0xf
 	mrs		x1, CurrentEL
 	cmp		x1, #0x4
-	b.eq	Lsweet_secondary_el1
+	b.eq	Lmapple_secondary_el1
 	cmp		x1, #0x8
-	b.ne	Lsweet_secondary_bad_el
+	b.ne	Lmapple_secondary_bad_el
 	adrp	x1, EXT(LowExceptionVectorBase)@page
 	add		x1, x1, EXT(LowExceptionVectorBase)@pageoff
 	msr		VBAR_EL2, x1
@@ -315,19 +315,19 @@ LEXT(sweet_secondary_entry)
 	MOV64	x1, 0x30d00800
 	msr		SCTLR_EL1, x1
 	isb
-	adrp	x1, Lsweet_secondary_el1@page
-	add		x1, x1, Lsweet_secondary_el1@pageoff
+	adrp	x1, Lmapple_secondary_el1@page
+	add		x1, x1, Lmapple_secondary_el1@pageoff
 	msr		ELR_EL2, x1
 	mov		x1, #0x3c5			// DAIF masked, AArch64 EL1h
 	msr		SPSR_EL2, x1
 	eret
-Lsweet_secondary_bad_el:
+Lmapple_secondary_bad_el:
 	b		.
-Lsweet_secondary_el1:
+Lmapple_secondary_el1:
 	/* x0 is deliberately unused; reset_vector selects CPU data by MPIDR. */
 	msr		SPSel, #1
 	b		EXT(LowResetVectorBase)
-#endif /* SWEET */
+#endif /* MT6781 */
 
 	.align 2
 	.globl EXT(resume_idle_cpu)
@@ -513,22 +513,22 @@ LEXT(start_first_cpu)
 	mov		x20, x0
 	mov		x21, #0
 
-#if defined(SWEET)
+#if defined(MT6781)
 	/* Stage 0: white 64x32 band, no stack or page tables needed. */
 	MOV64	x0, (0x7bc10000 + 2368 * 4352)	/* viva LK framebuffer, pitch 1088 px */
 	mov		w1, #-1
 	mov		x2, #32
 	mov		x4, #4352
-Lsweet_mark_row:
+Lmapple_mark_row:
 	mov		x3, #64
 	mov		x5, x0
-Lsweet_mark_pixel:
+Lmapple_mark_pixel:
 	str		w1, [x5], #4
 	subs	x3, x3, #1
-	b.ne	Lsweet_mark_pixel
+	b.ne	Lmapple_mark_pixel
 	add		x0, x0, x4
 	subs	x2, x2, #1
-	b.ne	Lsweet_mark_row
+	b.ne	Lmapple_mark_row
 	dsb		sy
 #endif
 
@@ -678,12 +678,12 @@ Lkernelcache_base_found:
 	lsr		x5,  x24, #(ARM_TT_L2_SHIFT)
 	create_bootstrap_mapping x14, x15, x5, x3, x2, x9, x10, x11, x12, x13
 
-#if defined(SWEET)
+#if defined(MT6781)
 	/*
 	 * Splash framebuffer: one 32MB Device block in the EXISTING V=P
 	 * L2 table. Both framebuffer and RAM use L1 index 0; another call to
 	 * create_bootstrap_mapping would replace the RAM L2 table.
-	 * SWEET uses 16K pages and all bring-up RAM is below 4GB, so the first
+	 * MT6781 uses 16K pages and all bring-up RAM is below 4GB, so the first
 	 * V=P L2 page is bootstrap_pagetables + 2*PGBYTES.
 	 */
 	MOV64	x10, 0x7a000000	/* 32MB block holding the viva framebuffer start */
@@ -793,7 +793,7 @@ common_start:
 	ic		iallu
 #endif
 
-#if defined(SWEET)
+#if defined(MT6781)
 	/* Complete local TLB/I-cache invalidation before enabling the MMU. */
 	dsb		sy
 	isb
@@ -837,11 +837,11 @@ common_start:
 	MSR_SCTLR_EL1_X0
 	isb		sy
 
-#if !VMAPPLE && !defined(SWEET)
+#if !VMAPPLE && !defined(MT6781)
 	MOV64   x1, SCTLR_EL1_DEFAULT
 	cmp		x0, x1
 	bne		.
-#endif /* !VMAPPLE && !SWEET */
+#endif /* !VMAPPLE && !MT6781 */
 
 #if (!CONFIG_KERNEL_INTEGRITY || (CONFIG_KERNEL_INTEGRITY && !defined(KERNEL_INTEGRITY_WT)))
 	/* Watchtower

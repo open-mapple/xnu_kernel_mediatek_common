@@ -1,5 +1,5 @@
 /*
- * SWEET: minimal IOHIDEventService.
+ * minimal IOHIDEventService.
  *
  * Apple's IOHIDFamily kext is not part of xnu. The iOS 16.7 userland
  * (IOKit.framework's HID event system, IOHIDFamily-1915.140.3) talks to

@@ -24,7 +24,7 @@
 #ifndef _IOKIT_IOHIDEVENT_H
 #define _IOKIT_IOHIDEVENT_H
 
-/* SWEET: kernel build, no SDK TargetConditionals.h */
+/* kernel build, no SDK TargetConditionals.h */
 #ifndef TARGET_OS_DRIVERKIT
 #define TARGET_OS_DRIVERKIT 0
 #endif

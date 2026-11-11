@@ -766,16 +766,16 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
 		}
 	}
 
-#if defined(ARM64_BOARD_CONFIG_SWEET)
+#if defined(ARM64_BOARD_CONFIG_MT6781)
 //
-//	SWEET: root on a GPT partition of the internal UFS (bsd/dev/sweet_ufs.c)
+//	root on a GPT partition of the internal UFS (bsd/dev/mtk_ufs.c)
 //
 	if (strcmp(rdBootVar, "ufsroot0") == 0) {
-		extern int sweet_ufs_rootdev(dev_t *dev);
+		extern int mtk_ufs_rootdev(dev_t *dev);
 		OSSafeReleaseNULL(matching);
-		int ufs_error = sweet_ufs_rootdev(root);
+		int ufs_error = mtk_ufs_rootdev(root);
 		if (ufs_error) {
-			panic("IOFindBSDRoot: SWEET UFS root %s unavailable: %d", rdBootVar, ufs_error);
+			panic("IOFindBSDRoot: MT6781 UFS root %s unavailable: %d", rdBootVar, ufs_error);
 		}
 		strlcpy(rootName, rdBootVar, rootNameSize);
 		IOLog("BSD root: %s, major %d, minor %d\n", rootName, major(*root), minor(*root));

@@ -212,7 +212,7 @@ L_ipui_loop:
 	.globl EXT(CleanPoC_Dcache)
 	.globl EXT(clean_mmu_dcache)
 LEXT(CleanPoC_Dcache)
-LEXT(clean_mmu_dcache)		/* sweet: was exported without a label */
+LEXT(clean_mmu_dcache)		/* Open Mapple: was exported without a label */
 #if  defined(APPLE_ARM64_ARCH_FAMILY)
 	dsb		sy
 	ret
@@ -348,7 +348,7 @@ LEXT(CleanPoC_DcacheRegion_Force)
  *	void CleanPoC_DcacheRegion_Force_nopreempt(vm_offset_t va, size_t length)
  *	void CleanPoC_DcacheRegion_Force_nopreempt_nohid(vm_offset_t va, size_t length)
  *
- *		sweet: the Apple variants toggle HID bits around DC CVAC; generic
+ *		Open Mapple: the Apple variants toggle HID bits around DC CVAC; generic
  *		ARMv8 has no such bits, so both are the plain region clean.
  */
 	.text

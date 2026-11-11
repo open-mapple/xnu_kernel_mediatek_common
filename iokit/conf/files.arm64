@@ -6,35 +6,35 @@ iokit/Kernel/IOPMrootDomain.cpp    					optional iokitcpp
 # SMP
 iokit/Kernel/arm/AppleARMSMP.cpp    					optional iokitcpp
 
-# SWEET device-tree platform (empty translation unit on other boards)
-iokit/Kernel/arm/SweetPlatformExpert.cpp                         optional iokitcpp
+# MT6781 device-tree platform (empty translation unit on other boards)
+iokit/Kernel/arm/MapplePlatformExpert.cpp                         optional iokitcpp
 
-iokit/Kernel/arm/SweetCPU.cpp                                    optional iokitcpp
-iokit/Kernel/arm/SweetEntitlements.cpp                           optional iokitcpp
-iokit/Kernel/arm/SweetKeyStore.cpp                               optional iokitcpp
-iokit/Kernel/arm/SweetWatchdog.cpp                               optional iokitcpp
-iokit/Kernel/arm/SweetAMFI.cpp                                   optional iokitcpp
-iokit/Kernel/arm/SweetSurface.cpp                                optional iokitcpp
-iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
-iokit/Kernel/arm/SweetGIC.cpp                                    optional iokitcpp
-iokit/Kernel/arm/VivaPwrap.cpp                                   optional iokitcpp
-iokit/Kernel/arm/VivaEINT.cpp                                    optional iokitcpp
-iokit/Kernel/arm/VivaPMIC.cpp                                    optional iokitcpp
-iokit/Kernel/arm/VivaIO.cpp                                      optional iokitcpp
-iokit/Kernel/arm/VivaGPU.cpp                                     optional iokitcpp
-iokit/Kernel/arm/VivaGPUUserClient.cpp                           optional iokitcpp
-iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
-iokit/Kernel/arm/VivaBattery.cpp                                 optional iokitcpp
-iokit/Kernel/arm/VivaWiFi.cpp                                    optional iokitcpp
-iokit/Kernel/arm/VivaWLAN.cpp                                    optional iokitcpp
-iokit/Kernel/arm/VivaScaler.cpp                                  optional iokitcpp
-iokit/Kernel/arm/VivaMDP.cpp                                     optional iokitcpp
-iokit/Kernel/arm/VivaJPEGHW.cpp                                  optional iokitcpp
-iokit/Kernel/arm/VivaJPEG.cpp                                    optional iokitcpp
-iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
-iokit/Kernel/arm/hid/VivaKeypad.cpp                              optional iokitcpp
-iokit/Kernel/arm/hid/VivaPMICKeys.cpp                            optional iokitcpp
-iokit/Kernel/arm/hid/VivaGT9896.cpp                              optional iokitcpp
+iokit/Kernel/arm/MappleCPU.cpp                                    optional iokitcpp
+iokit/Kernel/arm/MappleEntitlements.cpp                           optional iokitcpp
+iokit/Kernel/arm/MappleKeyStore.cpp                               optional iokitcpp
+iokit/Kernel/arm/MappleWatchdog.cpp                               optional iokitcpp
+iokit/Kernel/arm/MappleAMFI.cpp                                   optional iokitcpp
+iokit/Kernel/arm/MappleSurface.cpp                                optional iokitcpp
+iokit/Kernel/arm/MappleFramebuffer.cpp                            optional iokitcpp
+iokit/Kernel/arm/MappleGIC.cpp                                    optional iokitcpp
+iokit/Kernel/arm/MTKPwrap.cpp                                   optional iokitcpp
+iokit/Kernel/arm/MTKEINT.cpp                                    optional iokitcpp
+iokit/Kernel/arm/MT6358PMIC.cpp                                    optional iokitcpp
+iokit/Kernel/arm/MTKIO.cpp                                      optional iokitcpp
+iokit/Kernel/arm/MappleGPU.cpp                                     optional iokitcpp
+iokit/Kernel/arm/MappleGPUUserClient.cpp                           optional iokitcpp
+iokit/Kernel/arm/MapplePowerSource.cpp                                optional iokitcpp
+iokit/Kernel/arm/BQ27Z561Battery.cpp                                 optional iokitcpp
+iokit/Kernel/arm/MT6631WiFi.cpp                                    optional iokitcpp
+iokit/Kernel/arm/MT6631WLAN.cpp                                    optional iokitcpp
+iokit/Kernel/arm/MTKScaler.cpp                                  optional iokitcpp
+iokit/Kernel/arm/MTKMDP.cpp                                     optional iokitcpp
+iokit/Kernel/arm/MTKJPEGHW.cpp                                  optional iokitcpp
+iokit/Kernel/arm/MTKJPEG.cpp                                    optional iokitcpp
+iokit/Kernel/arm/hid/MappleHID.cpp                                optional iokitcpp
+iokit/Kernel/arm/hid/MTKKeypad.cpp                              optional iokitcpp
+iokit/Kernel/arm/hid/MT6358Keys.cpp                            optional iokitcpp
+iokit/Kernel/arm/hid/GT9896.cpp                              optional iokitcpp
 iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
 iokit/Kernel/arm/hid/IOHIDEventServiceQueue.cpp                  optional iokitcpp
 iokit/Kernel/arm/hid/IOHIDEventServiceUserClient.cpp             optional iokitcpp

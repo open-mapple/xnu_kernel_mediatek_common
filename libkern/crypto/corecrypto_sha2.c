@@ -34,12 +34,12 @@
 
 #if defined(CRYPTO_SHA2)
 
-#if defined(ARM64_BOARD_CONFIG_SWEET)
+#if defined(ARM64_BOARD_CONFIG_MT6781)
 /*
- * SWEET has no corecrypto kext, so g_crypto_funcs stays NULL. SHA-256 uses
- * XNU's built-in implementation directly, as the SWEET PRNG does; this also
+ * MT6781 has no corecrypto kext, so g_crypto_funcs stays NULL. SHA-256 uses
+ * XNU's built-in implementation directly, as the MT6781 PRNG does; this also
  * serves code-signing page hashes. SHA-384/512 use BearSSL's portable
- * implementation (libkern/crypto/sweet_sha2big.c), its context stored in
+ * implementation (libkern/crypto/bearssl_sha2big.c), its context stored in
  * the caller's SHA384_CTX/SHA512_CTX.
  */
 #include <corecrypto/ccsha2.h>
@@ -84,8 +84,8 @@ SHA256_Final(void *digest, SHA256_CTX *ctx)
 	ccdigest_final(di, ctx->ctx, digest);
 }
 
-#if defined(ARM64_BOARD_CONFIG_SWEET)
-#include "sweet_bearssl/inc/bearssl_hash.h"
+#if defined(ARM64_BOARD_CONFIG_MT6781)
+#include "bearssl/inc/bearssl_hash.h"
 
 _Static_assert(sizeof(br_sha384_context) <= sizeof(SHA512_CTX),
     "BearSSL SHA-384/512 context must fit in SHA512_CTX");
@@ -127,7 +127,7 @@ SHA512_Final(void *digest, SHA512_CTX *ctx)
 	br_sha512_out(BR_CTX(ctx), digest);
 }
 
-#else /* !ARM64_BOARD_CONFIG_SWEET */
+#else /* !ARM64_BOARD_CONFIG_MT6781 */
 
 void
 SHA384_Init(SHA384_CTX *ctx)
@@ -194,7 +194,7 @@ SHA512_Final(void *digest, SHA512_CTX *ctx)
 	ccdigest_final(di, ctx->ctx, digest);
 }
 
-#endif /* !ARM64_BOARD_CONFIG_SWEET */
+#endif /* !ARM64_BOARD_CONFIG_MT6781 */
 
 #else
 

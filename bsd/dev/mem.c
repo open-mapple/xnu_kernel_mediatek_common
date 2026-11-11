@@ -153,30 +153,30 @@ mmioctl(dev_t dev, u_long cmd, __unused caddr_t data,
 	return 0;
 }
 
-#if defined(ARM64_BOARD_CONFIG_SWEET)
+#if defined(ARM64_BOARD_CONFIG_MT6781)
 /*
- * SWEET: daemons started by launchd write stdout/stderr to /dev/null, and
+ * daemons started by launchd write stdout/stderr to /dev/null, and
  * pointing a launchd job at /dev/console stops it from launching at all
  * (backboardd, v8 image). Instead, what the processes named in boot-arg
- * sweetnull (comma separated, default "backboardd,SpringBoard") write to
+ * mp_null_tee (comma separated, default "backboardd,SpringBoard") write to
  * /dev/null goes to the console (and so to the persistent log) as
- * "|name| text". sweetnull=- turns it off.
+ * "|name| text". mp_null_tee=- turns it off.
  */
-static char sweet_null_names[128];
-static int sweet_null_parsed;
+static char mapple_null_names[128];
+static int mapple_null_parsed;
 
 static bool
-sweet_null_tee(char *name, size_t len)
+mapple_null_tee(char *name, size_t len)
 {
-	if (!sweet_null_parsed) {
-		if (!PE_parse_boot_argn("sweetnull", sweet_null_names, sizeof(sweet_null_names))) {
-			strlcpy(sweet_null_names, "backboardd,SpringBoard", sizeof(sweet_null_names));
+	if (!mapple_null_parsed) {
+		if (!PE_parse_boot_argn_alias("mp_null_tee", "sweetnull", mapple_null_names, sizeof(mapple_null_names))) {
+			strlcpy(mapple_null_names, "backboardd,SpringBoard", sizeof(mapple_null_names));
 		}
-		sweet_null_parsed = 1;
+		mapple_null_parsed = 1;
 	}
 	proc_selfname(name, (int)len);
 	size_t n = strlen(name);
-	for (const char *t = sweet_null_names; *t;) {
+	for (const char *t = mapple_null_names; *t;) {
 		const char *end = strchr(t, ',');
 		size_t tl = end ? (size_t)(end - t) : strlen(t);
 		if (tl == n && n > 0 && strncmp(t, name, n) == 0) {
@@ -254,10 +254,10 @@ mmrw(dev_t dev, struct uio *uio, enum uio_rw rw)
 			if (rw == UIO_READ) {
 				return 0;
 			}
-#if defined(ARM64_BOARD_CONFIG_SWEET)
+#if defined(ARM64_BOARD_CONFIG_MT6781)
 			{
 				char name[32];
-				if (sweet_null_tee(name, sizeof(name))) {
+				if (mapple_null_tee(name, sizeof(name))) {
 					char buf[256];
 					c = MIN(uio_curriovlen(uio), sizeof(buf));
 					error = uiomove(buf, (int)c, uio);

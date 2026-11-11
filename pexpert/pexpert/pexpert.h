@@ -339,6 +339,13 @@ extern boolean_t PE_parse_boot_argn(
 	void            *arg_ptr,
 	int                     max_arg);
 
+/* Open Mapple: a boot-arg under its new name, else under the old one it had (a line says it was renamed) */
+extern boolean_t PE_parse_boot_argn_alias(
+	const char      *arg_string,
+	const char      *old_string,
+	void            *arg_ptr,
+	int                     max_arg);
+
 #if XNU_KERNEL_PRIVATE
 extern boolean_t PE_parse_boot_arg_str(
 	const char *arg_string,

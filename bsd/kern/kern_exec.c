@@ -7411,8 +7411,8 @@ process_signature(proc_t p, struct image_params *imgp)
 				error = EACCES;
 				goto done;
 			}
-#if defined(ARM64_BOARD_CONFIG_SWEET)
-			/* SWEET runs every iOS binary this way: one short line per exec. */
+#if defined(ARM64_BOARD_CONFIG_MT6781)
+			/* MT6781 runs every iOS binary this way: one short line per exec. */
 			printf("exec %s\n", p->p_name);
 #else
 			printf("Allowing spawn of iOS binary %s since it has "

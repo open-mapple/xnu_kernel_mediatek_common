@@ -85,7 +85,7 @@
 #include <sys/pgo.h>
 #include <console/serial_protos.h>
 #if defined(__arm64__)
-#include <arm64/sweet_early.h>
+#include <arm64/early_console.h>
 #endif
 #include <IOKit/IOBSD.h>
 
@@ -1072,9 +1072,9 @@ panic_trap_to_debugger(const char *panic_format_str, va_list *panic_args, unsign
 {
 #pragma clang diagnostic pop
 
-#if defined(SWEET)
+#if defined(MT6781)
 	/* No CPU/thread/debugger state is required for this first panic copy. */
-	sweet_early_panic(panic_format_str, panic_args);
+	early_console_panic(panic_format_str, panic_args);
 #endif
 
 #if defined(__x86_64__) && (DEVELOPMENT || DEBUG)

@@ -41,7 +41,7 @@
 #include <machine/atomic.h>
 #include <arm64/proc_reg.h>
 #include <arm64/lowglobals.h>
-#include <arm64/sweet_early.h>
+#include <arm64/early_console.h>
 #include <arm/cpu_data_internal.h>
 #include <arm/misc_protos.h>
 #include <pexpert/arm64/boot.h>
@@ -1820,30 +1820,30 @@ init_ptpages(tt_entry_t *tt, vm_map_address_t start, vm_map_address_t end, bool 
  * arm_vm_physmap_slide() preserves each PA's block offset. Each PTOV entry
  * can therefore consume up to one extra twig of VA space. Reserve that
  * space in both the aperture bound and its L1 allocation, including the
- * ARM_LARGE_MEMORY configuration used by SWEET's non-PPL kernel.
+ * ARM_LARGE_MEMORY configuration used by MT6781's non-PPL kernel.
  */
 #define ARM64_PHYSMAP_ALIGNMENT_PADDING (PTOV_TABLE_SIZE * ARM_TT_TWIG_SIZE)
 #endif
 
-#if defined(SWEET)
+#if defined(MT6781)
 /*
  * The reserved low-globals/kernel region is excluded from VM allocation.
  * Use the otherwise empty 32MB block above low globals and below gVirtBase
  * for a Normal-NC framebuffer alias that survives bootstrap TTBR0 teardown.
  */
-#define SWEET_EARLY_FB_VA (VM_MIN_KERNEL_ADDRESS + ARM_TT_L2_SIZE)
+#define EARLY_CONSOLE_FB_VA (VM_MIN_KERNEL_ADDRESS + ARM_TT_L2_SIZE)
 
 static void
-sweet_early_map_final(void)
+early_console_map_final(void)
 {
-	const vm_map_address_t va = SWEET_EARLY_FB_VA;
+	const vm_map_address_t va = EARLY_CONSOLE_FB_VA;
 	assert(va + ARM_TT_L2_SIZE <= gVirtBase);
 	tt_entry_t l1 = cpu_tte[(va & ARM_TT_L1_INDEX_MASK) >> ARM_TT_L1_SHIFT];
 	assert((l1 & (ARM_TTE_VALID | ARM_TTE_TYPE_MASK)) == (ARM_TTE_VALID | ARM_TTE_TYPE_TABLE));
 	tt_entry_t *l2 = (tt_entry_t *)phystokv(l1 & ARM_TTE_TABLE_MASK);
 	tt_entry_t *slot = &l2[(va & ARM_TT_L2_INDEX_MASK) >> ARM_TT_L2_SHIFT];
 	assert(*slot == ARM_TTE_EMPTY);
-	*slot = SWEET_EARLY_FB_BLOCK | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
+	*slot = EARLY_CONSOLE_FB_BLOCK | ARM_TTE_VALID | ARM_TTE_TYPE_BLOCK |
 	    ARM_TTE_BLOCK_SH(SH_OUTER_MEMORY) |
 	    ARM_TTE_BLOCK_ATTRINDX(CACHE_ATTRINDX_DISABLE) |
 	    ARM_TTE_BLOCK_AF | ARM_TTE_BLOCK_PNX | ARM_TTE_BLOCK_NX;
@@ -2179,28 +2179,28 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
 
 	arm_set_user_tbi();
 
-#if defined(SWEET)
+#if defined(MT6781)
 	/* phystokv() must still refer to the bootstrap aperture here. */
-	sweet_early_map_final();
+	early_console_map_final();
 #endif
 	arm_vm_physmap_init(args);
 	set_mmu_ttb_alternate(cpu_ttep & TTBR_BADDR_MASK);
 
 	ml_enable_monitor();
 
-#if defined(SWEET)
+#if defined(MT6781)
 	/* The final TTBR1 is live; leave the outgoing VA=PA framebuffer alias. */
-	sweet_early_relocate(SWEET_EARLY_FB_VA + (SWEET_EARLY_FB_PHYS - SWEET_EARLY_FB_BLOCK));
+	early_console_relocate(EARLY_CONSOLE_FB_VA + (EARLY_CONSOLE_FB_PHYS - EARLY_CONSOLE_FB_BLOCK));
 #endif
 	set_mmu_ttb(invalid_ttep & TTBR_BADDR_MASK);
 
 	flush_mmu_tlb();
-	sweet_early_mark(10, "TTBR0 off; TLB flushed");
+	early_console_mark(10, "TTBR0 off; TLB flushed");
 	kva_active = TRUE;
 	// global table pointers may need to be different due to physical aperture remapping
 	cpu_tte = (tt_entry_t*)(phystokv(cpu_ttep));
 	invalid_tte = (tt_entry_t*)(phystokv(invalid_ttep));
-	sweet_early_mark(11, "physmap table pointers rebound");
+	early_console_mark(11, "physmap table pointers rebound");
 
 	// From here on out, we're off the bootstrap translation tables.
 
@@ -2293,9 +2293,9 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
     }
 #endif
 #endif
-	sweet_early_mark(12, "calling pmap_bootstrap");
+	early_console_mark(12, "calling pmap_bootstrap");
 	pmap_bootstrap(dynamic_memory_begin);
-	sweet_early_mark(13, "pmap_bootstrap done");
+	early_console_mark(13, "pmap_bootstrap done");
 
 	disable_preemption();
 
@@ -2346,7 +2346,7 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
 		va_l1 = va_l2_end;
 		cpu_l1_tte++;
 	}
-	sweet_early_mark(14, "early I/O page tables ready");
+	early_console_mark(14, "early I/O page tables ready");
 
 #if defined(KERNEL_INTEGRITY_KTRR) || defined(KERNEL_INTEGRITY_CTRR)
 	/*

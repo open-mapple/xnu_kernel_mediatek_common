@@ -5021,26 +5021,26 @@ choose_next_pset(
  *	The thread must be locked.  The pset must be locked,
  *	and the resulting pset is locked on return.
  */
-#if defined(ARM64_BOARD_CONFIG_SWEET)
+#if defined(ARM64_BOARD_CONFIG_MT6781)
 /*
- * viva: one homogeneous pset holds 6 Cortex-A55s and 2 Cortex-A76s. Once the A76s run fast (osfmk/arm64/
- * viva_cpufreq.c sets this map), threads at or above user-initiated priority take an idle A76 first and
+ * Open Mapple: one homogeneous pset holds 6 Cortex-A55s and 2 Cortex-A76s. Once the A76s run fast (osfmk/arm64/
+ * mt6781_cpufreq.c sets this map), threads at or above user-initiated priority take an idle A76 first and
  * lower-priority threads an idle A55 first. 0 = the stock lowest-idle-cpu choice.
  */
-uint64_t sched_viva_fast_cpus = 0;
+uint64_t sched_mapple_fast_cpus = 0;
 
 static processor_t
-viva_pick_idle(processor_set_t pset, thread_t thread, cpumap_t idle)
+mapple_pick_idle(processor_set_t pset, thread_t thread, cpumap_t idle)
 {
-	cpumap_t fast = idle & sched_viva_fast_cpus;
+	cpumap_t fast = idle & sched_mapple_fast_cpus;
 	int cpuid;
-	if (sched_viva_fast_cpus == 0 || idle == 0) {
+	if (sched_mapple_fast_cpus == 0 || idle == 0) {
 		return PROCESSOR_NULL;
 	}
 	if (thread->sched_pri >= BASEPRI_USER_INITIATED && fast != 0) {
 		cpuid = lsb_first(fast);
-	} else if ((idle & ~sched_viva_fast_cpus) != 0) {
-		cpuid = lsb_first(idle & ~sched_viva_fast_cpus);
+	} else if ((idle & ~sched_mapple_fast_cpus) != 0) {
+		cpuid = lsb_first(idle & ~sched_mapple_fast_cpus);
 	} else {
 		cpuid = lsb_first(idle);
 	}
@@ -5112,10 +5112,10 @@ choose_processor(
 				 * the "least cost idle" processor above.
 				 */
 				if ((thread->sched_pri < BASEPRI_RTQUEUES) || processor_is_fast_track_candidate_for_realtime_thread(pset, processor)) {
-#if defined(ARM64_BOARD_CONFIG_SWEET)
-					if (thread->sched_pri < BASEPRI_RTQUEUES && sched_viva_fast_cpus != 0 &&
-					    ((sched_viva_fast_cpus >> processor->cpu_id) & 1) != (thread->sched_pri >= BASEPRI_USER_INITIATED)) {
-						processor_t vp = viva_pick_idle(pset, thread, pset->cpu_state_map[PROCESSOR_IDLE] &
+#if defined(ARM64_BOARD_CONFIG_MT6781)
+					if (thread->sched_pri < BASEPRI_RTQUEUES && sched_mapple_fast_cpus != 0 &&
+					    ((sched_mapple_fast_cpus >> processor->cpu_id) & 1) != (thread->sched_pri >= BASEPRI_USER_INITIATED)) {
+						processor_t vp = mapple_pick_idle(pset, thread, pset->cpu_state_map[PROCESSOR_IDLE] &
 						    pset->primary_map & pset->recommended_bitmask & ~pset->pending_AST_URGENT_cpu_mask);
 						if (vp != PROCESSOR_NULL) {
 							return vp;
@@ -5284,8 +5284,8 @@ no_available_cpus:
 		/* there shouldn't be a pending AST if the processor is idle */
 		assert((idle_primary_map & pset->pending_AST_URGENT_cpu_mask) == 0);
 
-#if defined(ARM64_BOARD_CONFIG_SWEET)
-		processor_t vp = viva_pick_idle(pset, thread, idle_primary_map);
+#if defined(ARM64_BOARD_CONFIG_MT6781)
+		processor_t vp = mapple_pick_idle(pset, thread, idle_primary_map);
 		if (vp != PROCESSOR_NULL) {
 			return vp;
 		}

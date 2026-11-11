@@ -25,7 +25,7 @@
 #ifndef IOHIDDeviceTypes_h
 #define IOHIDDeviceTypes_h
 
-/* SWEET: kernel build, no SDK TargetConditionals.h */
+/* kernel build, no SDK TargetConditionals.h */
 #ifndef TARGET_OS_DRIVERKIT
 #define TARGET_OS_DRIVERKIT 0
 #endif

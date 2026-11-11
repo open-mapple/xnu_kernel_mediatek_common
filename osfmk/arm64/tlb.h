@@ -51,7 +51,7 @@
 static inline void
 sync_tlb_flush(void)
 {
-#if defined(SWEET)
+#if defined(MT6781)
 	/*
 	 * Cortex-A76 erratum 1286807 (r0p0-r3p0) and Cortex-A55 erratum 2441007:
 	 * a broadcast TLBI completed by a DSB may leave stale entries. Like Linux's

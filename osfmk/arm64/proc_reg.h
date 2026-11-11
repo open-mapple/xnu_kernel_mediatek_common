@@ -213,7 +213,7 @@
 /* D-Cache. */
 #define MMU_CLINE   6
 
-#elif defined (SWEET) /* Qualcomm Kryo 470: Cortex-A76 + Cortex-A55 */
+#elif defined (MT6781) /* Qualcomm Kryo 470: Cortex-A76 + Cortex-A55 */
 
 /* I-Cache. */
 #define MMU_I_CLINE 6

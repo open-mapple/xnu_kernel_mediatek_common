@@ -12,7 +12,7 @@
 #include <IOKit/IOLib.h>
 
 /*
- * SWEET: HID logging goes to the kernel console (and so the persistent
+ * HID logging goes to the kernel console (and so the persistent
  * log) instead of os_log, so the HID path is visible in boot logs.
  */
 #define HIDLog(fmt, ...)        IOLog("HID: " fmt "\n", ##__VA_ARGS__)

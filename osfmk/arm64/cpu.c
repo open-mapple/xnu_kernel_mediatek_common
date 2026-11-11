@@ -922,7 +922,7 @@ cpu_start(int cpu)
 
 		flush_dcache((vm_offset_t)&CpuDataEntries[cpu], sizeof(cpu_data_entry_t), FALSE);
 		flush_dcache((vm_offset_t)cpu_data_ptr, sizeof(cpu_data_t), FALSE);
-#if defined(SWEET)
+#if defined(MT6781)
 		/* The reset stub loads these through physical addresses with caches off.
 		 * Use VA range cleans to PoC, including on coherent-I/O builds. */
 		extern uint8_t bootstrap_pagetables[BOOTSTRAP_TABLE_SIZE];
@@ -963,11 +963,11 @@ cpu_start(int cpu)
 }
 
 
-#if defined(SWEET)
+#if defined(MT6781)
 /* Bring-up observer: the self-SGI clears SIGPdisabled after IRQs unmask. */
-boolean_t sweet_cpu_signal_is_enabled(unsigned int cpu);
+boolean_t mapple_cpu_signal_is_enabled(unsigned int cpu);
 boolean_t
-sweet_cpu_signal_is_enabled(unsigned int cpu)
+mapple_cpu_signal_is_enabled(unsigned int cpu)
 {
 	if (cpu >= MAX_CPUS) {
 		return FALSE;

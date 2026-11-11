@@ -5126,7 +5126,7 @@ IOService::publishHiddenMedia(IOService * parent)
 	bool                wasHiding;
 
 	iomediaClass = OSMetaClass::getMetaClassWithName(gIOMediaKey);
-#if !defined(ARM64_BOARD_CONFIG_SWEET)
+#if !defined(ARM64_BOARD_CONFIG_MT6781)
 	assert(iomediaClass);
 #endif
 
@@ -5137,8 +5137,8 @@ IOService::publishHiddenMedia(IOService * parent)
 	}
 	UNLOCKNOTIFY();
 
-#if defined(ARM64_BOARD_CONFIG_SWEET)
-	/* SWEET has no IOStorageFamily: without the IOMedia class no media exists to unhide. */
+#if defined(ARM64_BOARD_CONFIG_MT6781)
+	/* MT6781 has no IOStorageFamily: without the IOMedia class no media exists to unhide. */
 	if (!iomediaClass) {
 		wasHiding = false;
 	}
@@ -5188,9 +5188,9 @@ IOService::setRootMedia(IOService * root)
 	bool unhide;
 
 	ioblockstoragedriverClass = OSMetaClass::getMetaClassWithName(gIOBlockStorageDriverKey);
-#if defined(ARM64_BOARD_CONFIG_SWEET)
+#if defined(ARM64_BOARD_CONFIG_MT6781)
 	/*
-	 * SWEET has no IOStorageFamily, so no service can be a block storage
+	 * MT6781 has no IOStorageFamily, so no service can be a block storage
 	 * driver: the root (e.g. a RAM disk) is not block media, as for image boot.
 	 */
 	if (!ioblockstoragedriverClass) {

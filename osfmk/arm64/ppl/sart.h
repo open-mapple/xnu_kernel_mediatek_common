@@ -1,5 +1,5 @@
 /*
- * sweet: Apple's SART (IOMMU for NVMe/ANS) header is not in the open
+ * Open Mapple: Apple's SART (IOMMU for NVMe/ANS) header is not in the open
  * source drop. There is no SART on Qualcomm hardware; bootstrap is a no-op.
  */
 #ifndef _ARM64_PPL_SART_H_

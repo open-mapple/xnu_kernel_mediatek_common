@@ -1,5 +1,5 @@
 /*
- * SWEET: the two IOGraphics types the HID headers use (IOGraphicsFamily
+ * the two IOGraphics types the HID headers use (IOGraphicsFamily
  * is not part of xnu). Layouts as in IOKit/graphics/IOGraphicsTypes.h.
  */
 #ifndef _IOKIT_IOGRAPHICSTYPES_H

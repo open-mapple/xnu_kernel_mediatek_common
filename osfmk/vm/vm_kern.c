@@ -2439,9 +2439,9 @@ kmem_sizeclass_init(void)
 	}
 }
 
-#if defined(SWEET)
+#if defined(MT6781)
 /*
- * No corecrypto kext is loaded on SWEET yet. The kmem RNG contract permits
+ * No corecrypto kext is loaded on MT6781 yet. The kmem RNG contract permits
  * a non-cryptographic generator and requires lock-free generation. Keep
  * allocator RNG state per CPU/sizeclass; seed it from XNU's built-in early
  * HMAC-SHA256 DRBG during single-CPU initialization.
@@ -2450,12 +2450,12 @@ kmem_sizeclass_init(void)
  * https://prng.di.unimi.it/splitmix64.c
  * This is private to kmem; it does not register or replace crypto services.
  */
-struct sweet_kmem_rng {
+struct mapple_kmem_rng {
 	uint64_t state;
 };
 
 static uint64_t
-sweet_kmem_random64(struct sweet_kmem_rng *rng)
+mapple_kmem_random64(struct mapple_kmem_rng *rng)
 {
 	uint64_t value = (rng->state += 0x9e3779b97f4a7c15ULL);
 	value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ULL;
@@ -2464,18 +2464,18 @@ sweet_kmem_random64(struct sweet_kmem_rng *rng)
 }
 
 static uint64_t
-sweet_kmem_uniform(struct sweet_kmem_rng *rng, uint64_t bound)
+mapple_kmem_uniform(struct mapple_kmem_rng *rng, uint64_t bound)
 {
 	assert(bound != 0);
 	/* Reject the incomplete residue interval to avoid modulo bias. */
 	const uint64_t threshold = -bound % bound;
 	uint64_t value;
 	do {
-		value = sweet_kmem_random64(rng);
+		value = mapple_kmem_random64(rng);
 	} while (value < threshold);
 	return value % bound;
 }
-#endif /* SWEET */
+#endif /* MT6781 */
 
 /*
  * This is done during EARLY_BOOT as it needs the corecrypto module to be
@@ -2485,8 +2485,8 @@ __startup_func
 static void
 kmem_crypto_init(void)
 {
-#if defined(SWEET)
-	vm_size_t ctx_size = sizeof(struct sweet_kmem_rng);
+#if defined(MT6781)
+	vm_size_t ctx_size = sizeof(struct mapple_kmem_rng);
 #else
 	vm_size_t ctx_size = crypto_random_kmem_ctx_size();
 #endif
@@ -2496,8 +2496,8 @@ kmem_crypto_init(void)
 
 		ks->ks_rng_ctx = zalloc_percpu_permanent(ctx_size, ZALIGN_PTR);
 		zpercpu_foreach(ctx, ks->ks_rng_ctx) {
-#if defined(SWEET)
-			((struct sweet_kmem_rng *)ctx)->state = early_random();
+#if defined(MT6781)
+			((struct mapple_kmem_rng *)ctx)->state = early_random();
 #else
 			crypto_random_kmem_init(ctx);
 #endif
@@ -2765,8 +2765,8 @@ kmem_get_next_slot(
 		 */
 		slot_idx = kmem_get_random16((uint16_t)num_slots - 1);
 	} else {
-#if defined(SWEET)
-		slot_idx = sweet_kmem_uniform(zpercpu_get(sizeclass.ks_rng_ctx), num_slots);
+#if defined(MT6781)
+		slot_idx = mapple_kmem_uniform(zpercpu_get(sizeclass.ks_rng_ctx), num_slots);
 #else
 		crypto_random_uniform(zpercpu_get(sizeclass.ks_rng_ctx), num_slots,
 		    &slot_idx);

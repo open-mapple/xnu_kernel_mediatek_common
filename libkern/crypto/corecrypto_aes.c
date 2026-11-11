@@ -32,12 +32,12 @@
 #include <corecrypto/ccaes.h>
 #include <kern/debug.h>
 
-#if defined(ARM64_BOARD_CONFIG_SWEET)
-/* SWEET has a built-in portable AES provider for the legacy CBC/ECB API. */
-extern const struct ccmode_cbc sweet_aes_cbc_encrypt;
-extern const struct ccmode_cbc sweet_aes_cbc_decrypt;
-#define AES_CBC_ENCRYPT_MODE (&sweet_aes_cbc_encrypt)
-#define AES_CBC_DECRYPT_MODE (&sweet_aes_cbc_decrypt)
+#if defined(ARM64_BOARD_CONFIG_MT6781)
+/* MT6781 has a built-in portable AES provider for the legacy CBC/ECB API. */
+extern const struct ccmode_cbc bearssl_aes_cbc_encrypt;
+extern const struct ccmode_cbc bearssl_aes_cbc_decrypt;
+#define AES_CBC_ENCRYPT_MODE (&bearssl_aes_cbc_encrypt)
+#define AES_CBC_DECRYPT_MODE (&bearssl_aes_cbc_decrypt)
 #else
 #define AES_CBC_ENCRYPT_MODE (g_crypto_funcs->ccaes_cbc_encrypt)
 #define AES_CBC_DECRYPT_MODE (g_crypto_funcs->ccaes_cbc_decrypt)

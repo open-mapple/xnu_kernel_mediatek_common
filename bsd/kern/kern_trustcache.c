@@ -248,9 +248,9 @@ trust_cache_runtime_init(void)
 	allow_legacy_caches = true;
 #endif
 
-#if defined(SWEET)
+#if defined(MT6781)
 	/*
-	 * Standalone SWEET bring-up has no AppleImage4/AMFI kexts. Represent
+	 * Standalone MT6781 bring-up has no AppleImage4/AMFI kexts. Represent
 	 * the missing service explicitly: no caches can be loaded or matched.
 	 * Keep a NULL runtime through lockdown rather than a partially
 	 * initialized runtime that would later dereference absent callbacks.
@@ -258,7 +258,7 @@ trust_cache_runtime_init(void)
 	if (img4if == NULL || amfi == NULL) {
 		trust_cache_rt = NULL;
 		trust_cache_mut_rt = NULL;
-		printf("SWEET: trust caches unavailable (Image4/AMFI not installed)\n");
+		printf("trust caches unavailable (Image4/AMFI not installed)\n");
 		return;
 	}
 #endif
@@ -493,7 +493,7 @@ check_trust_cache_runtime_for_uuid(
 		return KERN_INVALID_ARGUMENT;
 	}
 
-#if defined(SWEET)
+#if defined(MT6781)
 	if (trust_cache_rt == NULL) {
 		return KERN_NOT_FOUND;
 	}
@@ -583,7 +583,7 @@ load_trust_cache_with_type(
 		}
 	}
 
-#if defined(SWEET)
+#if defined(MT6781)
 	if (trust_cache_rt == NULL) {
 		return KERN_NOT_SUPPORTED;
 	}
@@ -695,7 +695,7 @@ load_legacy_trust_cache(
 		panic("overflow on the module: %p | %lu", module_data, module_size);
 	}
 
-#if defined(SWEET)
+#if defined(MT6781)
 	if (trust_cache_rt == NULL) {
 		return KERN_NOT_SUPPORTED;
 	}
@@ -729,7 +729,7 @@ query_trust_cache(
 		return KERN_INVALID_ARGUMENT;
 	}
 
-#if defined(SWEET)
+#if defined(MT6781)
 	if (trust_cache_rt == NULL) {
 		if (query_type >= kTCQueryTypeTotal) {
 			return KERN_INVALID_ARGUMENT;
@@ -946,7 +946,7 @@ static_trust_cache_capabilities(
 	*capabilities0_ret = kTCCapabilityNone;
 	*capabilities1_ret = kTCCapabilityNone;
 
-#if defined(SWEET)
+#if defined(MT6781)
 	if (trust_cache_rt == NULL) {
 		return KERN_NOT_SUPPORTED;
 	}

@@ -1210,15 +1210,15 @@ in_control(struct socket *so, u_long cmd, caddr_t data, struct ifnet *ifp,
 	/* In case it's NULL, make sure it came from the kernel */
 	VERIFY(so != NULL || p == kernproc);
 
-#if defined(ARM64_BOARD_CONFIG_SWEET)
-	/* SWEET: which process sets IPv4 addresses on which interface. */
+#if defined(ARM64_BOARD_CONFIG_MT6781)
+	/* which process sets IPv4 addresses on which interface. */
 	if ((cmd == SIOCAIFADDR || cmd == SIOCDIFADDR) && ifp != NULL) {
-		static int sweet_in_logged;
-		if (sweet_in_logged++ < 100) {
+		static int mapple_in_logged;
+		if (mapple_in_logged++ < 100) {
 			const uint8_t *a = (const uint8_t *)&((struct in_aliasreq *)(void *)data)->ifra_addr.sin_addr;
 			char pname[20];
 			proc_name(proc_pid(p), pname, sizeof(pname));
-			printf("SWEET NET: %s %s %s %u.%u.%u.%u\n", pname, if_name(ifp),
+			printf("NET: %s %s %s %u.%u.%u.%u\n", pname, if_name(ifp),
 			    cmd == SIOCAIFADDR ? "add address" : "delete address", a[0], a[1], a[2], a[3]);
 		}
 	}

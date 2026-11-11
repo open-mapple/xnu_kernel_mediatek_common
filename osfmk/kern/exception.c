@@ -820,23 +820,23 @@ exception_triage(
 	return exception_triage_thread(exception, code, codeCnt, thread);
 }
 
-#if defined(ARM64_BOARD_CONFIG_SWEET)
+#if defined(ARM64_BOARD_CONFIG_MT6781)
 #include <vm/vm_shared_region.h>
 #include <arm/thread.h>
 
 /*
- * SWEET crash report on the console. The phone has no way to get crash
+ * MT6781 crash report on the console. The phone has no way to get crash
  * logs off the device, and corpses stop after a few crashes, so print what
  * symbolication needs: user registers, a frame-pointer backtrace, the
  * shared cache slide (unslid = pc - slide) and the main binary's Mach-O
  * header (offset = pc - mh). Called from proc_prepareexit on the exiting
  * (crashing) thread.
  */
-void sweet_crash_log(const char *name, int pid, int sig, uint64_t code, uint64_t subcode);
-static void sweet_crash_strings(const char *name);
+void mapple_crash_log(const char *name, int pid, int sig, uint64_t code, uint64_t subcode);
+static void mapple_crash_strings(const char *name);
 
 void
-sweet_crash_log(const char *name, int pid, int sig, uint64_t code, uint64_t subcode)
+mapple_crash_log(const char *name, int pid, int sig, uint64_t code, uint64_t subcode)
 {
 	thread_t thread = current_thread();
 	task_t task = current_task();
@@ -893,12 +893,12 @@ sweet_crash_log(const char *name, int pid, int sig, uint64_t code, uint64_t subc
 		vm_map_unlock_read(map);
 	}
 	if (sig == 6 || sig == 5) {
-		sweet_crash_strings(name);
+		mapple_crash_strings(name);
 	}
 }
 
 /*
- * SWEET: for a process named in boot-arg sweetscan (comma separated,
+ * for a process named in boot-arg mp_crash_strings (comma separated,
  * default "backboardd,SpringBoard"; "-" = off) that dies with SIGABRT or
  * SIGTRAP (BSAssert / NSAssert style failures) print the printable text runs
  * (>= 24 characters, at least 2 spaces) found in its malloc heap as
@@ -906,7 +906,7 @@ sweet_crash_log(const char *name, int pid, int sig, uint64_t code, uint64_t subc
  * is among them: the abort message only carries the exception's type.
  */
 static void
-sweet_crash_strings(const char *name)
+mapple_crash_strings(const char *name)
 {
 	static char names[128];
 	char *buf;
@@ -916,7 +916,7 @@ sweet_crash_strings(const char *name)
 	int lines = 0;
 	char last[96] = "";
 
-	if (!PE_parse_boot_argn("sweetscan", names, sizeof(names))) {
+	if (!PE_parse_boot_argn_alias("mp_crash_strings", "sweetscan", names, sizeof(names))) {
 		strlcpy(names, "backboardd,SpringBoard", sizeof(names));
 	}
 	size_t n = strlen(name), found = 0;
@@ -991,13 +991,13 @@ sweet_crash_strings(const char *name)
 	kfree_data(buf, 65536);
 }
 /*
- * SWEET process sampler (bsd/dev/sweet_sample.c): user pc/lr/sp and a frame
+ * MT6781 process sampler (bsd/dev/proc_sampler.c): user pc/lr/sp and a frame
  * pointer backtrace of every thread of a task, from the saved user state.
  */
-void sweet_sample_task(const char *name, int pid, task_t task);
+void proc_sampler_task(const char *name, int pid, task_t task);
 
 void
-sweet_sample_task(const char *name, int pid, task_t task)
+proc_sampler_task(const char *name, int pid, task_t task)
 {
 	vm_map_t map = get_task_map(task);
 	uint64_t slide = 0;
@@ -1040,7 +1040,7 @@ sweet_sample_task(const char *name, int pid, task_t task)
 	task_unlock(task);
 }
 
-#endif /* ARM64_BOARD_CONFIG_SWEET */
+#endif /* ARM64_BOARD_CONFIG_MT6781 */
 
 kern_return_t
 bsd_exception(
