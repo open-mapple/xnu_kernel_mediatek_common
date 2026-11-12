@@ -29,6 +29,7 @@
 #include <IOKit/system.h>
 #include <kern/clock.h>
 #include <mach/mach_time.h>
+#include <sys/sysctl.h>
 
 #include "MappleGPU.h"
 #include "MappleSurface.h"
@@ -45,6 +46,10 @@
 #define HEAP_ALIGN              (2ull << 20)
 
 OSDefineMetaClassAndStructors(MappleGPUUserClient, IOUserClient);
+
+static int mapple_gpu_dropmaps = 1;
+SYSCTL_INT(_kern, OID_AUTO, mapple_gpu_dropmaps, CTLFLAG_RW | CTLFLAG_LOCKED, &mapple_gpu_dropmaps, 0,
+    "GEM_CLOSE drops the process's CPU mappings of the BO still in place (0: they stay until the process exits)");
 
 /* Absolute CLOCK_MONOTONIC ns -> absolute-time deadline (0 = forever); *expired if already past. */
 static uint64_t
@@ -393,7 +398,7 @@ MappleGPUUserClient::dispatch(uint32_t selector, void *arg)
 			 * find them (it asks clientMemoryForType again) and they would keep the pages until the process exits.
 			 */
 			IOMemoryMap *m;
-			while (b->memory != NULL && (m = removeMappingForDescriptor(b->mapMD ? b->mapMD : b->memory)) != NULL) {
+			while (mapple_gpu_dropmaps && b->memory != NULL && (m = removeMappingForDescriptor(b->mapMD ? b->mapMD : b->memory)) != NULL) {
 				m->release();
 				fGPU->fMapsDropped++;
 			}
