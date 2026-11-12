@@ -881,6 +881,9 @@ MappleGPUAccelerator::getWorkLoop(void) const
 	return fWorkLoop;
 }
 
+#define LK_VGPU_SEL     0x40    /* 900 mV, as LK leaves VGPU on the realme 8i */
+#define LK_VSRAM_SEL    0x50    /* 1000 mV */
+
 bool
 MappleGPUAccelerator::start(IOService *provider)
 {
@@ -921,6 +924,13 @@ MappleGPUAccelerator::start(IOService *provider)
 	fDvfsFast = oppForMHz(maxMhz);
 	if (fDvfsFast > fOpp) {
 		fDvfsFast = fOpp;       /* never below the floor (mp_gpu_freq) */
+	}
+	flag = 0;
+	PE_parse_boot_argn_alias("mp_gpu_lkrails", "vivagpulkrails", &flag, sizeof(flag));
+	fLkRails = flag != 0;
+	if (fLkRails) {                 /* LK's 300 MHz at LK's 0.9 V / 1.0 V: no PMIC write anywhere below */
+		fOpp = fClockOpp = fDvfsFast = oppForMHz(300);
+		fDvfs = false;
 	}
 	int64_t mib = GPU_MEMORY_LIMIT >> 20;
 	PE_parse_boot_argn_alias("mp_gpu_memtotal", "vivagpumemtotal", &mib, sizeof(mib));
@@ -1611,6 +1621,9 @@ MappleGPUAccelerator::railsTo(uint32_t tvg, uint32_t tvs)
 {
 	uint32_t vgEn, vg, vsEn, vs;
 	railsRead(&vgEn, &vg, &vsEn, &vs);
+	if (fLkRails) {                 /* never written: fine only while both are on at LK's levels */
+		return vgEn && vsEn && vg == LK_VGPU_SEL && vs == LK_VSRAM_SEL;
+	}
 	bool ok = true;
 	if (!vsEn) {
 		ok = regulatorSet(PMIC_VSRAM_EN, PMIC_VSRAM_VOSEL, tvs);
@@ -1773,9 +1786,11 @@ MappleGPUAccelerator::mfgOff(char **out, char *end)
 		clr32(fApmixed, PLL_MFG_CON0, 1u << 0);
 		set32(fApmixed, PLL_MFG_PWR_CON0, 1u << 1);
 		clr32(fApmixed, PLL_MFG_PWR_CON0, 1u << 0);
-		fPwrap->writeRegulator(PMIC_VGPU_EN, 0x1, 0);
-		IODelay(50);
-		fPwrap->writeRegulator(PMIC_VSRAM_EN, 0x1, 0);
+		if (!fLkRails) {
+			fPwrap->writeRegulator(PMIC_VGPU_EN, 0x1, 0);
+			IODelay(50);
+			fPwrap->writeRegulator(PMIC_VSRAM_EN, 0x1, 0);
+		}
 	}
 	say(out, end, "MFG off: status 0x%08x/0x%08x, mfgpll con0 0x%08x\n", rd32(fSpm, SPM_PWR_STATUS),
 	    rd32(fSpm, SPM_PWR_STATUS_2ND), rd32(fApmixed, PLL_MFG_CON0));

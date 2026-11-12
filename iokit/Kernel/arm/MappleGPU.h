@@ -411,6 +411,7 @@ private:
 	bool     fFlushReduce;
 	/* DVFS governor (mp_gpu_dvfs, 1 default; fOpp is the floor, fDvfsFast from mp_gpu_freqmax) */
 	bool     fDvfs, fDvfsArmed;
+	bool     fLkRails;                  /* mp_gpu_lkrails: VGPU/VSRAM_GPU stay where LK left them; 300 MHz, no DVFS */
 	uint32_t fDvfsFast, fLoadPct;
 	uint64_t fBusyStart, fBusyNs, fWindowStart, fDvfsUpMs, fDvfsUps, fDvfsDowns;
 	uint64_t fBusyTotal;            /* KA1 busy_ns: absolute time with a job running, since boot */
