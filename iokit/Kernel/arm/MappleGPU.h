@@ -359,7 +359,8 @@ private:
 	static void jobTimer(OSObject *owner, IOTimerEventSource *src);
 	static void dvfsTimer(OSObject *owner, IOTimerEventSource *src);
 	void dvfsSample(void);
-	void selftest(bool fault, char **out, char *end);
+	void selftest(bool fault, uint32_t count, char **out, char *end);
+	void objectCounts(char **out, char *end, const char *when);
 
 	inline uint32_t rd(uint32_t off) { return *(volatile uint32_t *)(fMali + off); }
 	inline void wr(uint32_t off, uint32_t v) { *(volatile uint32_t *)(fMali + off) = v; }
@@ -472,6 +473,7 @@ private:
 	OSArray *fPromises;                 /* K0i: pending promises (their timeout, in jobTimer) */
 	uint64_t fPromisesMade, fPromisesTimedOut;
 	uint64_t fPromiseBypass, fQueueBypass, fJobsDiscarded;      /* K0j */
+	uint64_t fJobsLive;
 	uint32_t fArmWait;
 	uint64_t fK0jEpoch;                 /* bumped when a promise is made, resolved or signalled, or a job dropped */
 	uint64_t fK0jVisits, fK0jCached;    /* graph nodes walked / answered from the cache */                  /* nextStartable(forArm): the slots the armed job waits for */

@@ -1193,6 +1193,7 @@ MappleGPUAccelerator::memoryDump(char **out, char *end)
 	say(out, end, "wired for the GPU: user memory %lld KiB (%llu prepares, %llu completes), IOSurfaces %lld KiB (%llu "
 	    "prepares, %llu completes)\n", fUserWired >> 10, fUserPrepares, fUserCompletes, fSurfPrepared >> 10, fSurfPrepares,
 	    fSurfCompletes);
+	objectCounts(out, end, NULL);
 	for (MappleGPUVM *v = fVMs; v != NULL; v = v->nextVM) {
 		bool seen = false;
 		for (MappleGPUVM *w = fVMs; w != v; w = w->nextVM) {
@@ -2277,6 +2278,7 @@ MappleGPUAccelerator::submit(MappleGPUVM *vm, uint64_t jc, uint32_t requirements
 		}
 	}
 	MappleGPUJob *job = IOMallocType(MappleGPUJob);
+	fJobsLive++;
 	job->vm = vm;
 	vm->retain();
 	job->jc = jc;
@@ -2747,6 +2749,7 @@ MappleGPUAccelerator::completeJob(uint32_t slot, IOReturn error, uint32_t status
 	OSSafeReleaseNULL(job->fence);
 	OSSafeReleaseNULL(job->vm);
 	IOFreeType(job, MappleGPUJob);
+	fJobsLive--;
 	if (surfaces) {
 		mapple_fb_gpu_done();    /* a frame held back for the GPU may be ready: the display need not wait for a tick */
 	}
@@ -3783,6 +3786,7 @@ MappleGPUAccelerator::discardJob(MappleGPUJob *job, IOReturn error)
 	OSSafeReleaseNULL(job->fence);
 	OSSafeReleaseNULL(job->vm);
 	IOFreeType(job, MappleGPUJob);
+	fJobsLive--;
 	fJobsDiscarded++;
 }
 
@@ -3931,7 +3935,7 @@ MappleGPUAccelerator::getVersion(struct vgpu_version *v)
 /* ---- self test (USB link) ---- */
 
 void
-MappleGPUAccelerator::selftest(bool fault, char **out, char *end)
+MappleGPUAccelerator::selftest(bool fault, uint32_t count, char **out, char *end)
 {
 	if (!fPowered) {
 		say(out, end, "selftest: GPU off (gpu on first)\n");
@@ -3983,16 +3987,27 @@ MappleGPUAccelerator::selftest(bool fault, char **out, char *end)
 	w[12] = value;
 	__asm__ volatile ("dsb sy" : : : "memory");
 
-	MappleGPUFence *fence = MappleGPUFence::create(false);
-	OSArray *bos = OSArray::withObjects((const OSObject **)&bo, 1);
 	uint64_t t0 = nowMs(), mmu0 = fMmuFaults, resets0 = fResets;
-	IOReturn ret = (fence && bos) ? submit(fSelfVM, bo->va, 0, NULL, bos, fence) : kIOReturnNoMemory;
-	if (ret == kIOReturnSuccess) {
-		uint64_t deadline;
-		clock_interval_to_deadline(1000, kMillisecondScale, &deadline);
-		ret = waitFence(fence, deadline);
+	if (count > 1) {
+		objectCounts(out, end, "before");
 	}
-	invalidatePending(fSelfVM, bo);         /* what userspace's wait does */
+	MappleGPUFence *fence = NULL;
+	OSArray *bos = NULL;
+	IOReturn ret = kIOReturnSuccess;
+	/* count > 1: the same job again, each with its own fence and BO list as a client's submit has */
+	for (uint32_t k = 0; k < count && ret == kIOReturnSuccess; k++) {
+		OSSafeReleaseNULL(bos);
+		OSSafeReleaseNULL(fence);
+		fence = MappleGPUFence::create(false);
+		bos = OSArray::withObjects((const OSObject **)&bo, 1);
+		ret = (fence && bos) ? submit(fSelfVM, bo->va, 0, NULL, bos, fence) : kIOReturnNoMemory;
+		if (ret == kIOReturnSuccess) {
+			uint64_t deadline;
+			clock_interval_to_deadline(1000, kMillisecondScale, &deadline);
+			ret = waitFence(fence, deadline);
+		}
+		invalidatePending(fSelfVM, bo);         /* what userspace's wait does */
+	}
 	uint32_t got = w[0x200 / 4], exc = w[0];
 	say(out, end, "selftest%s: submit/wait 0x%x after %llu ms, fence %s 0x%x, job status 0x%02x (%s), "
 	    "value 0x%08x (expected 0x%08x), MMU faults +%llu\n", fault ? " fault" : "", ret, nowMs() - t0,
@@ -4011,9 +4026,27 @@ MappleGPUAccelerator::selftest(bool fault, char **out, char *end)
 	OSSafeReleaseNULL(bos);
 	OSSafeReleaseNULL(fence);
 	bo->release();
+	if (count > 1) {
+		say(out, end, "selftest: %u jobs in %llu ms\n", count, nowMs() - t0);
+		objectCounts(out, end, "after");
+	}
 }
 
-/* ---- USB link: "gpu [status|mfg|on|off|regs|freq [MHz]|dvfs [on|off]|selftest [fault]|probe|publish]" ---- */
+extern "C" unsigned int vm_page_wire_count;
+
+/* Live driver objects and wired pages, for leak checks ("gpu jobs N", "gpu memory"). Gated. */
+void
+MappleGPUAccelerator::objectCounts(char **out, char *end, const char *when)
+{
+	say(out, end, "objects%s%s: wired %llu KiB; jobs %llu, fences %u, BOs %u, VMs %u, clients %u, surfaces %u, "
+	    "OSArrays %u, OSData %u\n", when ? " " : "", when ? when : "", (uint64_t)vm_page_wire_count * (PAGE_SIZE >> 10),
+	    fJobsLive, MappleGPUFence::metaClass->getInstanceCount(), MappleGPUBO::metaClass->getInstanceCount(),
+	    MappleGPUVM::metaClass->getInstanceCount(), MappleGPUUserClient::metaClass->getInstanceCount(),
+	    MappleSurface::metaClass->getInstanceCount(),
+	    OSArray::metaClass->getInstanceCount(), OSData::metaClass->getInstanceCount());
+}
+
+/* ---- USB link: "gpu [status|mfg|on|off|regs|freq [MHz]|dvfs [on|off]|selftest [fault]|jobs N|probe|publish]" ---- */
 
 void
 MappleGPUAccelerator::linkCommand(const char *args, char *out, size_t outLen)
@@ -4033,7 +4066,10 @@ MappleGPUAccelerator::linkCommand(const char *args, char *out, size_t outLen)
 		} else if (strncmp(args, "off", 3) == 0) {
 			powerOff(o, end);
 		} else if (strncmp(args, "selftest", 8) == 0) {
-			selftest(strncmp(args, "selftest fault", 14) == 0, o, end);
+			selftest(strncmp(args, "selftest fault", 14) == 0, 1, o, end);
+		} else if (strncmp(args, "jobs ", 5) == 0) {
+			uint32_t n = (uint32_t)strtoul(args + 5, NULL, 10);
+			selftest(false, n < 1 ? 1 : n > 100000 ? 100000 : n, o, end);
 		} else if (strncmp(args, "freq", 4) == 0) {
 			const char *a = args + 4;
 			while (*a == ' ') {
