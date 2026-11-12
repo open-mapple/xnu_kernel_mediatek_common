@@ -4195,7 +4195,9 @@ mapple_gpu_set_dvfs_cap(uint32_t mhz)
 	gMappleGPUCapMHz = mhz;
 }
 
+#if DEVELOPMENT || DEBUG
 extern "C" void mtk_gpu_probe_link(const char *args, char *out, size_t len);    /* osfmk/arm64/mtk_gpu_probe.c */
+#endif
 
 extern "C" void
 mapple_gpu_link(const char *args, char *out, size_t outLen)
@@ -4204,10 +4206,12 @@ mapple_gpu_link(const char *args, char *out, size_t outLen)
 		while (*args == ' ') {
 			args++;
 		}
+#if DEVELOPMENT || DEBUG
 		if (strncmp(args, "probe", 5) == 0 || strncmp(args, "power", 5) == 0) {
 			mtk_gpu_probe_link(args, out, outLen);
 			return;
 		}
+#endif
 		snprintf(out, outLen, strncmp(args, "kv", 2) == 0 ? "powered=0\nmode=0\n" :
 		    "gpu: driver not running (boot-arg mp_gpu=1 or 2)\n");
 		return;

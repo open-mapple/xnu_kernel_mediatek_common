@@ -69,7 +69,9 @@ void
 usblink_probe(void)
 {
 	uint32_t mode = 0;
+#if DEVELOPMENT || DEBUG        /* the link and its commands are development tools: off in a release kernel */
 	PE_parse_boot_argn_alias("mp_usblink", "vivausb", &mode, sizeof(mode));
+#endif
 	if (mode == 0) {
 		return;
 	}
