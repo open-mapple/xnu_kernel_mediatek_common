@@ -187,6 +187,23 @@ gotit:
 	return arg_found;
 }
 
+/* Once per boot for each old name; two readers racing may both print it. */
+static void
+boot_arg_renamed(const char *old_string, const char *arg_string)
+{
+	static const char *said[64];
+	static unsigned nsaid;
+	for (unsigned i = 0; i < nsaid; i++) {
+		if (strcmp(said[i], old_string) == 0) {
+			return;
+		}
+	}
+	if (nsaid < sizeof(said) / sizeof(said[0])) {
+		said[nsaid++] = old_string;
+	}
+	printf("boot-arg %s is now %s (the old name goes at release 1)\n", old_string, arg_string);
+}
+
 boolean_t
 PE_parse_boot_argn_alias(
 	const char      *arg_string,
@@ -198,7 +215,24 @@ PE_parse_boot_argn_alias(
 		return TRUE;
 	}
 	if (PE_parse_boot_argn(old_string, arg_ptr, max_len)) {
-		printf("boot-arg %s is now %s (the old name goes at release 1)\n", old_string, arg_string);
+		boot_arg_renamed(old_string, arg_string);
+		return TRUE;
+	}
+	return FALSE;
+}
+
+boolean_t
+PE_parse_boot_arg_str_alias(
+	const char      *arg_string,
+	const char      *old_string,
+	char            *arg_ptr,
+	int                     size)
+{
+	if (PE_parse_boot_arg_str(arg_string, arg_ptr, size)) {
+		return TRUE;
+	}
+	if (PE_parse_boot_arg_str(old_string, arg_ptr, size)) {
+		boot_arg_renamed(old_string, arg_string);
 		return TRUE;
 	}
 	return FALSE;

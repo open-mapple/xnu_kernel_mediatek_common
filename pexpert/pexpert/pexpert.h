@@ -351,6 +351,12 @@ extern boolean_t PE_parse_boot_arg_str(
 	const char *arg_string,
 	char *      arg_ptr,
 	int         size);
+/* Open Mapple: the same for a string boot-arg */
+extern boolean_t PE_parse_boot_arg_str_alias(
+	const char *arg_string,
+	const char *old_string,
+	char *      arg_ptr,
+	int         size);
 #endif /* XNU_KERNEL_PRIVATE */
 
 extern boolean_t PE_get_default(
