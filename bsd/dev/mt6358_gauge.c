@@ -1,6 +1,6 @@
 /*
- * The Infinix Hot 20's battery as iOS reads it. Boot-arg mtkbatt=1; mtkbatt=2 says every reading in the log, every 2 s
- * instead of every 10; mtkbatt=3 takes the percentage from the voltage alone (the way without Android's number).
+ * The Infinix Hot 20's battery as iOS reads it. Boot-arg mp_gauge=1; mp_gauge=2 says every reading in the log, every 2 s
+ * instead of every 10; mp_gauge=3 takes the percentage from the voltage alone (the way without Android's number).
  *
  * The percentage is Android's own, carried on by the PMIC's counter of charge:
  *  - Android's gauge is a program, and it leaves the percentage it shows in the PMIC's clock, bits 14:8 of RTC_AL_MTH (0x5aa):
@@ -26,14 +26,14 @@
  * A charger on the port: RGS_CHRDET, bit 5 of CHR_CON0 (0xa88), the name Android's PMIC header gives it; 0x62 with the cable
  * in. It has not been seen at 0 yet (the cable is how the phone is run). "Charging" is said only while the current goes in.
  * Not done: the charger itself (RT9471 on I2C5: nothing sets or feeds it here), the temperature (25 degrees is said).
- * One transaction at a time on the wrapper: redwood_pwrap_lock() is the camera's and CONNSYS's too.
+ * One transaction at a time on the wrapper: mapple_pwrap_lock() is the camera's and CONNSYS's too.
  */
 #include <kern/clock.h>
 #include <kern/thread.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
 #include <pexpert/pexpert.h>
-#include <sys/redwood_input.h>
+#include <sys/mapple_input.h>
 #include <sys/systm.h>
 
 extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
@@ -84,7 +84,7 @@ pmic_read(uint32_t reg, uint16_t *value)
 {
 	bool ok = false;
 
-	redwood_pwrap_lock();
+	mapple_pwrap_lock();
 	if (pwrap_wait(0)) {
 		pwrap[PWRAP_WACS2_CMD / 4] = (reg >> 1) << 16;
 		if (pwrap_wait(6)) {
@@ -93,7 +93,7 @@ pmic_read(uint32_t reg, uint16_t *value)
 			ok = true;
 		}
 	}
-	redwood_pwrap_unlock();
+	mapple_pwrap_unlock();
 	return ok;
 }
 
@@ -102,12 +102,12 @@ pmic_write(uint32_t reg, uint16_t value)
 {
 	bool ok = false;
 
-	redwood_pwrap_lock();
+	mapple_pwrap_lock();
 	if (pwrap_wait(0)) {
 		pwrap[PWRAP_WACS2_CMD / 4] = (1u << 31) | ((reg >> 1) << 16) | value;
 		ok = pwrap_wait(0);
 	}
-	redwood_pwrap_unlock();
+	mapple_pwrap_unlock();
 	return ok;
 }
 
@@ -140,7 +140,7 @@ batadc_convert(void)
 	}
 	if (!said) {
 		said = true;
-		printf("mtkbatt: no conversion of BATADC in 50 ms after the request (ADC0 %#x): no reading is given\n", raw);
+		printf("mp_gauge: no conversion of BATADC in 50 ms after the request (ADC0 %#x): no reading is given\n", raw);
 	}
 	return -1;
 }
@@ -173,7 +173,7 @@ gauge_latch(int16_t *current, uint32_t *charge)
 
 			said = true;
 			(void)pmic_read(MT6358_FGADC_CON0, &con0);
-			printf("mtkbatt: the fuel gauge does not latch (FGADC_CON0 %#x, CON1 %#x): no current\n", con0, got);
+			printf("mp_gauge: the fuel gauge does not latch (FGADC_CON0 %#x, CON1 %#x): no current\n", con0, got);
 		}
 		return false;
 	}
@@ -214,14 +214,14 @@ mtkbatt_thread(__unused void *arg, __unused wait_result_t wr)
 	uint16_t rtc = 0;
 	bool counted = false, apart_said = false;
 
-	PE_parse_boot_argn("mtkbatt", &level, sizeof(level));
+	PE_parse_boot_argn_alias("mp_gauge", "mtkbatt", &level, sizeof(level));
 	pwrap = (volatile uint32_t *)ml_io_map(PWRAP_BASE, 0x1000);
 	if (pmic_read(MT6358_RTC_AL_MTH, &rtc) && ((rtc >> 8) & 0x7f) >= 1 && ((rtc >> 8) & 0x7f) <= 100) {
 		start_hundredths = (int32_t)((rtc >> 8) & 0x7f) * 100;
 	}
 	delay_for_interval(20000, NSEC_PER_MSEC);
 	for (;; delay_for_interval(level == 2 ? 2000 : 10000, NSEC_PER_MSEC)) {
-		struct redwood_battery_state b = { .size = sizeof(b) };
+		struct mapple_battery_state b = { .size = sizeof(b) };
 		int32_t sum = 0, good = 0, low = 0x7fff, high = 0, mv, rest_mv, ma = 0, by_voltage, by_charge = -1;
 		uint16_t chr = 0;
 		int16_t gauge = 0;
@@ -243,7 +243,7 @@ mtkbatt_thread(__unused void *arg, __unused wait_result_t wr)
 		}
 		mv = (int32_t)((int64_t)(sum / good) * COUNT_NV / 1000000);
 		if (mv < 2500 || mv > 4700) {
-			printf("mtkbatt: BATADC %d counts would be %d mV: not a cell's voltage, not given\n", sum / good, mv);
+			printf("mp_gauge: BATADC %d counts would be %d mV: not a cell's voltage, not given\n", sum / good, mv);
 			continue;
 		}
 		charger = pmic_read(MT6358_CHR_CON0, &chr) && (chr & CHR_CON0_CHRDET);
@@ -259,7 +259,7 @@ mtkbatt_thread(__unused void *arg, __unused wait_result_t wr)
 			if (!counted) {
 				counted = true;
 				start_charge = charge;
-				printf("mtkbatt: Android left %d%% (RTC_AL_MTH %#x); the charge is counted from %#x\n", start_hundredths / 100, rtc, charge);
+				printf("mp_gauge: Android left %d%% (RTC_AL_MTH %#x); the charge is counted from %#x\n", start_hundredths / 100, rtc, charge);
 			}
 			/* hundredths of a percent: counts x pAh / (uAh x 100) */
 			by_charge = start_hundredths + (int32_t)((int64_t)(int32_t)(charge - start_charge) * CAR_COUNT_PAH / ((int64_t)CELL_UAH * 100));
@@ -267,14 +267,14 @@ mtkbatt_thread(__unused void *arg, __unused wait_result_t wr)
 			if (by_charge - by_voltage > APART_HUNDREDTHS || by_voltage - by_charge > APART_HUNDREDTHS) {
 				if (!apart_said) {
 					apart_said = true;
-					printf("mtkbatt: %d%% by the charge and %d%% by the voltage (%d mV at rest): the voltage is believed from here\n",
+					printf("mp_gauge: %d%% by the charge and %d%% by the voltage (%d mV at rest): the voltage is believed from here\n",
 					    by_charge / 100, by_voltage / 100, kept_mv);
 				}
 				start_hundredths = -1;
 				by_charge = -1;
 			}
 		} else if (!counted && !apart_said && looks == 0) {
-			printf("mtkbatt: the percentage is by the voltage alone (RTC_AL_MTH %#x, %s, mtkbatt=%u)\n", rtc,
+			printf("mp_gauge: the percentage is by the voltage alone (RTC_AL_MTH %#x, %s, mp_gauge=%u)\n", rtc,
 			    current ? "the gauge answers" : "no gauge", level);
 		}
 		b.percent_hundredths = by_charge >= 0 ? by_charge : by_voltage;
@@ -293,9 +293,9 @@ mtkbatt_thread(__unused void *arg, __unused wait_result_t wr)
 		} else {
 			b.status = 1;
 		}
-		redwood_battery_report(&b);
+		mapple_battery_report(&b);
 		if (level >= 2 || (looks % 30) == 0) {
-			printf("mtkbatt: %d.%02d%% (%s), BATADC %d counts (%d..%d of %d) = %d mV, charger %s (CHR_CON0 %#x), status %d",
+			printf("mp_gauge: %d.%02d%% (%s), BATADC %d counts (%d..%d of %d) = %d mV, charger %s (CHR_CON0 %#x), status %d",
 			    b.percent_hundredths / 100, b.percent_hundredths % 100, by_charge >= 0 ? "by the charge" : "by the voltage",
 			    sum / good, low, high, good, mv, charger ? "in" : "out", chr, b.status);
 			if (current) {
@@ -310,12 +310,12 @@ mtkbatt_thread(__unused void *arg, __unused wait_result_t wr)
 }
 
 void
-redwood_mtkbatt_init(void)
+mt6358_gauge_init(void)
 {
 	uint32_t level = 0;
 	thread_t thread;
 
-	if (!PE_parse_boot_argn("mtkbatt", &level, sizeof(level)) || level < 1) {
+	if (!PE_parse_boot_argn_alias("mp_gauge", "mtkbatt", &level, sizeof(level)) || level < 1) {
 		return;
 	}
 	if (kernel_thread_start(mtkbatt_thread, NULL, &thread) == KERN_SUCCESS) {
