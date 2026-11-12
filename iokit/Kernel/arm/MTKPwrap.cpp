@@ -261,6 +261,45 @@ MTKPwrap::writeRegulator(uint32_t addr, uint32_t mask, uint32_t value)
 	return ret;
 }
 
+/* bsd/dev/mt6358_gauge.c: MT6358 registers.h */
+static const struct {
+	uint16_t addr, mask, status;    /* status: read-only bits, written as 0 */
+} gMappleGaugeRegs[] = {
+	{ 0x0d0a, 0x0009, 0x8000 },     /* FGADC_CON1: bit 0 latch the counter and current, bit 3 release; 15 latched */
+	{ 0x1108, 0x0001, 0x0000 },     /* AUXADC_RQST0: bit 0 one BATADC conversion */
+};
+
+IOReturn
+MTKPwrap::writeGauge(uint32_t addr, uint32_t mask, uint32_t value)
+{
+	unsigned int i;
+	for (i = 0; i < sizeof(gMappleGaugeRegs) / sizeof(gMappleGaugeRegs[0]); i++) {
+		if (gMappleGaugeRegs[i].addr == addr) {
+			break;
+		}
+	}
+	if (i == sizeof(gMappleGaugeRegs) / sizeof(gMappleGaugeRegs[0]) || (mask & ~gMappleGaugeRegs[i].mask) || (value & ~mask)) {
+		IOLog("PWRAP: refused gauge write 0x%04x mask 0x%x <- 0x%x\n", addr, mask, value);
+		return kIOReturnNotPermitted;
+	}
+	uint32_t old = 0;
+	IOReturn ret = readPMIC(addr, &old);
+	if (ret != kIOReturnSuccess) {
+		return ret;
+	}
+	IOLockLock(fLock);
+	ret = kIOReturnTimeout;
+	if (WACS_FSM(rd32(PWRAP_WACS2_RDATA)) == WACS_FSM_WFVLDCLR) {
+		wr32(PWRAP_WACS2_VLDCLR, 1);
+	}
+	if (waitFSM(WACS_FSM_IDLE)) {
+		wr32(PWRAP_WACS2_CMD, 0x80000000u | ((addr >> 1) << 16) | (((old & ~(mask | gMappleGaugeRegs[i].status)) | value) & 0xffff));
+		ret = waitFSM(WACS_FSM_IDLE) ? kIOReturnSuccess : kIOReturnTimeout;
+	}
+	IOLockUnlock(fLock);
+	return ret;
+}
+
 MTKPwrap *
 MTKPwrap::wait(void)
 {
@@ -316,6 +355,15 @@ mtk_pwrap_write_regulator(uint32_t addr, uint32_t mask, uint32_t value)
 		return -1;
 	}
 	return gMapplePwrap->writeRegulator(addr, mask, value) == kIOReturnSuccess ? 0 : -2;
+}
+
+extern "C" int
+mtk_pwrap_write_gauge(uint32_t addr, uint32_t mask, uint32_t value)
+{
+	if (gMapplePwrap == NULL) {
+		return -1;
+	}
+	return gMapplePwrap->writeGauge(addr, mask, value) == kIOReturnSuccess ? 0 : -2;
 }
 
 extern "C" int

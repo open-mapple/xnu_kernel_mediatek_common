@@ -110,6 +110,7 @@ bsd/dev/mapple_keys.c			standard
 bsd/dev/mapple_touch.c			standard
 bsd/dev/mapple_rpmh.c			standard
 bsd/dev/mapple_spmi.c			standard
+bsd/dev/mt6358_gauge.c		standard
 bsd/dev/mapple_usb.c			standard
 bsd/dev/usb_link.c			standard
 bsd/dev/mt6631_wifi.c			standard

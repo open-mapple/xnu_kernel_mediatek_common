@@ -38,6 +38,8 @@ public:
 	 * read-modify-write of the bits in `mask`, read back. Everything else is refused.
 	 */
 	IOReturn writeRegulator(uint32_t addr, uint32_t mask, uint32_t value);
+	/* The fuel gauge's latch and the AUXADC request bits only (gMappleGaugeRegs): read-modify-write, not read back. */
+	IOReturn writeGauge(uint32_t addr, uint32_t mask, uint32_t value);
 	/* The started instance, waiting for it if needed (NULL after timeout). */
 	static MTKPwrap *wait(void);
 

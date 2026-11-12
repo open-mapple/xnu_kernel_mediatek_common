@@ -17,6 +17,10 @@ extern "C" int mapple_spmi_init(void);
 extern "C" int mapple_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
 /* iokit/Kernel/arm/BQ27Z561Battery.cpp: viva's real battery driver will run */
 extern "C" bool bq27z561_present(void);
+/* bsd/dev/mt6358_gauge.c: the MT6358 fuel gauge (mp_gauge=) */
+extern "C" bool mt6358_gauge_init(void);
+extern "C" bool mt6358_gauge_read(int32_t *percent_hundredths, int32_t *mv, int32_t *ma, bool *external,
+    bool *current, int *status);
 
 class MapplePowerSource : public IOPMPowerSource {
 	OSDeclareDefaultStructors(MapplePowerSource);
@@ -28,7 +32,7 @@ public:
 private:
 	IOWorkLoop *fLoop;
 	IOTimerEventSource *fTimer;
-	bool fTimerAdded, fRunning, fReal;
+	bool fTimerAdded, fRunning, fReal, fGauge;
 	int fLastMode;
 	void putNumber(const char *key, UInt32 value);
 	void putBool(const char *key, bool value);
@@ -156,7 +160,7 @@ MapplePowerSource::publish(unsigned percent, unsigned mv, int ma, bool external,
 	int mode = measured ? 1 : 0;
 	if (mode != fLastMode) {
 		IOLog("BATTERY: %s, %u%% %umV external=%d charging=%d\n",
-		    measured ? "PM6150 / estimated SOC" : "static fallback",
+		    !measured ? "static fallback" : fGauge ? "MT6358 fuel gauge" : "PM6150 / estimated SOC",
 		    percent, mv, external, charging);
 		fLastMode = mode;
 	}
@@ -208,6 +212,15 @@ MapplePowerSource::estimatePercent(unsigned mv)
 void
 MapplePowerSource::poll(void)
 {
+	int32_t hundredths, gmv, gma;
+	bool gexternal, gcurrent;
+	int status;
+	if (fGauge && mt6358_gauge_read(&hundredths, &gmv, &gma, &gexternal, &gcurrent, &status)) {
+		/* status as Linux numbers it: 1 charging, 4 full */
+		publish((unsigned)(hundredths + 50) / 100, (unsigned)gmv, gma, gexternal, gexternal, status == 1, status == 4,
+		    true, gcurrent);
+		return;
+	}
 	uint8_t type, present, usb, path, charger, error, temperature;
 	uint16_t rawVoltage;
 	bool valid = fReal &&
@@ -270,10 +283,11 @@ MapplePowerSource::start(IOService *provider)
 	}
 	int real = 0;
 	(void)PE_parse_boot_argn_alias("mp_battery_pm6150", "sweetbattery", &real, sizeof(real));
-	fReal = real == 1 && mapple_spmi_init() == 0;
+	fGauge = mt6358_gauge_init();
+	fReal = !fGauge && real == 1 && mapple_spmi_init() == 0;
 	/* Publish a complete source BEFORE registerService wakes powerd. */
 	poll();
-	if (fReal) {
+	if (fReal || fGauge) {
 		fLoop = IOWorkLoop::workLoop();
 		fTimer = IOTimerEventSource::timerEventSource(this, &MapplePowerSource::timerFired);
 		if (fLoop && fTimer && fLoop->addEventSource(fTimer) == kIOReturnSuccess) {
@@ -281,7 +295,7 @@ MapplePowerSource::start(IOService *provider)
 			fRunning = true;
 			fTimer->setTimeoutMS(30000);
 		} else {
-			fReal = false;
+			fReal = fGauge = false;
 			poll();
 			IOLog("BATTERY: timer unavailable; static fallback\n");
 		}

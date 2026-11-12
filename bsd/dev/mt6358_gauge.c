@@ -1,5 +1,5 @@
 /*
- * The Infinix Hot 20's battery as iOS reads it. Boot-arg mp_gauge=1; mp_gauge=2 says every reading in the log, every 2 s
+ * The realme 8i's battery, published by MapplePowerSource. Boot-arg mp_gauge=1; mp_gauge=2 says every reading in the log, every 2 s
  * instead of every 10; mp_gauge=3 takes the percentage from the voltage alone (the way without Android's number).
  *
  * The percentage is Android's own, carried on by the PMIC's counter of charge:
@@ -11,7 +11,8 @@
  *    16 bits with a sign, 250 mV / 65536 a count over 5 mOhm = 0.763 mA. Run 764 saw -240..-437 mA on a computer's port
  *    (Android says about the same there, -357 mA), the voltage lower the more negative it was, and the counter falling:
  *    less than 0 is out of the battery. The counter fell 92546 in the 90.8 s that the current summed to 9.94 mAh:
- *    0.1074 uAh a count. The cell is 5132 mAh (the 25 degree table of the phone's profile), 51 mAh a point.
+ *    0.1074 uAh a count. That was the Hot 20; the realme 8i has the same 5 mOhm and CAR_TUNE 100 and is not yet measured.
+ *    Its cell is 4950 mAh (the 25 degree table of the 21690 profile), 49.5 mAh a point.
  *  - So: the percentage in the clock when the kernel starts, plus the counter's change since. Not written back to the clock:
  *    Android's gauge makes its own on its next start.
  * Checked against the voltage, and without Android's number (0, or over 100) it is the voltage alone:
@@ -25,24 +26,20 @@
  *    at -357 mA is 94% by it where Android says 99. If the two ways are more than 30 points apart the voltage is believed.
  * A charger on the port: RGS_CHRDET, bit 5 of CHR_CON0 (0xa88), the name Android's PMIC header gives it; 0x62 with the cable
  * in. It has not been seen at 0 yet (the cable is how the phone is run). "Charging" is said only while the current goes in.
- * Not done: the charger itself (RT9471 on I2C5: nothing sets or feeds it here), the temperature (25 degrees is said).
- * One transaction at a time on the wrapper: mapple_pwrap_lock() is the camera's and CONNSYS's too.
+ * Not done: the charger itself (bq25601d on I2C: nothing sets or feeds it here), the temperature (25 degrees is said).
+ * The PMIC is reached through MTKPwrap, which allows writes to the two gauge fields only (FGADC_CON1 bits 0 and 3,
+ * AUXADC_RQST0 bit 0).
  */
 #include <kern/clock.h>
+#include <kern/locks.h>
 #include <kern/thread.h>
 #include <libkern/libkern.h>
 #include <mach/mach_types.h>
 #include <pexpert/pexpert.h>
-#include <sys/mapple_input.h>
 #include <sys/systm.h>
 
-extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
-
-#define PWRAP_BASE              0x1000d000ULL
-#define PWRAP_WACS2_CMD         0xc20
-#define PWRAP_WACS2_RDATA       0xc24
-#define PWRAP_WACS2_VLDCLR      0xc28
-#define PWRAP_FSM(r)            (((r) >> 16) & 7u)
+extern int mtk_pwrap_read(uint32_t addr, uint32_t *value);                          /* iokit/Kernel/arm/MTKPwrap.cpp */
+extern int mtk_pwrap_write_gauge(uint32_t addr, uint32_t mask, uint32_t value);
 
 #define MT6358_RTC_AL_MTH       0x05aa          /* bits 14:8: the percentage Android's gauge shows */
 #define MT6358_CHR_CON0         0x0a88
@@ -61,54 +58,38 @@ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 #define COUNT_NV                164795          /* 1.8 V x 3 / 32768, in nV a count */
 #define FG_COUNT_NA             762939          /* 250 mV / 65536 over 5 mOhm, in nA a count */
 #define CAR_COUNT_PAH           107425          /* run 764: 9.94 mAh by the current while the counter fell 92546, in pAh a count */
-#define CELL_UAH                5132000         /* the phone's profile at 25 degrees */
+#define CELL_UAH                4950000         /* the phone's profile at 25 degrees */
 #define CELL_MOHM               280
 #define FULL_MV                 4410
 #define APART_HUNDREDTHS        3000
 
-static volatile uint32_t *pwrap;
+struct mtkbatt_state {
+	int32_t percent_hundredths, voltage_uv, current_ua;
+	bool external, current;
+	int status;
+};
 
-static bool
-pwrap_wait(uint32_t state)
-{
-	for (uint32_t spin = 0; spin < 200000; spin++) {
-		if (PWRAP_FSM(pwrap[PWRAP_WACS2_RDATA / 4]) == state) {
-			return true;
-		}
-	}
-	return false;
-}
+static LCK_GRP_DECLARE(mtkbatt_grp, "mp_gauge");
+static LCK_MTX_DECLARE(mtkbatt_lock, &mtkbatt_grp);
+static struct mtkbatt_state mtkbatt_last;
+static bool mtkbatt_have;
 
 static bool
 pmic_read(uint32_t reg, uint16_t *value)
 {
-	bool ok = false;
+	uint32_t v;
 
-	mapple_pwrap_lock();
-	if (pwrap_wait(0)) {
-		pwrap[PWRAP_WACS2_CMD / 4] = (reg >> 1) << 16;
-		if (pwrap_wait(6)) {
-			*value = (uint16_t)pwrap[PWRAP_WACS2_RDATA / 4];
-			pwrap[PWRAP_WACS2_VLDCLR / 4] = 1;
-			ok = true;
-		}
+	if (mtk_pwrap_read(reg, &v) != 0) {
+		return false;
 	}
-	mapple_pwrap_unlock();
-	return ok;
+	*value = (uint16_t)v;
+	return true;
 }
 
 static bool
-pmic_write(uint32_t reg, uint16_t value)
+pmic_write(uint32_t reg, uint16_t mask, uint16_t value)
 {
-	bool ok = false;
-
-	mapple_pwrap_lock();
-	if (pwrap_wait(0)) {
-		pwrap[PWRAP_WACS2_CMD / 4] = (1u << 31) | ((reg >> 1) << 16) | value;
-		ok = pwrap_wait(0);
-	}
-	mapple_pwrap_unlock();
-	return ok;
+	return mtk_pwrap_write_gauge(reg, mask, value) == 0;
 }
 
 /* the register's bits (mask) at `want`, looked at every millisecond for `ms` */
@@ -131,7 +112,7 @@ batadc_convert(void)
 	static bool said;
 	uint16_t raw = 0;
 
-	if (pmic_write(MT6358_AUXADC_RQST0, 1)) {
+	if (pmic_write(MT6358_AUXADC_RQST0, 1, 1)) {
 		/* the last conversion's "ready" may still be up: the converter is given its time before the look */
 		delay_for_interval(3, NSEC_PER_MSEC);
 		if (pmic_until(MT6358_AUXADC_ADC0, 0x8000, 0x8000, 50, &raw)) {
@@ -153,20 +134,17 @@ static bool
 gauge_latch(int16_t *current, uint32_t *charge)
 {
 	static bool said;
-	uint16_t con1 = 0, got = 0, low = 0, high = 0, cur = 0;
+	const uint16_t bits = FGADC_CON1_READ | FGADC_CON1_CLEAR;
+	uint16_t got = 0, low = 0, high = 0, cur = 0;
 	bool ok;
 
-	if (!pmic_read(MT6358_FGADC_CON1, &con1)) {
-		return false;
-	}
-	con1 &= (uint16_t)~(FGADC_CON1_READ | FGADC_CON1_CLEAR | FGADC_CON1_LATCHED);
-	ok = pmic_write(MT6358_FGADC_CON1, con1 | FGADC_CON1_READ) &&
+	ok = pmic_write(MT6358_FGADC_CON1, bits, FGADC_CON1_READ) &&
 	    pmic_until(MT6358_FGADC_CON1, FGADC_CON1_LATCHED, FGADC_CON1_LATCHED, 100, &got) &&
 	    pmic_read(MT6358_FGADC_CUR_CON0, &cur) && pmic_read(MT6358_FGADC_CAR_CON0, &low) && pmic_read(MT6358_FGADC_CAR_CON1, &high);
 	/* let go, whatever happened */
-	(void)pmic_write(MT6358_FGADC_CON1, con1 | FGADC_CON1_CLEAR);
+	(void)pmic_write(MT6358_FGADC_CON1, bits, FGADC_CON1_CLEAR);
 	(void)pmic_until(MT6358_FGADC_CON1, FGADC_CON1_LATCHED, 0, 100, &got);
-	(void)pmic_write(MT6358_FGADC_CON1, con1);
+	(void)pmic_write(MT6358_FGADC_CON1, bits, 0);
 	if (!ok) {
 		if (!said) {
 			uint16_t con0 = 0;
@@ -215,13 +193,12 @@ mtkbatt_thread(__unused void *arg, __unused wait_result_t wr)
 	bool counted = false, apart_said = false;
 
 	PE_parse_boot_argn_alias("mp_gauge", "mtkbatt", &level, sizeof(level));
-	pwrap = (volatile uint32_t *)ml_io_map(PWRAP_BASE, 0x1000);
+	delay_for_interval(20000, NSEC_PER_MSEC);      /* MTKPwrap is up by then */
 	if (pmic_read(MT6358_RTC_AL_MTH, &rtc) && ((rtc >> 8) & 0x7f) >= 1 && ((rtc >> 8) & 0x7f) <= 100) {
 		start_hundredths = (int32_t)((rtc >> 8) & 0x7f) * 100;
 	}
-	delay_for_interval(20000, NSEC_PER_MSEC);
 	for (;; delay_for_interval(level == 2 ? 2000 : 10000, NSEC_PER_MSEC)) {
-		struct mapple_battery_state b = { .size = sizeof(b) };
+		struct mtkbatt_state b = { 0 };
 		int32_t sum = 0, good = 0, low = 0x7fff, high = 0, mv, rest_mv, ma = 0, by_voltage, by_charge = -1;
 		uint16_t chr = 0;
 		int16_t gauge = 0;
@@ -280,8 +257,7 @@ mtkbatt_thread(__unused void *arg, __unused wait_result_t wr)
 		b.percent_hundredths = by_charge >= 0 ? by_charge : by_voltage;
 		b.voltage_uv = mv * 1000;
 		b.current_ua = current ? ma * 1000 : 0;
-		b.temperature_hundredths = 2500;        /* not read: 25 degrees */
-		b.present = 1;
+		b.current = current;
 		b.external = charger;
 		/* Linux's numbers: 1 charging, 2 discharging, 3 not charging, 4 full */
 		if (!charger) {
@@ -293,7 +269,10 @@ mtkbatt_thread(__unused void *arg, __unused wait_result_t wr)
 		} else {
 			b.status = 1;
 		}
-		mapple_battery_report(&b);
+		lck_mtx_lock(&mtkbatt_lock);
+		mtkbatt_last = b;
+		mtkbatt_have = true;
+		lck_mtx_unlock(&mtkbatt_lock);
 		if (level >= 2 || (looks % 30) == 0) {
 			printf("mp_gauge: %d.%02d%% (%s), BATADC %d counts (%d..%d of %d) = %d mV, charger %s (CHR_CON0 %#x), status %d",
 			    b.percent_hundredths / 100, b.percent_hundredths % 100, by_charge >= 0 ? "by the charge" : "by the voltage",
@@ -309,16 +288,41 @@ mtkbatt_thread(__unused void *arg, __unused wait_result_t wr)
 	}
 }
 
-void
+/* MapplePowerSource.cpp: the last reading, false before the first one */
+bool
+mt6358_gauge_read(int32_t *percent_hundredths, int32_t *mv, int32_t *ma, bool *external, bool *current, int *status)
+{
+	struct mtkbatt_state b;
+	bool have;
+
+	lck_mtx_lock(&mtkbatt_lock);
+	b = mtkbatt_last;
+	have = mtkbatt_have;
+	lck_mtx_unlock(&mtkbatt_lock);
+	if (have) {
+		*percent_hundredths = b.percent_hundredths;
+		*mv = b.voltage_uv / 1000;
+		*ma = b.current_ua / 1000;
+		*external = b.external;
+		*current = b.current;
+		*status = b.status;
+	}
+	return have;
+}
+
+/* MapplePowerSource.cpp: true if mp_gauge= asks for it and its thread runs */
+bool
 mt6358_gauge_init(void)
 {
 	uint32_t level = 0;
 	thread_t thread;
 
 	if (!PE_parse_boot_argn_alias("mp_gauge", "mtkbatt", &level, sizeof(level)) || level < 1) {
-		return;
+		return false;
 	}
-	if (kernel_thread_start(mtkbatt_thread, NULL, &thread) == KERN_SUCCESS) {
-		thread_deallocate(thread);
+	if (kernel_thread_start(mtkbatt_thread, NULL, &thread) != KERN_SUCCESS) {
+		return false;
 	}
+	thread_deallocate(thread);
+	return true;
 }
