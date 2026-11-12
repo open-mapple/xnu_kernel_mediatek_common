@@ -21,6 +21,8 @@
 #include <sys/kauth.h>
 #include <kern/locks.h>
 #include <pexpert/pexpert.h>
+#include <pexpert/arm64/boot.h>
+#include <machine/machine_routines.h>
 
 extern void usblink_stat(char *out, size_t len);                          /* bsd/dev/usb_link.c */
 extern void bq27z561_link(const char *args, char *out, size_t len);     /* iokit/Kernel/arm/BQ27Z561Battery.cpp */
@@ -172,9 +174,12 @@ mapple_boot_part(void)
 
 /*
  * The payload's command line: boot_a's or boot_b's. On a phone with a single boot partition (the payload inside the boot
- * loader's image) it is the line this boot started with, unless the shim replaced that with the record's: then it is not
- * known here, and the record's own base_hash says which payload it belongs to.
+ * loader's image) it is the line this boot started with, or, when the shim replaced that with the record's, the copy
+ * the shim leaves 0x1000 into the boot_args page (shim/loader.c), the 16 KiB below topOfKernelData. Read physically:
+ * arm_init copies boot_args into const_boot_args, so PE_state.bootArgs is not that page.
  */
+#define MAPPLE_PAYLOAD_LINE_OFF 0x1000
+
 static int
 mapple_payload_line(char *payload, size_t len)
 {
@@ -182,6 +187,15 @@ mapple_payload_line(char *payload, size_t len)
 	int error = mtk_ufs_bootargs(mapple_boot_part(), false, payload, len);
 	if (error != ENOENT) {
 		return error;
+	}
+	char keep[8 + BOOTARGS_MAX];
+	uint64_t pa = ((boot_args *)PE_state.bootArgs)->topOfKernelData - 0x4000 + MAPPLE_PAYLOAD_LINE_OFF;
+	for (size_t i = 0; i < sizeof(keep); i++) {
+		keep[i] = (char)ml_phys_read_byte_64(pa + i);
+	}
+	if (memcmp(keep, "MAPPLEPC", 8) == 0 && strnlen(keep + 8, BOOTARGS_MAX) < BOOTARGS_MAX) {
+		strlcpy(payload, keep + 8, len);
+		return 0;
 	}
 	if (mtk_ufs_bootfile(false, 0, rec, sizeof(rec)) == 0 && strcmp(rec, PE_boot_args()) == 0) {
 		return ENOENT;
