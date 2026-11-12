@@ -26,6 +26,7 @@
 #include <kern/debug.h>
 #include <kern/startup.h>
 #include <libkern/amfi/amfi.h>
+#include <libkern/OSAtomic.h>
 #include <mach/kern_return.h>
 #include <pexpert/pexpert.h>
 #include <sys/codesign.h>
@@ -281,8 +282,10 @@ amfi_stub_vnode_check_signature(struct vnode *vp, __unused struct label *label,
  * launchd reports mach lookups as "error = 159: Sandbox restriction"
  * (backboardd cannot reach mobilegestalt or iohideventsystem; tccd:
  * "profile not found"). MT6781 runs without a sandbox: operations succeed
- * (checks allow, profile init is accepted); the few that must return
- * data (extension tokens) fail with ENOENT. A container path (op 4) is the
+ * (checks allow, profile init is accepted). An extension (op 5) is a token
+ * naming its class and path, and consuming one (op 6) gives a handle: tccd
+ * grants Photos access to assetsd through one (boot-arg mp_sbx_ext=0: both
+ * fail with ENOENT, as before). A container path (op 4) is the
  * home of the process's user: PlugInKit aborts an extension whose container
  * path is missing ("plugin has invalid sandbox or container"); boot-arg
  * mp_sbx_container=0 makes it fail with ENOENT again. The first use of each
@@ -329,13 +332,63 @@ mapple_sandbox_container_path(struct proc *p, user_addr_t arg)
 	return copyout(home, (user_addr_t)a.buf, len);
 }
 
+/* op 5's argument (libsystem_sandbox _sandbox_extension_issue): class, a word, path or name, flags, the 0x800-byte token
+ * buffer, pid, a word; op 6's: token, its length + 1, where the handle goes */
+struct mapple_sandbox_issue_args {
+	uint64_t class_name, word, path, flags, token, pid, word2;
+};
+struct mapple_sandbox_consume_args {
+	uint64_t token, length, handle;
+};
+#define MAPPLE_SANDBOX_TOKEN 0x800
+
+static int
+mapple_sandbox_issue(user_addr_t arg)
+{
+	struct mapple_sandbox_issue_args a;
+	char cls[128] = "", path[MAXPATHLEN] = "", token[MAPPLE_SANDBOX_TOKEN];
+	size_t len;
+	int err = copyin(arg, &a, sizeof(a));
+	if (err) {
+		return err;
+	}
+	if (a.class_name) {
+		(void)copyinstr((user_addr_t)a.class_name, cls, sizeof(cls), &len);
+	}
+	if (a.path) {
+		(void)copyinstr((user_addr_t)a.path, path, sizeof(path), &len);
+	}
+	len = (size_t)snprintf(token, sizeof(token), "mapple;%s;%s", cls, path);
+	if (a.token == 0) {
+		return EINVAL;
+	}
+	return copyout(token, (user_addr_t)a.token, MIN(len + 1, sizeof(token)));
+}
+
+static int
+mapple_sandbox_consume(user_addr_t arg)
+{
+	static int64_t next_handle;
+	struct mapple_sandbox_consume_args a;
+	int err = copyin(arg, &a, sizeof(a));
+	if (err) {
+		return err;
+	}
+	int64_t h = OSIncrementAtomic64(&next_handle) + 1;
+	return a.handle ? copyout(&h, (user_addr_t)a.handle, sizeof(h)) : 0;
+}
+
 static int
 mapple_sandbox_syscall(struct proc *p, int call, user_addr_t arg)
 {
-	static int container = -1;
+	static int container = -1, ext = -1;
 	if (container < 0) {
 		container = 1;
 		PE_parse_boot_argn("mp_sbx_container", &container, sizeof(container));
+	}
+	if (ext < 0) {
+		ext = 1;
+		PE_parse_boot_argn("mp_sbx_ext", &ext, sizeof(ext));
 	}
 	if (call >= 0 && call < 64 && !(mapple_sandbox_seen & (1ULL << call))) {
 		mapple_sandbox_seen |= 1ULL << call;
@@ -347,7 +400,9 @@ mapple_sandbox_syscall(struct proc *p, int call, user_addr_t arg)
 	case 4:         /* container path (audit token / pid) */
 		return container ? mapple_sandbox_container_path(p, arg) : ENOENT;
 	case 5:         /* extension issue */
+		return ext ? mapple_sandbox_issue(arg) : ENOENT;
 	case 6:         /* extension consume */
+		return ext ? mapple_sandbox_consume(arg) : ENOENT;
 	case 0x43:      /* container expected */
 		return ENOENT;
 	default:
