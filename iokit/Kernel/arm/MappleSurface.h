@@ -64,6 +64,9 @@ public:
 	 * jobs on the surface wait for this one, not for the promise they will resolve.
 	 */
 	OSObject                 *gpuPrev;
+	/* the last GPU import (kern.mapple_gpu_surf_debug): its VM (compared only, never dereferenced here) and address */
+	void                     *gpuVM;
+	uint64_t                  gpuVA;
 
 	bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
 	void free() APPLE_KEXT_OVERRIDE;
@@ -71,6 +74,14 @@ public:
 	/* Kernel address of the pixels (mapped on first use), or 0. */
 	uintptr_t kernelAddress();
 };
+
+/*
+ * Black Metal frames, one boot for every case (sysctls in DEVELOPMENT/DEBUG kernels): after a GPU job the surface's CPU
+ * lines are dropped at the next CPU access (kern.mapple_gpu_surf_maint=0), at once (1) or never (2); new surfaces
+ * are write-combined (kern.mapple_gpu_surf_uncached=1).
+ */
+extern int mapple_gpu_surf_maint;
+extern int mapple_gpu_surf_uncached;
 
 /* Retained surface for an id, or NULL. */
 MappleSurface *mapple_surface_copy(uint32_t id);

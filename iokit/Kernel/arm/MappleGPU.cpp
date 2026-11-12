@@ -633,6 +633,14 @@ MappleGPUVM::tableFor(uint64_t va, bool create)
 	return tableKVA(pa);
 }
 
+uint64_t
+MappleGPUVM::paOf(uint64_t va)
+{
+	uint64_t *l3 = tableFor(va, false);
+	uint64_t e = l3 != NULL ? l3[(uint32_t)(va >> 12) & 511] : 0;
+	return (e & 3) == PTE_PAGE ? (e & PTE_ADDR) | (va & 0xfff) : 0;
+}
+
 bool
 MappleGPUVM::map(uint64_t va, IOMemoryDescriptor *md, uint64_t offset, uint64_t size, uint64_t pte)
 {
@@ -2669,8 +2677,11 @@ MappleGPUAccelerator::completeJob(uint32_t slot, IOReturn error, uint32_t status
 			}
 			/* drop stale CPU lines so the CPU sees what the GPU wrote; civac keeps lines the CPU dirtied meanwhile */
 			bytes += bo->cacheOp(0, 0, kMappleCacheFlush);
-		} else if (bo->lazySurface) {
+		} else if (bo->lazySurface && mapple_gpu_surf_maint != 2) {
 			mapple_surface_device_wrote(bo->surface);                /* dropped at the next IOSurfaceLock */
+			if (mapple_gpu_surf_maint == 1) {
+				bytes += mapple_surface_before_cpu_access(bo->surface);    /* or at once */
+			}
 		}
 	}
 	if (bytes != 0) {
@@ -4140,6 +4151,26 @@ MappleGPUAccelerator::linkCommand(const char *args, char *out, size_t outLen)
 		}
 		return kIOReturnSuccess;
 	});
+}
+
+/* kern.mapple_gpu_surf_debug: where the GPU's page table puts the surface's last import (0: no live import). */
+extern "C" uint64_t
+mapple_gpu_surface_pa(MappleSurface *surface)
+{
+	MappleGPUAccelerator *gpu = gMappleGPU;
+	__block uint64_t pa = 0;
+	if (gpu == NULL || surface == NULL || surface->gpuVM == NULL || gpu->gate() == NULL) {
+		return 0;
+	}
+	gpu->gate()->runActionBlock(^IOReturn {
+		for (MappleGPUVM *v = gpu->firstVM(); v != NULL; v = v->nextVM) {
+			if (v == surface->gpuVM) {
+				pa = v->paOf(surface->gpuVA);
+			}
+		}
+		return kIOReturnSuccess;
+	});
+	return pa;
 }
 
 /* K0c: the display (AppleCLCD) and IOSurfaceLock wait for the GPU's writes to a surface. */

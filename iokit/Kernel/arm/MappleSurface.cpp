@@ -944,7 +944,8 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
 		    s->allocSize <= MAPPLE_SURFACE_WIRED_MAX) {
 			bool display = mapple_surface_scanout_w != 0 && s->width == mapple_surface_scanout_w &&
 			    s->height == mapple_surface_scanout_h && s->bytesPerElement == 4 && s->planeCount == 0;
-			if (display) {
+			IOOptionBits wc = mapple_gpu_surf_uncached ? kIOMapWriteCombineCache : 0;
+			if (display && !wc) {
 				/* 0184: the boot-time pool first (fragmentation made the allocation below fail for 60 % of pages) */
 				mem = mapple_surface_pool_take(s->allocSize, &s->poolSlot);
 				if (mem != NULL) {
@@ -955,7 +956,7 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
 			if (mem == NULL && display && mapple_surface_contig + s->allocSize <= MAPPLE_SURFACE_CONTIG_MAX) {
 				/* the display's DMA has no IOMMU here: one physical range below 4 GiB, 16 KiB aligned */
 				mem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task, kIODirectionInOut |
-				    kIOMemoryKernelUserShared | kIOMemoryPhysicallyContiguous, s->allocSize, 0x00000000ffffc000ull);
+				    kIOMemoryKernelUserShared | kIOMemoryPhysicallyContiguous | wc, s->allocSize, 0x00000000ffffc000ull);
 				if (mem != NULL) {
 					OSAddAtomic64(s->allocSize, (volatile SInt64 *)&mapple_surface_contig);
 					s->contig = true;
@@ -965,7 +966,10 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
 			if (mem == NULL) {
 				mapple_surface_sparse += display;
 				mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
-				    kIODirectionInOut | kIOMemoryKernelUserShared, s->allocSize, page_size);
+				    kIODirectionInOut | kIOMemoryKernelUserShared | wc, s->allocSize, page_size);
+			}
+			if (mem != NULL && wc) {
+				s->mapCache = kIOMapWriteCombineCache;
 			}
 		}
 		if (mem == NULL) {
@@ -974,8 +978,10 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
 		} else {
 			bzero(mem->getBytesNoCopy(), s->allocSize);
 			s->memory = mem;
-			s->cpuDirty = 1;        /* the zeros may still be in the CPU caches */
-			s->mapCache = kIOMapDefaultCache;
+			if (s->mapCache != kIOMapWriteCombineCache) {
+				s->cpuDirty = 1;        /* the zeros may still be in the CPU caches */
+				s->mapCache = kIOMapDefaultCache;
+			}
 			if (!mapple_surface_publish(s)) {
 				ret = kIOReturnNoResources;
 			}
@@ -1394,4 +1400,114 @@ IOSurfaceRootUserClient::getTargetAndTrapForIndex(IOService **targetP, UInt32 in
 	*targetP = this;
 	return &mapple_surface_traps[index];
 }
+
+/* ---- black Metal frames: the experiments of one boot (MappleSurface.h) ---- */
+
+int mapple_gpu_surf_maint;
+int mapple_gpu_surf_uncached;
+
+#if DEVELOPMENT || DEBUG
+#include <sys/sysctl.h>
+#include <sys/kauth.h>
+
+extern "C" uint64_t mapple_gpu_surface_pa(MappleSurface *surface);         /* MappleGPU.cpp */
+
+/* Read by the Metal driver at each texture it makes: render targets linear, IOSurfaces copied instead of imported. */
+static int mapple_gpu_linear, mapple_gpu_surf_copy;
+SYSCTL_INT(_kern, OID_AUTO, mapple_gpu_linear, CTLFLAG_RW | CTLFLAG_LOCKED, &mapple_gpu_linear, 0,
+    "Metal driver: every render target linear (no AFBC or tiling)");
+SYSCTL_INT(_kern, OID_AUTO, mapple_gpu_surf_copy, CTLFLAG_RW | CTLFLAG_LOCKED, &mapple_gpu_surf_copy, 0,
+    "Metal driver: IOSurfaces copied in and out, never imported");
+SYSCTL_INT(_kern, OID_AUTO, mapple_gpu_surf_maint, CTLFLAG_RW | CTLFLAG_LOCKED, &mapple_gpu_surf_maint, 0,
+    "after a GPU job a surface's CPU lines are dropped: 0 at the next CPU access, 1 at once, 2 never");
+SYSCTL_INT(_kern, OID_AUTO, mapple_gpu_surf_uncached, CTLFLAG_RW | CTLFLAG_LOCKED, &mapple_gpu_surf_uncached, 0,
+    "new IOSurfaces write-combined");
+
+/* 16 bytes at `pa`, through an uncached mapping: what is in DRAM, whatever the CPU caches hold. */
+static void
+mapple_surface_dram(uint64_t pa, uint8_t *out)
+{
+	bzero(out, 16);
+	IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(pa & ~15ull, 16, kIODirectionIn);
+	IOMemoryMap *map = md != NULL ? md->map(kIOMapInhibitCache | kIOMapReadOnly) : NULL;
+	if (map != NULL) {
+		const volatile uint8_t *p = (const volatile uint8_t *)map->getVirtualAddress();
+		for (int i = 0; i < 16; i++) {
+			out[i] = p[i];
+		}
+	}
+	OSSafeReleaseNULL(map);
+	OSSafeReleaseNULL(md);
+}
+
+static int
+mapple_surface_hex(char *out, size_t len, const char *what, const uint8_t *b)
+{
+	return snprintf(out, len, " %s %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x", what,
+	           b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
+}
+
+/*
+ * kern.mapple_gpu_surf_debug: newp = a surface id (4 bytes); oldp = its pages and its first bytes, at the start and in
+ * the middle, as DRAM holds them (uncached), as the framebuffer's copy reads them (the kernel's mapping, before any
+ * maintenance) and after a clean + invalidate. Root only.
+ */
+static int
+mapple_surface_debug SYSCTL_HANDLER_ARGS
+{
+#pragma unused(oidp, arg1, arg2)
+	uint32_t id = 0;
+	if (req->newptr == USER_ADDR_NULL || req->newlen != sizeof(id) || !kauth_cred_issuser(kauth_cred_get())) {
+		return EINVAL;
+	}
+	int error = SYSCTL_IN(req, &id, sizeof(id));
+	if (error) {
+		return error;
+	}
+	MappleSurface *s = mapple_surface_copy(id);
+	if (s == NULL) {
+		return ENOENT;
+	}
+	char out[1024];
+	size_t o = 0;
+	o += snprintf(out + o, sizeof(out) - o, "surface %u %ux%u bpr %u alloc %u %s%s, cpuDirty %u gpuDirty %u, %llu GPU jobs\n",
+	    s->id, s->width, s->height, s->bytesPerRow, s->allocSize, s->contig ? "contiguous" : "sparse",
+	    s->mapCache == kIOMapWriteCombineCache ? " write-combined" : " cached", s->cpuDirty, s->gpuDirty, s->gpuJobs);
+	uint64_t mid = (uint64_t)(s->height / 2) * s->bytesPerRow;
+	uint64_t at[2] = { s->offset, s->offset + mid };
+	uint64_t gpa = mapple_gpu_surface_pa(s);
+	for (int k = 0; k < 2 && s->memory != NULL; k++) {
+		IOByteCount seg = 0;
+		uint64_t pa = s->memory->getPhysicalSegment(at[k], &seg, kIOMemoryMapperNone);
+		uint8_t dram[16], cached[16], after[16];
+		mapple_surface_dram(pa, dram);
+		uintptr_t kva = s->kernelAddress();
+		if (kva != 0) {
+			memcpy(cached, (const void *)(kva + at[k]), 16);
+			for (uintptr_t line = (kva + at[k]) & ~(uintptr_t)63; line < kva + at[k] + 16; line += 64) {
+				__asm__ volatile ("dc civac, %0" : : "r"(line) : "memory");
+			}
+			__asm__ volatile ("dsb sy" : : : "memory");
+			memcpy(after, (const void *)(kva + at[k]), 16);
+		} else {
+			bzero(cached, 16);
+			bzero(after, 16);
+		}
+		o += snprintf(out + o, sizeof(out) - o, "%s +0x%llx: pa 0x%llx", k ? "middle" : "start", at[k], pa);
+		if (k == 0) {
+			o += snprintf(out + o, sizeof(out) - o, ", GPU va 0x%llx -> pa 0x%llx (%s)", s->gpuVA, gpa,
+			    gpa == 0 ? "no live import" : gpa == pa ? "same" : "DIFFERENT");
+		}
+		o += snprintf(out + o, sizeof(out) - o, "\n ");
+		o += mapple_surface_hex(out + o, sizeof(out) - o, "dram", dram);
+		o += mapple_surface_hex(out + o, sizeof(out) - o, "| cached", cached);
+		o += mapple_surface_hex(out + o, sizeof(out) - o, "| after civac", after);
+		o += snprintf(out + o, sizeof(out) - o, "\n");
+	}
+	s->release();
+	return SYSCTL_OUT(req, out, strnlen(out, sizeof(out)) + 1);
+}
+SYSCTL_PROC(_kern, OID_AUTO, mapple_gpu_surf_debug, CTLTYPE_OPAQUE | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
+    0, 0, mapple_surface_debug, "-", "an IOSurface's pages and first bytes: DRAM, the CPU's view, after civac");
+#endif /* DEVELOPMENT || DEBUG */
 #endif /* MT6781 */

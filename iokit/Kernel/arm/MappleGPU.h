@@ -112,6 +112,8 @@ public:
 	static uint64_t leafAttrs(bool exec);
 	/* MMU fault report: what `addr` is (live BO and its PTE, VA freed lately, outside the range). Gated. */
 	void describe(uint64_t addr, char *buf, size_t len);
+	/* The physical address the GPU's page table gives for `va`, 0 if unmapped. Gated. */
+	uint64_t paOf(uint64_t va);
 
 	MappleGPUAccelerator *gpu;
 	uint64_t  rootPA;               /* level 0 table */
@@ -422,6 +424,7 @@ private:
 	void cacheStats(char **out, char *end);
 public:
 	int cacheMode(void) const { return fCacheMode; }
+	MappleGPUVM *firstVM(void) const { return fVMs; }  /* gated */
 	/* A BO gets a CPU mapping (user mmap): from now on it is maintained around jobs. Gated. */
 	void boMapped(MappleGPUBO *bo);
 private:

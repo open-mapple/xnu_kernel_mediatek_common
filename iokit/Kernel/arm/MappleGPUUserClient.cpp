@@ -916,6 +916,8 @@ MappleGPUUserClient::importSurface(struct vgpu_import_iosurface *a)
 		}
 		a->handle = h;
 		a->offset = b->va + b->gpuOffset;
+		s->gpuVM = fVM;
+		s->gpuVA = a->offset;
 		a->size = total - planeOff;
 		a->bytes_per_row = planes ? s->planes[a->plane].bytesPerRow : s->bytesPerRow;
 		a->pixel_format = s->pixelFormat;
