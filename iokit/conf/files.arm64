@@ -35,6 +35,7 @@ iokit/Kernel/arm/hid/MappleHID.cpp                                optional iokit
 iokit/Kernel/arm/hid/MTKKeypad.cpp                              optional iokitcpp
 iokit/Kernel/arm/hid/MT6358Keys.cpp                            optional iokitcpp
 iokit/Kernel/arm/hid/GT9896.cpp                              optional iokitcpp
+iokit/Kernel/arm/hid/ILI7807S.cpp                          optional iokitcpp
 iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp
 iokit/Kernel/arm/hid/IOHIDEventServiceQueue.cpp                  optional iokitcpp
 iokit/Kernel/arm/hid/IOHIDEventServiceUserClient.cpp             optional iokitcpp
