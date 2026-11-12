@@ -833,6 +833,7 @@ MappleGPUBO::free(void)
 		memory->release();
 	}
 	OSSafeReleaseNULL(kmap);
+	OSSafeReleaseNULL(mapMD);
 	OSSafeReleaseNULL(surface);
 	OSSafeReleaseNULL(busy);
 	if (vm != NULL) {
@@ -4039,11 +4040,13 @@ void
 MappleGPUAccelerator::objectCounts(char **out, char *end, const char *when)
 {
 	say(out, end, "objects%s%s: wired %llu KiB; jobs %llu, fences %u, BOs %u, VMs %u, clients %u, surfaces %u, "
-	    "OSArrays %u, OSData %u\n", when ? " " : "", when ? when : "", (uint64_t)vm_page_wire_count * (PAGE_SIZE >> 10),
+	    "OSArrays %u, OSData %u, memory maps %u, buffer descriptors %u; mappings dropped at close %llu\n", when ? " " : "",
+	    when ? when : "", (uint64_t)vm_page_wire_count * (PAGE_SIZE >> 10),
 	    fJobsLive, MappleGPUFence::metaClass->getInstanceCount(), MappleGPUBO::metaClass->getInstanceCount(),
 	    MappleGPUVM::metaClass->getInstanceCount(), MappleGPUUserClient::metaClass->getInstanceCount(),
 	    MappleSurface::metaClass->getInstanceCount(),
-	    OSArray::metaClass->getInstanceCount(), OSData::metaClass->getInstanceCount());
+	    OSArray::metaClass->getInstanceCount(), OSData::metaClass->getInstanceCount(),
+	    IOMemoryMap::metaClass->getInstanceCount(), IOBufferMemoryDescriptor::metaClass->getInstanceCount(), fMapsDropped);
 }
 
 /* ---- USB link: "gpu [status|mfg|on|off|regs|freq [MHz]|dvfs [on|off]|selftest [fault]|jobs N|probe|publish]" ---- */

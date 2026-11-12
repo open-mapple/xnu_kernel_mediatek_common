@@ -190,6 +190,7 @@ public:
 	MappleGPUBOKind       kind;
 	IOMemoryDescriptor *memory;     /* normal/user/surface pages; NULL for a heap */
 	uint64_t            memOffset;  /* first mapped byte in `memory` (page-aligned) */
+	IOMemoryDescriptor *mapMD;      /* [memOffset, +vaSize) of `memory`, made once: an unmap finds its mapping by it */
 	uint64_t            gpuOffset;  /* GPU address of the content = va + gpuOffset (surface plane) */
 	uint64_t            va, vaSize; /* GPU VA and mapped span (16 KiB multiple) */
 	uint64_t            size;       /* size reported to userspace */
@@ -473,7 +474,7 @@ private:
 	OSArray *fPromises;                 /* K0i: pending promises (their timeout, in jobTimer) */
 	uint64_t fPromisesMade, fPromisesTimedOut;
 	uint64_t fPromiseBypass, fQueueBypass, fJobsDiscarded;      /* K0j */
-	uint64_t fJobsLive;
+	uint64_t fJobsLive, fMapsDropped;
 	uint32_t fArmWait;
 	uint64_t fK0jEpoch;                 /* bumped when a promise is made, resolved or signalled, or a job dropped */
 	uint64_t fK0jVisits, fK0jCached;    /* graph nodes walked / answered from the cache */                  /* nextStartable(forArm): the slots the armed job waits for */

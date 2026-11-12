@@ -388,6 +388,15 @@ MappleGPUUserClient::dispatch(uint32_t selector, void *arg)
 				return kIOReturnNotFound;
 			}
 			fBOs[a->handle] = NULL;
+			/*
+			 * CPU mappings still in the process go now: once the handle is gone, IOConnectUnmapMemory64 cannot
+			 * find them (it asks clientMemoryForType again) and they would keep the pages until the process exits.
+			 */
+			IOMemoryMap *m;
+			while (b->memory != NULL && (m = removeMappingForDescriptor(b->mapMD ? b->mapMD : b->memory)) != NULL) {
+				m->release();
+				fGPU->fMapsDropped++;
+			}
 			b->release();           /* jobs using it hold their own reference */
 			return kIOReturnSuccess;
 		}
@@ -1046,15 +1055,14 @@ MappleGPUUserClient::clientMemoryForType(UInt32 type, IOOptionBits *options, IOM
 			return kIOReturnBadArgument;
 		}
 		fGPU->boMapped(b);
-		IOMemoryDescriptor *md = b->memory;
-		if (b->memOffset != 0) {
-			md = IOSubMemoryDescriptor::withSubRange(b->memory, b->memOffset, b->vaSize, kIODirectionInOut);
-			if (md == NULL) {
+		if (b->memOffset != 0 && b->mapMD == NULL) {
+			b->mapMD = IOSubMemoryDescriptor::withSubRange(b->memory, b->memOffset, b->vaSize, kIODirectionInOut);
+			if (b->mapMD == NULL) {
 				return kIOReturnNoMemory;
 			}
-		} else {
-			md->retain();
 		}
+		IOMemoryDescriptor *md = b->mapMD ? b->mapMD : b->memory;
+		md->retain();
 		*options = 0;
 		*memory = md;
 		return kIOReturnSuccess;
