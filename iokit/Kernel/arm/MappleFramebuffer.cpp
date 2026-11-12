@@ -218,6 +218,7 @@ public:
 	struct LatStat { uint64_t sum, n, max; } fLatReady, fLatFlip, fLatSwap, fLatRender;
 	LatStat       fLatWait[4];                    /* 0184: first "not done" -> done, per WAIT_* reason */
 	uint64_t      fLatReadyHist[5];               /* SwapEnd -> chosen in frames: <1, <2, <3, <4, more */
+	uint64_t      fSwapGapHist[5];                /* SwapEnd to SwapEnd: <= 17, 34, 50, 100 ms, more */
 	uint64_t      fLastSwapAt, fLastNotifyAt, fNextChosenAt;
 	uint64_t      fTickPresents;                  /* 0135: frames chosen at a tick before its frame end (scanout) */
 	static void latAdd(LatStat *s, uint64_t d) { s->sum += d; s->n++; if (d > s->max) s->max = d; }
@@ -821,6 +822,8 @@ mapple_fb_convert_row(uint32_t *dst, const uint8_t *src, int32_t w, uint32_t fmt
  * CPU (default 25: a 4 ms copy allows a frame every 16 ms, 60 Hz; an 8 ms
  * one every 32 ms, 30 Hz). Frames the GPU drew cost the CPU nothing else.
  */
+static uint64_t absUsFB(uint64_t abs);
+
 void
 AppleCLCD::swap(const uint8_t *rec)
 {
@@ -844,6 +847,10 @@ AppleCLCD::swap(const uint8_t *rec)
 	fQueueSeq[fQueueCount++] = ++fSeq;
 	if (fLastSwapAt != 0 && now - fLastSwapAt < 8 * periodOr60()) {
 		latAdd(&fLatSwap, now - fLastSwapAt);
+	}
+	if (fLastSwapAt != 0) {
+		uint64_t us = absUsFB(now - fLastSwapAt);
+		fSwapGapHist[us <= 17000 ? 0 : us <= 34000 ? 1 : us <= 50000 ? 2 : us <= 100000 ? 3 : 4]++;
 	}
 	fLastSwapAt = now;
 	if (fLastNotifyAt != 0 && now - fLastNotifyAt < 4 * periodOr60()) {
@@ -2264,6 +2271,7 @@ AppleCLCD::dispCommand(const char *args, char *out, size_t len)
 		bzero(&fLatSwap, sizeof(fLatSwap));
 		bzero(&fLatRender, sizeof(fLatRender));
 		bzero(fLatReadyHist, sizeof(fLatReadyHist));
+		bzero(fSwapGapHist, sizeof(fSwapGapHist));
 		bzero(fLatWait, sizeof(fLatWait));
 		bzero(fWaitBusyWhy, sizeof(fWaitBusyWhy));
 		bzero(fWaitSleptWhy, sizeof(fWaitSleptWhy));
@@ -2387,6 +2395,8 @@ AppleCLCD::dispCommand(const char *args, char *out, size_t len)
 			    "%llu (%llu swaps); %llu chosen at the tick before its switch (disp lat reset)\n", c, cm, r, rm,
 			    fLatReadyHist[0], fLatReadyHist[1], fLatReadyHist[2], fLatReadyHist[3], fLatReadyHist[4], f, fm, s,
 			    fLatSwap.n, fTickPresents);
+			disp_say(&p, end, "SwapEnd to SwapEnd: <=17 ms %llu, <=34 %llu, <=50 %llu, <=100 %llu, more %llu\n",
+			    fSwapGapHist[0], fSwapGapHist[1], fSwapGapHist[2], fSwapGapHist[3], fSwapGapHist[4]);
 			disp_say(&p, end, "ticks with a switch pending (0136): %llu late (avg %llu max %llu us after the frame end), "
 			    "%llu early (avg %llu us before it), %llu polled up to 3 ms ahead\n", fTickLate,
 			    absUsFB(fTickLate ? fTickLateSum / fTickLate : 0), absUsFB(fTickLateMax), fTickEarly,
