@@ -158,7 +158,7 @@ mmioctl(dev_t dev, u_long cmd, __unused caddr_t data,
  * daemons started by launchd write stdout/stderr to /dev/null, and
  * pointing a launchd job at /dev/console stops it from launching at all
  * (backboardd, v8 image). Instead, what the processes named in boot-arg
- * mp_null_tee (comma separated, default "backboardd,SpringBoard") write to
+ * mp_null_tee (comma separated, default "backboardd,SpringBoard,assetsd") write to
  * /dev/null goes to the console (and so to the persistent log) as
  * "|name| text". mp_null_tee=- turns it off.
  */
@@ -170,7 +170,7 @@ mapple_null_tee(char *name, size_t len)
 {
 	if (!mapple_null_parsed) {
 		if (!PE_parse_boot_argn_alias("mp_null_tee", "sweetnull", mapple_null_names, sizeof(mapple_null_names))) {
-			strlcpy(mapple_null_names, "backboardd,SpringBoard", sizeof(mapple_null_names));
+			strlcpy(mapple_null_names, "backboardd,SpringBoard,assetsd", sizeof(mapple_null_names));
 		}
 		mapple_null_parsed = 1;
 	}
