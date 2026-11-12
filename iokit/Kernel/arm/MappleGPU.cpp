@@ -812,6 +812,17 @@ MappleGPUBO::free(void)
 	if (memory != NULL) {
 		if (prepared) {
 			memory->complete();
+			if (kind == kMappleBOUser && vm != NULL) {
+				vm->userWired -= (int64_t)vaSize;
+				vm->userCompletes++;
+				vm->gpu->fUserWired -= (int64_t)vaSize;
+				vm->gpu->fUserCompletes++;
+			} else if (kind == kMappleBOSurface && vm != NULL) {
+				vm->surfPrepared -= (int64_t)vaSize;
+				vm->surfCompletes++;
+				vm->gpu->fSurfPrepared -= (int64_t)vaSize;
+				vm->gpu->fSurfCompletes++;
+			}
 		}
 		if (kind == kMappleBONormal && vm != NULL) {
 			vm->gpu->chargeMemory(vm, -(int64_t)vaSize);
@@ -1179,6 +1190,9 @@ MappleGPUAccelerator::memoryDump(char **out, char *end)
 	say(out, end, "memory: %lld KiB (peak %lld KiB, limit %lld MiB, %lld MiB per process), %llu refusals, in the processes' "
 	    "footprints %s\n", fMemory >> 10, fMemPeak >> 10, fMemLimit >> 20, fProcLimit >> 20, fMemRefused,
 	    fFootprint ? "(mp_gpu_footprint=1)" : "no (mp_gpu_footprint=0)");
+	say(out, end, "wired for the GPU: user memory %lld KiB (%llu prepares, %llu completes), IOSurfaces %lld KiB (%llu "
+	    "prepares, %llu completes)\n", fUserWired >> 10, fUserPrepares, fUserCompletes, fSurfPrepared >> 10, fSurfPrepares,
+	    fSurfCompletes);
 	for (MappleGPUVM *v = fVMs; v != NULL; v = v->nextVM) {
 		bool seen = false;
 		for (MappleGPUVM *w = fVMs; w != v; w = w->nextVM) {
@@ -1187,21 +1201,29 @@ MappleGPUAccelerator::memoryDump(char **out, char *end)
 		if (seen) {
 			continue;
 		}
-		int64_t bytes = 0, imported = 0, charged = 0;
+		int64_t bytes = 0, imported = 0, charged = 0, user = 0, surf = 0;
+		uint64_t up = 0, uc = 0, sp = 0, sc = 0;
 		uint32_t conns = 0, bos = 0, faults = 0;
 		for (MappleGPUVM *w = v; w != NULL; w = w->nextVM) {
 			if (w->pid == v->pid) {
 				bytes += w->bytes;
 				imported += w->imported;
 				charged += w->charged;
+				user += w->userWired;
+				surf += w->surfPrepared;
+				up += w->userPrepares;
+				uc += w->userCompletes;
+				sp += w->surfPrepares;
+				sc += w->surfCompletes;
 				bos += w->bos;
 				faults += w->faults;
 				conns++;
 			}
 		}
 		say(out, end, "  %s[%d]: %lld KiB in %u BOs (%lld KiB in its footprint), %lld KiB imported, %u connection%s, "
-		    "%u MMU faults\n", v->proc, v->pid, bytes >> 10, bos, charged >> 10, imported >> 10, conns,
-		    conns == 1 ? "" : "s", faults);
+		    "%u MMU faults; wired: user %lld KiB (%llu/%llu), IOSurfaces %lld KiB (%llu/%llu)\n", v->proc, v->pid,
+		    bytes >> 10, bos, charged >> 10, imported >> 10, conns, conns == 1 ? "" : "s", faults, user >> 10, up, uc,
+		    surf >> 10, sp, sc);
 	}
 }
 
@@ -4266,4 +4288,33 @@ mapple_gpu_link(const char *args, char *out, size_t outLen)
 	}
 	gMappleGPU->linkCommand(args, out, outLen);
 }
+
+#if DEVELOPMENT || DEBUG
+#include <sys/sysctl.h>
+
+/* gpu status's memory lines (per process: GPU memory, imports, pages wired for the GPU), for mstat */
+static int
+mapple_gpu_memory_sysctl(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
+{
+	const size_t cap = 32768;
+	MappleGPUAccelerator *gpu = gMappleGPU;
+	if (gpu == NULL) {
+		return ENODEV;
+	}
+	char *buf = (char *)IOMallocData(cap);
+	if (buf == NULL) {
+		return ENOMEM;
+	}
+	__block char *o = buf;
+	gpu->gate()->runActionBlock(^IOReturn {
+		gpu->memoryDump(&o, buf + cap);
+		return kIOReturnSuccess;
+	});
+	int err = SYSCTL_OUT(req, buf, (size_t)(o - buf) + 1);
+	IOFreeData(buf, cap);
+	return err;
+}
+SYSCTL_PROC(_kern, OID_AUTO, mapple_gpu_memory, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
+    0, 0, mapple_gpu_memory_sysctl, "A", "GPU memory per process, imports and pages wired for the GPU");
+#endif /* DEVELOPMENT || DEBUG */
 #endif /* MT6781 */

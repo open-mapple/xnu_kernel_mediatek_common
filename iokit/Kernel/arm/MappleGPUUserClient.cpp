@@ -900,6 +900,12 @@ MappleGPUUserClient::importSurface(struct vgpu_import_iosurface *a)
 		b->memory = s->memory;
 		b->memory->retain();
 		b->prepared = b->memory->prepare() == kIOReturnSuccess;
+		if (b->prepared) {
+			fVM->surfPrepared += (int64_t)mapSize;
+			fVM->surfPrepares++;
+			fGPU->fSurfPrepared += (int64_t)mapSize;
+			fGPU->fSurfPrepares++;
+		}
 		b->memOffset = mapStart;
 		b->size = b->vaSize = mapSize;
 		fVM->imported += (int64_t)mapSize;
@@ -976,6 +982,10 @@ MappleGPUUserClient::importUser(struct vgpu_import_userptr *a)
 			b->release();
 			return kIOReturnNoMemory;
 		}
+		fVM->userWired += (int64_t)a->size;
+		fVM->userPrepares++;
+		fGPU->fUserWired += (int64_t)a->size;
+		fGPU->fUserPrepares++;
 		a->handle = h;
 		a->offset = b->va;
 		return kIOReturnSuccess;

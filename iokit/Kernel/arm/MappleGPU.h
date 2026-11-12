@@ -127,6 +127,10 @@ public:
 	char       proc[20];
 	int64_t    bytes;               /* GPU memory charged: BOs, heap chunks, page tables */
 	int64_t    imported;            /* IOSurface / user memory mapped (not charged) */
+	/* pages prepared (wired) for the GPU and completed again: the process's own memory (importUser: no-copy buffers),
+	 * and IOSurfaces (their memory is wired by the surface already; prepare/complete only count) */
+	int64_t    userWired, surfPrepared;
+	uint64_t   userPrepares, userCompletes, surfPrepares, surfCompletes;
 	task_t     task;                /* the client's task (referenced), whose footprint holds `charged` */
 	int64_t    charged;
 	uint32_t   bos;
@@ -217,6 +221,7 @@ public:
 	    IOUserClient **handler) APPLE_KEXT_OVERRIDE;
 
 	IOCommandGate *gate(void) { return fGate; }
+	void memoryDump(char **out, char *end);
 	/* USB link "gpu ..." (text reply in out). */
 	void linkCommand(const char *args, char *out, size_t outLen);
 
@@ -391,10 +396,12 @@ private:
 	MappleGPUBO **fHeapList;              /* heap BOs (not retained), for GPU faults */
 	uint32_t    fHeapCount, fHeapCap;
 	int64_t     fMemory;                /* bytes of GPU memory allocated */
+	/* the same counts as each VM's (MappleGPUVM::userWired ...), over all processes, dead ones included */
+	int64_t     fUserWired, fSurfPrepared;
+	uint64_t    fUserPrepares, fUserCompletes, fSurfPrepares, fSurfCompletes;
 	int64_t     fMemPeak, fMemLimit, fProcLimit;    /* boot-args mp_gpu_memtotal / mp_gpu_mem (MiB) */
 	uint64_t    fMemRefused;
 	MappleGPUVM  *fVMs;                   /* live VMs (gated) */
-	void memoryDump(char **out, char *end);
 	MappleGPUVM  *fSelfVM;
 
 	/* counters */
