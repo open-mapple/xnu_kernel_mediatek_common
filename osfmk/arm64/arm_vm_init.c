@@ -1484,7 +1484,7 @@ SECURITY_READ_ONLY_LATE(static unsigned int) ptov_index = 0;
 
 #if defined(MT6781)
 /*
- * mp_mem4g=1: the shim gives the VM DRAM from 0x40000000 and leaves in the boot_args page the ranges it must not use:
+ * mp_mem4g (1 unless mp_mem4g=0): the shim gives the VM DRAM from 0x40000000 and leaves in the boot_args page the ranges it must not use:
  * LK's reservations (TEE, ATF, SSPM, SCP, the modem, LK's framebuffer), our payload and LK's tree, where Android puts
  * Wi-Fi's memory. They are kept out of the free pages, out of pa_valid() (so they are mapped as I/O, as before) and out
  * of the physmap, so the CPU has no cacheable alias to prefetch through into memory the EMI MPU protects.
@@ -1511,9 +1511,10 @@ mapple_mem4g_init(boot_args *args)
 	const pmap_paddr_t pa = args->topOfKernelData - 0x4000 + MAPPLE_HOLES_OFF;
 	const struct mapple_holes *h = (const struct mapple_holes *)(pa - gPhysBase + gVirtBase);
 	pmap_paddr_t prev = gPhysBase;
-	uint32_t on = 0;
+	uint32_t on = 1;
 
-	mapple_mem4g_asked = PE_parse_boot_argn("mp_mem4g", &on, sizeof(on)) && on != 0;
+	PE_parse_boot_argn("mp_mem4g", &on, sizeof(on));
+	mapple_mem4g_asked = on != 0;
 	if (!mapple_mem4g_asked || memcmp(h->magic, "MPHOLES1", 8) != 0) {
 		if (gPhysBase == MAPPLE_DRAM_BASE) {
 			panic("mp_mem4g: all of DRAM and no hole list");
