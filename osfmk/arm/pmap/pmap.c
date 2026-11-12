@@ -2565,6 +2565,11 @@ pmap_virtual_region(
  * need to skip those pages.
  */
 
+#if defined(MT6781)
+extern pmap_paddr_t mapple_hole_skip(pmap_paddr_t pa);
+extern uint64_t mapple_hole_bytes_in(pmap_paddr_t b, pmap_paddr_t e);
+#endif
+
 static unsigned int avail_page_count = 0;
 static bool need_ram_ranges_init = true;
 
@@ -2599,6 +2604,9 @@ initialize_ram_ranges(void)
 	assert(first == (first & ~PAGE_MASK));
 	assert(end == (end & ~PAGE_MASK));
 	avail_page_count = atop(end - first);
+#if defined(MT6781)
+	avail_page_count -= atop(mapple_hole_bytes_in(first, end));
+#endif
 
 	need_ram_ranges_init = false;
 }
@@ -2642,6 +2650,9 @@ pmap_next_page(
 	}
 
 
+#if defined(MT6781)
+	first_avail = MIN(mapple_hole_skip(first_avail), avail_end);
+#endif
 	if (first_avail != avail_end) {
 		*pnum = (ppnum_t)atop(first_avail);
 		first_avail += PAGE_SIZE;

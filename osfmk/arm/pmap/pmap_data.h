@@ -71,9 +71,19 @@ extern pmap_paddr_t vm_first_phys, vm_last_phys;
  *
  * @param pa The physical address to check.
  */
+#if defined(MT6781)
+extern unsigned int mapple_hole_count;
+extern bool mapple_pa_in_hole(pmap_paddr_t pa);         /* arm_vm_init.c, mp_mem4g=1 */
+#endif
+
 static inline bool
 pa_valid(pmap_paddr_t pa)
 {
+#if defined(MT6781)
+	if (__improbable(mapple_hole_count != 0) && mapple_pa_in_hole(pa)) {
+		return false;
+	}
+#endif
 	return (pa >= vm_first_phys) && (pa < vm_last_phys);
 }
 

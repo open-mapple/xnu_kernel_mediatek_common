@@ -23,6 +23,7 @@ public:
 };
 
 extern "C" int mapple_rtc_read(uint64_t *secs);   /* MTKPwrap.cpp: the PMIC's RTC (MT6781 only) */
+extern "C" void mapple_mem4g_report(void);        /* arm_vm_init.c: mp_mem4g's holes (MT6781 only) */
 
 /* The calendar at boot from the PMIC's RTC (otherwise 1970: no TLS, every site refuses the clock). */
 void
@@ -50,6 +51,9 @@ MapplePlatformExpert::start(IOService *provider)
 	}
 	registerService();
 	IOLog("platform expert registered\n");
+#if defined(MT6781)
+	mapple_mem4g_report();
+#endif
 	return true;
 }
 

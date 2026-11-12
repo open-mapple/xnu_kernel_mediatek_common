@@ -1482,6 +1482,133 @@ SECURITY_READ_ONLY_LATE(static unsigned int) ptov_index = 0;
 #define ROUND_L1(addr) (((addr) + ARM_TT_L1_OFFMASK) & ~(ARM_TT_L1_OFFMASK))
 #define ROUND_TWIG(addr) (((addr) + ARM_TT_TWIG_OFFMASK) & ~(ARM_TT_TWIG_OFFMASK))
 
+#if defined(MT6781)
+/*
+ * mp_mem4g=1: the shim gives the VM DRAM from 0x40000000 and leaves in the boot_args page the ranges it must not use:
+ * LK's reservations (TEE, ATF, SSPM, SCP, the modem, LK's framebuffer), our payload and LK's tree, where Android puts
+ * Wi-Fi's memory. They are kept out of the free pages, out of pa_valid() (so they are mapped as I/O, as before) and out
+ * of the physmap, so the CPU has no cacheable alias to prefetch through into memory the EMI MPU protects.
+ */
+#define MAPPLE_HOLES_OFF 0x2000
+#define MAPPLE_HOLES_MAX 48
+
+struct mapple_holes {
+	char magic[8];
+	uint32_t count, pad;
+	uint64_t range[MAPPLE_HOLES_MAX][2];
+};
+
+SECURITY_READ_ONLY_LATE(unsigned int) mapple_hole_count;
+SECURITY_READ_ONLY_LATE(static pmap_paddr_t) mapple_holes[MAPPLE_HOLES_MAX][2];
+SECURITY_READ_ONLY_LATE(static uint64_t) mapple_hole_bytes;
+SECURITY_READ_ONLY_LATE(static bool) mapple_mem4g_asked;
+
+static void
+mapple_mem4g_init(boot_args *args)
+{
+	const struct mapple_holes *h = (const struct mapple_holes *)((uintptr_t)args + MAPPLE_HOLES_OFF);
+	pmap_paddr_t prev = gPhysBase;
+	uint32_t on = 0;
+
+	mapple_mem4g_asked = PE_parse_boot_argn("mp_mem4g", &on, sizeof(on)) && on != 0;
+	if (!mapple_mem4g_asked || memcmp(h->magic, "MPHOLES1", 8) != 0) {
+		return;
+	}
+	if (h->count == 0 || h->count > MAPPLE_HOLES_MAX) {
+		panic("mp_mem4g: %u holes", h->count);
+	}
+	for (unsigned int i = 0; i < h->count; i++) {
+		pmap_paddr_t b = h->range[i][0], e = h->range[i][1];
+		if (b < prev || e <= b || e > gPhysBase + mem_size || ((b | e) & PAGE_MASK)) {
+			panic("mp_mem4g: hole %u 0x%llx-0x%llx", i, b, e);
+		}
+		mapple_holes[i][0] = b;
+		mapple_holes[i][1] = e;
+		mapple_hole_bytes += e - b;
+		prev = e;
+	}
+	mapple_hole_count = h->count;
+}
+
+bool
+mapple_pa_in_hole(pmap_paddr_t pa)
+{
+	unsigned int lo = 0, hi = mapple_hole_count;
+
+	while (lo < hi) {
+		unsigned int mid = (lo + hi) / 2;
+		if (pa >= mapple_holes[mid][1]) {
+			lo = mid + 1;
+		} else if (pa < mapple_holes[mid][0]) {
+			hi = mid;
+		} else {
+			return true;
+		}
+	}
+	return false;
+}
+
+/* PA itself, or the end of the hole it is in (the shim merges touching holes) */
+pmap_paddr_t
+mapple_hole_skip(pmap_paddr_t pa)
+{
+	for (unsigned int i = 0; i < mapple_hole_count; i++) {
+		if (pa >= mapple_holes[i][0] && pa < mapple_holes[i][1]) {
+			return mapple_holes[i][1];
+		}
+	}
+	return pa;
+}
+
+uint64_t
+mapple_hole_bytes_in(pmap_paddr_t b, pmap_paddr_t e)
+{
+	uint64_t n = 0;
+
+	for (unsigned int i = 0; i < mapple_hole_count; i++) {
+		pmap_paddr_t hb = MAX(b, mapple_holes[i][0]), he = MIN(e, mapple_holes[i][1]);
+		if (hb < he) {
+			n += he - hb;
+		}
+	}
+	return n;
+}
+
+/* the physmap's mapping of [PA, PA + LEN) at VA, all but the holes */
+static void
+mapple_physmap_map(vm_offset_t va, pmap_paddr_t pa, vm_size_t len, pmap_paddr_t pa_offset, int pte_prot_APX,
+    unsigned granule)
+{
+	pmap_paddr_t cur = pa, end = pa + len;
+
+	for (unsigned int i = 0; i <= mapple_hole_count && cur < end; i++) {
+		pmap_paddr_t hb = i < mapple_hole_count ? MIN(mapple_holes[i][0], end) : end;
+		pmap_paddr_t he = i < mapple_hole_count ? mapple_holes[i][1] : end;
+		if (hb > cur) {
+			arm_vm_page_granular_prot(va + (cur - pa), hb - cur, pa_offset, 1, pte_prot_APX, 1, granule);
+		}
+		cur = MAX(cur, he);
+	}
+}
+
+void
+mapple_mem4g_report(void)
+{
+	if (mapple_hole_count == 0) {
+		if (mapple_mem4g_asked) {
+			printf("mp_mem4g: no hole list from the shim: the 2 GB layout\n");
+		}
+		return;
+	}
+	for (unsigned int i = 0; i < mapple_hole_count; i++) {
+		printf("mp_mem4g: hole 0x%09llx-0x%09llx %llu KiB\n", mapple_holes[i][0], mapple_holes[i][1] - 1,
+		    (mapple_holes[i][1] - mapple_holes[i][0]) >> 10);
+	}
+	printf("mp_mem4g: RAM 0x%llx-0x%llx, %u holes of %llu MiB, %llu MiB for the VM\n", gPhysBase, gPhysBase + gPhysSize,
+	    mapple_hole_count, mapple_hole_bytes >> 20, max_mem >> 20);
+}
+#endif
+
 static void
 arm_vm_physmap_slide(ptov_table_entry *temp_ptov_table, vm_map_address_t orig_va, vm_size_t len, int pte_prot_APX, unsigned granule)
 {
@@ -1510,7 +1637,12 @@ arm_vm_physmap_slide(ptov_table_entry *temp_ptov_table, vm_map_address_t orig_va
 	assert((temp_ptov_table[ptov_index].va & ARM_PGMASK) == 0);
 	temp_ptov_table[ptov_index].len = round_page(len);
 	pa_offset = temp_ptov_table[ptov_index].va - orig_va;
+#if defined(MT6781)
+	mapple_physmap_map(temp_ptov_table[ptov_index].va, temp_ptov_table[ptov_index].pa, temp_ptov_table[ptov_index].len,
+	    pa_offset, pte_prot_APX, granule);
+#else
 	arm_vm_page_granular_prot(temp_ptov_table[ptov_index].va, temp_ptov_table[ptov_index].len, pa_offset, 1, pte_prot_APX, 1, granule);
+#endif
 	++ptov_index;
 }
 
@@ -1893,6 +2025,11 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
 	} else {
 		max_mem_actual = mem_actual;
 	}
+#if defined(MT6781)
+	mapple_mem4g_init(args);
+	mem_actual -= mapple_hole_bytes;
+	max_mem_actual -= mapple_hole_bytes;
+#endif
 	if (mem_size >= ((VM_MAX_KERNEL_ADDRESS - VM_MIN_KERNEL_ADDRESS) / 2)) {
 		panic("Unsupported memory configuration %lx", mem_size);
 	}
@@ -2251,6 +2388,10 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
 
 	sane_size = mem_size - (avail_start - gPhysBase);
 	max_mem = mem_size;
+#if defined(MT6781)
+	sane_size -= mapple_hole_bytes;
+	max_mem -= mapple_hole_bytes;
+#endif
 	vm_kernel_slid_base = segLOWESTTEXT;
 	// vm_kernel_slide is set by arm_init()->arm_slide_rebase_and_sign_image()
 	vm_kernel_stext = segTEXTB;
@@ -2419,6 +2560,11 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
 
 #if XNU_MONITOR
 	pmap_static_allocations_done();
+#endif
+#if defined(MT6781)
+	if (mapple_hole_bytes_in(args->topOfKernelData, avail_start) != 0) {
+		panic("mp_mem4g: the boot allocations 0x%llx-0x%llx ran into a hole", args->topOfKernelData, avail_start);
+	}
 #endif
 	first_avail = avail_start;
 	patch_low_glo_static_region(args->topOfKernelData, avail_start - args->topOfKernelData);
