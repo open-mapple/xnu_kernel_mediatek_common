@@ -27,7 +27,9 @@
 #include <kern/startup.h>
 #include <libkern/amfi/amfi.h>
 #include <mach/kern_return.h>
+#include <pexpert/pexpert.h>
 #include <sys/codesign.h>
+#include <sys/kauth.h>
 #include <sys/mount.h>
 #include <sys/priv.h>
 #include <sys/proc.h>
@@ -280,14 +282,61 @@ amfi_stub_vnode_check_signature(struct vnode *vp, __unused struct label *label,
  * (backboardd cannot reach mobilegestalt or iohideventsystem; tccd:
  * "profile not found"). MT6781 runs without a sandbox: operations succeed
  * (checks allow, profile init is accepted); the few that must return
- * data (container paths, extension tokens) fail with ENOENT. The first
- * use of each operation number is logged.
+ * data (extension tokens) fail with ENOENT. A container path (op 4) is the
+ * home of the process's user: PlugInKit aborts an extension whose container
+ * path is missing ("plugin has invalid sandbox or container"); boot-arg
+ * mp_sbx_container=0 makes it fail with ENOENT again. The first use of each
+ * operation number is logged.
  */
 static uint64_t mapple_sandbox_seen;
 
+/* op 4's argument (libsystem_sandbox): pid (0: the caller's), audit token pointer, path buffer, its size */
+struct mapple_sandbox_path_args {
+	uint64_t pid, token, buf, size, unused;
+};
+
 static int
-mapple_sandbox_syscall(struct proc *p, int call, __unused user_addr_t arg)
+mapple_sandbox_container_path(struct proc *p, user_addr_t arg)
 {
+	struct mapple_sandbox_path_args a;
+	uint32_t token[8];
+	int err = copyin(arg, &a, sizeof(a));
+	if (err) {
+		return err;
+	}
+	int pid = (int)a.pid;
+	if (pid == 0 && a.token != 0) {
+		if ((err = copyin((user_addr_t)a.token, token, sizeof(token)))) {
+			return err;
+		}
+		pid = (int)token[5];
+	}
+	proc_t t = pid == 0 || pid == proc_pid(p) ? p : proc_find(pid);
+	if (t == NULL) {
+		return ESRCH;
+	}
+	kauth_cred_t cred = kauth_cred_proc_ref(t);
+	uid_t uid = kauth_cred_getuid(cred);
+	kauth_cred_unref(&cred);
+	const char *home = uid == 501 ? "/private/var/mobile" : "/private/var/root";
+	if (t != p) {
+		proc_rele(t);
+	}
+	size_t len = strlen(home) + 1;
+	if (a.buf == 0 || a.size < len) {
+		return ERANGE;
+	}
+	return copyout(home, (user_addr_t)a.buf, len);
+}
+
+static int
+mapple_sandbox_syscall(struct proc *p, int call, user_addr_t arg)
+{
+	static int container = -1;
+	if (container < 0) {
+		container = 1;
+		PE_parse_boot_argn("mp_sbx_container", &container, sizeof(container));
+	}
 	if (call >= 0 && call < 64 && !(mapple_sandbox_seen & (1ULL << call))) {
 		mapple_sandbox_seen |= 1ULL << call;
 		char name[32];
@@ -296,6 +345,7 @@ mapple_sandbox_syscall(struct proc *p, int call, __unused user_addr_t arg)
 	}
 	switch (call) {
 	case 4:         /* container path (audit token / pid) */
+		return container ? mapple_sandbox_container_path(p, arg) : ENOENT;
 	case 5:         /* extension issue */
 	case 6:         /* extension consume */
 	case 0x43:      /* container expected */
