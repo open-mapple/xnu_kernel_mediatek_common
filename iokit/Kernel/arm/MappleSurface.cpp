@@ -455,12 +455,13 @@ mapple_surface_layout(MappleSurface *s, OSDictionary *props)
 	 * surfaces in and out at every use (10.7 MB each way, 23 ms stalls on the GPU queue). Single-plane surfaces get
 	 * the pitch rounded up: clients read it back from the lock result (+0x28; CA, ImageIO, IOSurface.framework).
 	 * Not when an explicit IOSurfaceAllocSize would no longer hold the rows (the client laid the memory out
-	 * itself), nor with an offset or a parent. Boot-arg mp_surface_pitch64=0: never; 2 (0187, to try): also those, the
-	 * allocation grown to the rounded rows (CA's 1125x2436 snapshot and 787x1705 switcher surfaces declare exactly
-	 * pitch x height and stayed unaligned: correct only if their writers read the pitch back).
+	 * itself), nor with an offset or a parent. Off by default: it garbled the home screen's icons.
+	 * mp_surface_pitch64=1: on; 2 (0187, to try): also those, the allocation grown to the rounded rows (CA's
+	 * 1125x2436 snapshot and 787x1705 switcher surfaces declare exactly pitch x height and stayed unaligned: correct
+	 * only if their writers read the pitch back).
 	 */
 	if (mapple_surface_pitch64 < 0) {
-		int on = 1;
+		int on = 0;
 		PE_parse_boot_argn_alias("mp_surface_pitch64", "vivasurfpitch", &on, sizeof(on));
 		mapple_surface_pitch64 = on;
 	}
