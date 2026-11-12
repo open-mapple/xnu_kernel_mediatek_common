@@ -170,12 +170,31 @@ mapple_boot_part(void)
 	return "boot_b";
 }
 
+/*
+ * The payload's command line: boot_a's or boot_b's. On a phone with a single boot partition (the payload inside the boot
+ * loader's image) it is the line this boot started with, unless the shim replaced that with the record's: then it is not
+ * known here, and the record's own base_hash says which payload it belongs to.
+ */
+static int
+mapple_payload_line(char *payload, size_t len)
+{
+	char rec[BOOTARGS_MAX + 1];
+	int error = mtk_ufs_bootargs(mapple_boot_part(), false, payload, len);
+	if (error != ENOENT) {
+		return error;
+	}
+	if (mtk_ufs_bootfile(false, 0, rec, sizeof(rec)) == 0 && strcmp(rec, PE_boot_args()) == 0) {
+		return ENOENT;
+	}
+	strlcpy(payload, PE_boot_args(), len);
+	return 0;
+}
+
 /* mapple_sysctl_mtx held */
 static void
 mapple_bootargs_remember(void)
 {
-	if (!mapple_bootargs_have_orig &&
-	    mtk_ufs_bootargs(mapple_boot_part(), false, mapple_bootargs_orig, sizeof(mapple_bootargs_orig)) == 0) {
+	if (!mapple_bootargs_have_orig && mapple_payload_line(mapple_bootargs_orig, sizeof(mapple_bootargs_orig)) == 0) {
 		mapple_bootargs_have_orig = true;
 	}
 }
@@ -192,7 +211,7 @@ static const char *mapple_bootargs_src = "payload";
 static int
 mapple_next_line(char *cur, size_t len, char *payload, size_t plen)
 {
-	int error = mtk_ufs_bootargs(mapple_boot_part(), false, payload, plen);
+	int error = mapple_payload_line(payload, plen);
 	if (error) {
 		return error;
 	}
@@ -269,7 +288,7 @@ sysctl_mapple_nextbootargs SYSCTL_HANDLER_ARGS
 		want[--n] = 0;
 	}
 	lck_mtx_lock(&mapple_sysctl_mtx);
-	error = mtk_ufs_bootargs(mapple_boot_part(), false, payload, sizeof(payload));
+	error = mapple_payload_line(payload, sizeof(payload));
 	if (!error) {
 		error = mapple_next_line_set(want, sizeof(want), payload);
 	}

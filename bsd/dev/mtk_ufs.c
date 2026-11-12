@@ -590,7 +590,7 @@ mapple_bootrec_hash(const char *s)
 }
 
 /*
- * Read: the record's command line into cmdline when it is enabled, valid and for base (else ENOENT).
+ * Read: the record's command line into cmdline when it is enabled, valid and for base, any base if 0 (else ENOENT).
  * Write: cmdline (empty = disable the record) for base. EROFS without mp_ufsrw=1, ENOSPC when the HFS+ volume
  * reaches the record's block, EINVAL for a bad string, EIO.
  */
@@ -696,7 +696,7 @@ mtk_ufs_bootfile(bool write, uint64_t base, char *cmdline, size_t len)
 	struct bootrec_rec rec;
 	memcpy(&rec, b, sizeof(rec));
 	if (!write) {
-		bool ok = memcmp(rec.magic, "MAPPLEBR", 8) == 0 && rec.version == 1 && (rec.flags & 1) && rec.base_hash == base &&
+		bool ok = memcmp(rec.magic, "MAPPLEBR", 8) == 0 && rec.version == 1 && (rec.flags & 1) && (base == 0 || rec.base_hash == base) &&
 		    strnlen(rec.cmdline, BOOTREC_LINE) < BOOTREC_LINE && mapple_bootrec_hash(rec.cmdline) == rec.line_hash;
 		if (!ok) {
 			error = ENOENT;
