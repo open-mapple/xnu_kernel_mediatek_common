@@ -198,8 +198,8 @@ extern "C" void mt6781_cpufreq_boost_stats(int *on, uint64_t *starts, uint64_t *
 #define DVFS_TARGET_PCT         70      /* lower: the OPP that would be this busy */
 #define DVFS_HOLD_MS            200     /* no step down this soon after a step up */
 #define HEAP_CHUNK              (2ull << 20)
-#define GPU_MEMORY_LIMIT        (2048ll << 20)  /* default of boot-arg mp_gpu_memtotal (MiB) */
-#define GPU_PROCESS_LIMIT       (1024ll << 20)  /* default of boot-arg mp_gpu_mem (MiB, per process) */
+#define GPU_MEMORY_LIMIT        (768ll << 20)  /* default of boot-arg mp_gpu_memtotal (MiB) */
+#define GPU_PROCESS_LIMIT       (384ll << 20)  /* default of boot-arg mp_gpu_mem (MiB, per process) */
 
 /* ---- MFG (MediaTek) ---- */
 
@@ -457,6 +457,8 @@ struct MappleGPUJob {
 
 OSDefineMetaClassAndStructors(MappleGPUVM, OSObject);
 
+extern "C" void mapple_task_graphics_footprint(task_t task, int64_t bytes);   /* osfmk/kern/task.c */
+
 MappleGPUVM *
 MappleGPUVM::create(MappleGPUAccelerator *g)
 {
@@ -511,6 +513,10 @@ MappleGPUVM::free(void)
 		gpu->chargeMemory(this, -(int64_t)(fPool->getCount() * page_size));
 	}
 	OSSafeReleaseNULL(fPool);
+	if (task != TASK_NULL) {
+		mapple_task_graphics_footprint(task, -charged);
+		task_deallocate(task);
+	}
 	if (fRanges != NULL) {
 		IODeleteData(fRanges, Range, fRangeCap);
 	}
@@ -940,6 +946,9 @@ MappleGPUAccelerator::start(IOService *provider)
 		fOpp = fClockOpp = fDvfsFast = oppForMHz(300);
 		fDvfs = false;
 	}
+	flag = 1;
+	PE_parse_boot_argn("mp_gpu_footprint", &flag, sizeof(flag));
+	fFootprint = flag != 0;
 	int64_t mib = GPU_MEMORY_LIMIT >> 20;
 	PE_parse_boot_argn_alias("mp_gpu_memtotal", "vivagpumemtotal", &mib, sizeof(mib));
 	fMemLimit = mib << 20;
@@ -1152,6 +1161,11 @@ MappleGPUAccelerator::chargeMemory(MappleGPUVM *vm, int64_t bytes)
 	}
 	fMemory += bytes;
 	vm->bytes += bytes;
+	if (vm->task != TASK_NULL && (fFootprint || bytes < 0)) {
+		int64_t d = bytes > 0 ? bytes : -MIN(-bytes, vm->charged);
+		mapple_task_graphics_footprint(vm->task, d);
+		vm->charged += d;
+	}
 	if (fMemory > fMemPeak) {
 		fMemPeak = fMemory;
 	}
@@ -1162,8 +1176,9 @@ MappleGPUAccelerator::chargeMemory(MappleGPUVM *vm, int64_t bytes)
 void
 MappleGPUAccelerator::memoryDump(char **out, char *end)
 {
-	say(out, end, "memory: %lld KiB (peak %lld KiB, limit %lld MiB, %lld MiB per process), %llu refusals\n",
-	    fMemory >> 10, fMemPeak >> 10, fMemLimit >> 20, fProcLimit >> 20, fMemRefused);
+	say(out, end, "memory: %lld KiB (peak %lld KiB, limit %lld MiB, %lld MiB per process), %llu refusals, in the processes' "
+	    "footprints %s\n", fMemory >> 10, fMemPeak >> 10, fMemLimit >> 20, fProcLimit >> 20, fMemRefused,
+	    fFootprint ? "(mp_gpu_footprint=1)" : "no (mp_gpu_footprint=0)");
 	for (MappleGPUVM *v = fVMs; v != NULL; v = v->nextVM) {
 		bool seen = false;
 		for (MappleGPUVM *w = fVMs; w != v; w = w->nextVM) {
@@ -1172,19 +1187,21 @@ MappleGPUAccelerator::memoryDump(char **out, char *end)
 		if (seen) {
 			continue;
 		}
-		int64_t bytes = 0, imported = 0;
+		int64_t bytes = 0, imported = 0, charged = 0;
 		uint32_t conns = 0, bos = 0, faults = 0;
 		for (MappleGPUVM *w = v; w != NULL; w = w->nextVM) {
 			if (w->pid == v->pid) {
 				bytes += w->bytes;
 				imported += w->imported;
+				charged += w->charged;
 				bos += w->bos;
 				faults += w->faults;
 				conns++;
 			}
 		}
-		say(out, end, "  %s[%d]: %lld KiB in %u BOs, %lld KiB imported, %u connection%s, %u MMU faults\n", v->proc,
-		    v->pid, bytes >> 10, bos, imported >> 10, conns, conns == 1 ? "" : "s", faults);
+		say(out, end, "  %s[%d]: %lld KiB in %u BOs (%lld KiB in its footprint), %lld KiB imported, %u connection%s, "
+		    "%u MMU faults\n", v->proc, v->pid, bytes >> 10, bos, charged >> 10, imported >> 10, conns,
+		    conns == 1 ? "" : "s", faults);
 	}
 }
 

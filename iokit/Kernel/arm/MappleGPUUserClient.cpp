@@ -112,6 +112,10 @@ MappleGPUUserClient::start(IOService *provider)
 	}
 	fGPU->gate()->runActionBlock(^IOReturn {
 		fVM = MappleGPUVM::create(fGPU);
+		if (fVM != NULL) {
+			task_reference(fTask);
+			fVM->task = fTask;
+		}
 		return kIOReturnSuccess;
 	});
 	return fVM != NULL;

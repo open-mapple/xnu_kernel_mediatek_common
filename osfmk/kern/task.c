@@ -9135,3 +9135,22 @@ kdp_task_is_locked(task_t task)
 {
 	return kdp_lck_mtx_lock_spin_is_acquired(&task->lock);
 }
+
+/*
+ * Open Mapple: memory a driver holds for a task (GPU buffers, IOSurfaces), counted in its graphics and physical
+ * footprint as Apple's graphics-tagged memory is, so memorystatus sees who uses it. bytes < 0 gives it back.
+ */
+void
+mapple_task_graphics_footprint(task_t task, int64_t bytes)
+{
+	if (task == TASK_NULL || task->ledger == LEDGER_NULL || bytes == 0) {
+		return;
+	}
+	if (bytes > 0) {
+		ledger_credit(task->ledger, task_ledgers.graphics_footprint, bytes);
+		ledger_credit(task->ledger, task_ledgers.phys_footprint, bytes);
+	} else {
+		ledger_debit(task->ledger, task_ledgers.graphics_footprint, -bytes);
+		ledger_debit(task->ledger, task_ledgers.phys_footprint, -bytes);
+	}
+}

@@ -64,6 +64,8 @@ public:
 	 * jobs on the surface wait for this one, not for the promise they will resolve.
 	 */
 	OSObject                 *gpuPrev;
+	/* the task that made it (referenced) while its pixels count in that task's footprint (mp_gpu_footprint) */
+	task_t                    owner;
 	/* the last GPU import (kern.mapple_gpu_surf_debug): its VM (compared only, never dereferenced here) and address */
 	void                     *gpuVM;
 	uint64_t                  gpuVA;

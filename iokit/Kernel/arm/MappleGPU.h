@@ -127,6 +127,8 @@ public:
 	char       proc[20];
 	int64_t    bytes;               /* GPU memory charged: BOs, heap chunks, page tables */
 	int64_t    imported;            /* IOSurface / user memory mapped (not charged) */
+	task_t     task;                /* the client's task (referenced), whose footprint holds `charged` */
+	int64_t    charged;
 	uint32_t   bos;
 	MappleGPUVM *nextVM;              /* the accelerator's list of live VMs */
 	/*
@@ -424,6 +426,7 @@ private:
 	void cacheStats(char **out, char *end);
 public:
 	int cacheMode(void) const { return fCacheMode; }
+	bool        fFootprint;         /* mp_gpu_footprint: GPU memory in its process's phys_footprint (1 default) */
 	MappleGPUVM *firstVM(void) const { return fVMs; }  /* gated */
 	/* A BO gets a CPU mapping (user mmap): from now on it is maintained around jobs. Gated. */
 	void boMapped(MappleGPUBO *bo);

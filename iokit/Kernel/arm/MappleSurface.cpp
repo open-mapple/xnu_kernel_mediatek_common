@@ -123,11 +123,30 @@ static uint64_t      mapple_surface_pitch_rounds;
 
 OSDefineMetaClassAndStructors(MappleSurface, OSObject);
 
+extern "C" void mapple_task_graphics_footprint(task_t task, int64_t bytes);   /* osfmk/kern/task.c */
+
+/* mp_gpu_footprint (1 default): an IOSurface's pixels count in the footprint of the task that made it, as on iOS */
+static bool
+mapple_surface_footprint(void)
+{
+	static int on = -1;
+	if (on < 0) {
+		int v = 1;
+		PE_parse_boot_argn("mp_gpu_footprint", &v, sizeof(v));
+		on = v != 0;
+	}
+	return on;
+}
+
 void
 MappleSurface::free()
 {
 	if (OSDynamicCast(IOBufferMemoryDescriptor, memory) != NULL) {
 		OSAddAtomic64(-(SInt64)allocSize, (volatile SInt64 *)&mapple_surface_wired);
+	}
+	if (owner != TASK_NULL) {
+		mapple_task_graphics_footprint(owner, -(int64_t)allocSize);
+		task_deallocate(owner);
 	}
 	if (contig && poolSlot < 0) {
 		OSAddAtomic64(-(SInt64)allocSize, (volatile SInt64 *)&mapple_surface_contig);
@@ -978,6 +997,11 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
 		} else {
 			bzero(mem->getBytesNoCopy(), s->allocSize);
 			s->memory = mem;
+			if (mapple_surface_footprint()) {
+				s->owner = current_task();
+				task_reference(s->owner);
+				mapple_task_graphics_footprint(s->owner, (int64_t)s->allocSize);
+			}
 			if (s->mapCache != kIOMapWriteCombineCache) {
 				s->cpuDirty = 1;        /* the zeros may still be in the CPU caches */
 				s->mapCache = kIOMapDefaultCache;
@@ -1422,6 +1446,14 @@ SYSCTL_INT(_kern, OID_AUTO, mapple_gpu_surf_maint, CTLFLAG_RW | CTLFLAG_LOCKED, 
     "after a GPU job a surface's CPU lines are dropped: 0 at the next CPU access, 1 at once, 2 never");
 SYSCTL_INT(_kern, OID_AUTO, mapple_gpu_surf_uncached, CTLFLAG_RW | CTLFLAG_LOCKED, &mapple_gpu_surf_uncached, 0,
     "new IOSurfaces write-combined");
+
+/* GPU memory (read by Mesa and the Metal driver; 1 when absent): Mesa's BO cache also drops buffers unused for 2 s when
+ * it hands one out and at each submit; the driver empties that cache at a memory pressure notification. */
+static int mapple_gpu_bocache = 1, mapple_gpu_pressure = 1;
+SYSCTL_INT(_kern, OID_AUTO, mapple_gpu_bocache, CTLFLAG_RW | CTLFLAG_LOCKED, &mapple_gpu_bocache, 0,
+    "Mesa's BO cache: stale buffers dropped at fetch and submit too (0: only when one is put back, as upstream)");
+SYSCTL_INT(_kern, OID_AUTO, mapple_gpu_pressure, CTLFLAG_RW | CTLFLAG_LOCKED, &mapple_gpu_pressure, 0,
+    "the Metal driver empties Mesa's BO cache at a memory pressure notification");
 
 /* 16 bytes at `pa`, through an uncached mapping: what is in DRAM, whatever the CPU caches hold. */
 static void
