@@ -321,10 +321,14 @@ public:
 	uint64_t      fFlips, fFlipMissed, fFlipUnsure, fFlipEarly, fInPlace, fPolls, fPollAbs;
 	/* 0136: ticks with a switch pending that came after the predicted frame end (late) or too early for it */
 	uint64_t      fTickLate, fTickLateSum, fTickLateMax, fTickEarly, fTickEarlySum, fTickWidePolls;
+	bool          fOneLayer;      /* mp_fb_onelayer */
+	uint32_t      fOneOff[2];     /* per OVL: the layers oneLayer() switched off */
+	uint32_t      fOneLkPitch;    /* LK's layer pitch before oneLayer() set it to fRowBytes (0: not changed) */
 
 	bool dispMap(void);
 	bool findLKLayer(char **out, char *end);
 	bool layerReads(uint64_t lo, uint64_t hi);
+	void oneLayer(bool on, char **out, char *end);
 	bool scanout(const uint8_t *rec);
 	bool layersIdle(const uint8_t *rec, uint64_t *jobs);
 	void scanoutStop(void);
@@ -451,6 +455,9 @@ AppleCLCD::start(IOService *provider)
 		OSSafeReleaseNULL(fEarlyTimer);
 	}
 	fEarly = early != 0 && fEarlyTimer != NULL;
+	int one = 0;
+	PE_parse_boot_argn_alias("mp_fb_onelayer", "sweetfb_onelayer", &one, sizeof(one));
+	fOneLayer = one != 0;
 	uint32_t hz = 10;
 	fFlushTicks = 0;
 	if (PE_parse_boot_argn_alias("mp_fb_hz", "sweetfb_hz", &hz, sizeof(hz))) {
@@ -2019,7 +2026,61 @@ AppleCLCD::flipSetup(char **out, char *end)
 	fMisses = 0;
 	fResync = false;
 	fFlipReady = true;
+	if (fOneLayer) {
+		oneLayer(true, out, end);
+	}
 	return true;
+}
+
+/*
+ * fScanLock. Other enabled OVL layers that read the buffer LK's layer shows, switched off (on) or back on (off), and
+ * LK's layer given the pitch the buffers are written with (fRowBytes, the boot framebuffer's). On the realme 8i
+ * mtkloader's OVL0 L1 (pitch 4320 = fRowBytes) sits above LK's OVL0_2L L0 (pitch 4352) on buffer 0: with double
+ * buffering only every other frame is visible, the half-written one as well, and L0 shows through it sheared.
+ */
+void
+AppleCLCD::oneLayer(bool on, char **out, char *end)
+{
+	uint64_t lo = fPhys, hi = fPhys + (uint64_t)fRowBytes * fHeight;
+	if (on && fOneLkPitch == 0 && (fLkPitch & 0xffff) != fRowBytes) {
+		fOneLkPitch = fLkPitch;
+		fLkPitch = (fLkPitch & ~0xffffu) | fRowBytes;
+	} else if (!on && fOneLkPitch != 0) {
+		fLkPitch = fOneLkPitch;
+		fOneLkPitch = 0;
+	}
+	if (fShown.buf >= 0) {          /* the buffer on screen now, at the new pitch; the next switch uses it too */
+		fShown.pitch = fLkPitch;
+		layerWrite(fShown);
+	}
+	disp_say(out, end, "LK's layer pitch 0x%x\n", fLkPitch & 0xffff);
+	for (int o = 0; o < 2; o++) {
+		vm_offset_t b = fDisp[o];
+		uint32_t con = disp_rd(b, OVL_SRC_CON), off = 0;
+		if (!on) {
+			if (fOneOff[o]) {
+				disp_wr(b, OVL_SRC_CON, con | fOneOff[o]);
+				disp_say(out, end, "%s SRC_CON 0x%x -> 0x%x\n", o ? "OVL0_2L" : "OVL0", con, con | fOneOff[o]);
+				fOneOff[o] = 0;
+			}
+			continue;
+		}
+		if (!(disp_rd(b, OVL_EN) & 1)) {
+			continue;
+		}
+		for (int n = 0; n < (o ? 2 : 4); n++) {
+			uint32_t addr = disp_rd(b, OVL_L_ADDR(n));
+			if ((con & (1u << n)) && addr >= lo && addr < hi && !(o == fScanOvl && OVL_L_ADDR(n) == fScanAddrReg)) {
+				off |= 1u << n;
+			}
+		}
+		if (off) {
+			disp_wr(b, OVL_SRC_CON, con & ~off);
+			fOneOff[o] |= off;
+			IOLog("FB: one layer: %s SRC_CON 0x%x -> 0x%x\n", o ? "OVL0_2L" : "OVL0", con, con & ~off);
+			disp_say(out, end, "%s SRC_CON 0x%x -> 0x%x\n", o ? "OVL0_2L" : "OVL0", con, con & ~off);
+		}
+	}
 }
 
 /*
@@ -2304,6 +2365,20 @@ AppleCLCD::dispCommand(const char *args, char *out, size_t len)
 		}
 		fDirty = true;
 		disp_say(&p, end, "double buffer off: copies go to LK's buffer on screen\n");
+	} else if (strncmp(args, "onelayer on", 11) == 0) {
+		if (!fFlipReady) {
+			disp_say(&p, end, "one layer: needs the double buffer (%s)\n", fFlipWhy ? fFlipWhy : "off");
+		} else {
+			fOneLayer = true;
+			oneLayer(true, &p, end);
+			fDirty = true;
+			disp_say(&p, end, "one layer on\n");
+		}
+	} else if (strncmp(args, "onelayer off", 12) == 0) {
+		fOneLayer = false;
+		oneLayer(false, &p, end);
+		fDirty = true;
+		disp_say(&p, end, "one layer off: the other layers back as they were\n");
 	} else if (strncmp(args, "surfpitch", 9) == 0) {
 		const char *a = args + 9;
 		while (*a == ' ') {
@@ -2439,10 +2514,12 @@ AppleCLCD::dispCommand(const char *args, char *out, size_t len)
 		    fFlipWhy ? ": " : "", fFlipWhy ? fFlipWhy : "", fShown.buf < 0 ? "surface" : "buffer ",
 		    fShown.buf < 0 ? 0 : fShown.buf, pns / 1000, fFlips, fInPlace, fFlipMissed, fFlipUnsure, fFlipEarly,
 		    pollNs / 1000);
+		disp_say(&p, end, "one layer (mp_fb_onelayer) %s: switched off OVL0 0x%x, OVL0_2L 0x%x\n", fOneLayer ? "on" : "off",
+		    fOneOff[0], fOneOff[1]);
 		disp_say(&p, end, "panel refresh (0189): %u Hz, mode %s, %llu switches, %llu failures\n", fPanelHz,
 		    fHzMode == 1 ? "auto" : fHzMode == 120 ? "120" : "60", fHzSwitches, fHzFailures);
-		disp_say(&p, end, "usage: disp [regs|scanout on|scanout off|flip on|flip off|early on|early off|surfpitch 0|1|2|lat reset|"
-		    "hz 60|120|auto]\n");
+		disp_say(&p, end, "usage: disp [regs|scanout on|scanout off|flip on|flip off|early on|early off|onelayer on|onelayer off|surfpitch 0|1|2|"
+		    "lat reset|hz 60|120|auto]\n");
 	}
 	IOLockUnlock(fScanLock);
 }
