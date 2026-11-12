@@ -106,12 +106,7 @@ bsd/dev/random/randomdev.c		standard
 bsd/dev/memdev.c			standard
 bsd/dev/mtk_ufs.c			standard
 bsd/dev/proc_sampler.c			standard
-bsd/dev/mapple_keys.c			standard
-bsd/dev/mapple_touch.c			standard
-bsd/dev/mapple_rpmh.c			standard
-bsd/dev/mapple_spmi.c			standard
 bsd/dev/mt6358_gauge.c		standard
-bsd/dev/mapple_usb.c			standard
 bsd/dev/usb_link.c			standard
 bsd/dev/mt6631_wifi.c			standard
 bsd/dev/mt6631_wpa.c			standard

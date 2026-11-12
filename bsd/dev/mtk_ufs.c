@@ -53,9 +53,6 @@ extern void thread_deallocate(thread_t);
 extern int hz;
 static void mapple_log_start(void);
 extern void proc_sampler_start(void);
-extern void mapple_keys_init(void);
-extern void mapple_touch_init(void);
-extern void mapple_usb_probe(void);
 extern void usblink_probe(void);
 
 #define REG_CAP         0x00
@@ -1102,10 +1099,6 @@ mtk_ufs_init(void)
 	    su.writable ? "read-write" : "read-only", su.dma_pa);
 	mapple_log_start();
 	proc_sampler_start();
-	/* Input drivers (HID services in iokit/Kernel/arm/hid/MappleHID.cpp). */
-	mapple_keys_init();
-	mapple_touch_init();
-	mapple_usb_probe();
 	return 0;
 }
 
