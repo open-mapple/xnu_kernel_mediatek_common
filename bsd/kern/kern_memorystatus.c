@@ -1579,6 +1579,10 @@ memorystatus_do_kill(proc_t p, uint32_t cause, os_reason_t jetsam_reason, uint64
 #pragma unused(cause)
 #endif /* CONFIG_JETSAM */
 
+	/* on the console as well: memorystatus_log only reaches os_log, and the USB log is how kills are counted here */
+	printf("JETSAM %s[%d] cause %u, %llu KB, band %d, %llu pages available\n", *p->p_name ? p->p_name : "unknown",
+	    proc_getpid(p), cause, footprint >> 10, p->p_memstat_effectivepriority, (uint64_t)MEMORYSTATUS_LOG_AVAILABLE_PAGES);
+
 	if (p->p_memstat_effectivepriority >= JETSAM_PRIORITY_FOREGROUND) {
 		memorystatus_log(
 			"memorystatus: killing process %d [%s] in high band %s (%d) - memorystatus_available_pages: %llu\n",
