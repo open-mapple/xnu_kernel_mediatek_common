@@ -1489,8 +1489,9 @@ SECURITY_READ_ONLY_LATE(static unsigned int) ptov_index = 0;
  * Wi-Fi's memory. They are kept out of the free pages, out of pa_valid() (so they are mapped as I/O, as before) and out
  * of the physmap, so the CPU has no cacheable alias to prefetch through into memory the EMI MPU protects.
  */
-#define MAPPLE_HOLES_OFF 0x2000
+#define MAPPLE_HOLES_OFF 0x2000         /* in the shim's boot_args page, the 16 KiB below topOfKernelData */
 #define MAPPLE_HOLES_MAX 48
+#define MAPPLE_DRAM_BASE 0x40000000ULL
 
 struct mapple_holes {
 	char magic[8];
@@ -1506,12 +1507,17 @@ SECURITY_READ_ONLY_LATE(static bool) mapple_mem4g_asked;
 static void
 mapple_mem4g_init(boot_args *args)
 {
-	const struct mapple_holes *h = (const struct mapple_holes *)((uintptr_t)args + MAPPLE_HOLES_OFF);
+	/* ARGS is arm_init's copy of boot_args by now: the list is read where the shim left it, through the bootstrap map */
+	const pmap_paddr_t pa = args->topOfKernelData - 0x4000 + MAPPLE_HOLES_OFF;
+	const struct mapple_holes *h = (const struct mapple_holes *)(pa - gPhysBase + gVirtBase);
 	pmap_paddr_t prev = gPhysBase;
 	uint32_t on = 0;
 
 	mapple_mem4g_asked = PE_parse_boot_argn("mp_mem4g", &on, sizeof(on)) && on != 0;
 	if (!mapple_mem4g_asked || memcmp(h->magic, "MPHOLES1", 8) != 0) {
+		if (gPhysBase == MAPPLE_DRAM_BASE) {
+			panic("mp_mem4g: all of DRAM and no hole list");
+		}
 		return;
 	}
 	if (h->count == 0 || h->count > MAPPLE_HOLES_MAX) {
