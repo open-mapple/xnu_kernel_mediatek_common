@@ -1580,7 +1580,8 @@ memorystatus_do_kill(proc_t p, uint32_t cause, os_reason_t jetsam_reason, uint64
 #endif /* CONFIG_JETSAM */
 
 	/* on the console as well: memorystatus_log only reaches os_log, and the USB log is how kills are counted here */
-	printf("JETSAM %s[%d] cause %u, %llu KB, band %d, %llu pages available\n", *p->p_name ? p->p_name : "unknown",
+	printf("%s %s[%d] cause %u, %llu KB, band %d, %llu pages available\n",
+	    cause == kMemorystatusKilledPerProcessLimit ? "JETSAM-LIMIT" : "JETSAM", *p->p_name ? p->p_name : "unknown",
 	    proc_getpid(p), cause, footprint >> 10, p->p_memstat_effectivepriority, (uint64_t)MEMORYSTATUS_LOG_AVAILABLE_PAGES);
 
 	if (p->p_memstat_effectivepriority >= JETSAM_PRIORITY_FOREGROUND) {
@@ -4298,6 +4299,9 @@ memorystatus_log_exception(const int max_footprint_mb, boolean_t memlimit_is_act
 	    ((p && *p->p_name) ? p->p_name : "unknown"), (p ? proc_getpid(p) : -1), (memlimit_is_active ? "Active" : "Inactive"),
 	    (memlimit_is_fatal  ? "Hard" : "Soft"), max_footprint_mb,
 	    (memlimit_is_fatal  ? "fatal" : "non-fatal"));
+	printf("LIMIT %s[%d] over its %s %s limit of %d MB (%s)\n", ((p && *p->p_name) ? p->p_name : "unknown"),
+	    (p ? proc_getpid(p) : -1), memlimit_is_active ? "active" : "inactive", memlimit_is_fatal ? "hard" : "soft",
+	    max_footprint_mb, memlimit_is_fatal ? "killed" : "warned");
 
 	return;
 }
