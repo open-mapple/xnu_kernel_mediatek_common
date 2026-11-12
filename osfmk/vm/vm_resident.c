@@ -1391,6 +1391,9 @@ uint64_t secluded_shutoff_headroom = 150 * 1024 * 1024; /* original value from N
 #if defined(__arm64__)
 extern void patch_low_glo_vm_page_info(void *, void *, uint32_t);
 unsigned int vm_first_phys_ppnum = 0;
+#if defined(ARM64_BOARD_CONFIG_MT6781)
+extern bool mapple_pa_in_hole(uint64_t pa);     /* arm_vm_init.c, mp_mem4g=1 */
+#endif
 #endif
 
 void vm_page_release_startup(vm_page_t mem);
@@ -1567,6 +1570,13 @@ pmap_startup(
 #endif
 		++vm_pages_count;
 		vm_page_init(&vm_pages[i], phys_page, FALSE);
+#if defined(ARM64_BOARD_CONFIG_MT6781)
+		/* mp_mem4g: a hole's page keeps its place in vm_pages[] (VM_PAGE_GET_PHYS_PAGE counts on it), never freed */
+		if (mapple_pa_in_hole(ptoa(phys_page))) {
+			vm_pages[i].vmp_error = TRUE;
+			continue;
+		}
+#endif
 		if (fill) {
 			fillPage(phys_page, fillval);
 		}
