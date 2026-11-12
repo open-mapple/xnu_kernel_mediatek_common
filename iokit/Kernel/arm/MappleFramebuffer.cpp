@@ -2304,6 +2304,14 @@ AppleCLCD::dispCommand(const char *args, char *out, size_t len)
 		}
 		fDirty = true;
 		disp_say(&p, end, "double buffer off: copies go to LK's buffer on screen\n");
+	} else if (strncmp(args, "surfpitch", 9) == 0) {
+		const char *a = args + 9;
+		while (*a == ' ') {
+			a++;
+		}
+		int m = mapple_surface_pitch_mode(*a >= '0' && *a <= '2' ? *a - '0' : -1);
+		disp_say(&p, end, "mp_surface_pitch64 %d for new surfaces (0 never, 1 default, 2 also explicit sizes); %llu rounded so "
+		    "far\n", m, mapple_surface_pitch_rounded());
 	} else if (strncmp(args, "hz", 2) == 0) {
 		const char *a = args + 2;
 		while (*a == ' ') {
@@ -2433,7 +2441,8 @@ AppleCLCD::dispCommand(const char *args, char *out, size_t len)
 		    pollNs / 1000);
 		disp_say(&p, end, "panel refresh (0189): %u Hz, mode %s, %llu switches, %llu failures\n", fPanelHz,
 		    fHzMode == 1 ? "auto" : fHzMode == 120 ? "120" : "60", fHzSwitches, fHzFailures);
-		disp_say(&p, end, "usage: disp [regs|scanout on|scanout off|flip on|flip off|early on|early off|lat reset|hz 60|120|auto]\n");
+		disp_say(&p, end, "usage: disp [regs|scanout on|scanout off|flip on|flip off|early on|early off|surfpitch 0|1|2|lat reset|"
+		    "hz 60|120|auto]\n");
 	}
 	IOLockUnlock(fScanLock);
 }

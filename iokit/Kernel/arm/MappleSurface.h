@@ -142,6 +142,8 @@ void mapple_surface_pool_stats(uint32_t *buffers, uint32_t *inUse, uint64_t *fro
  * copied in and out at every use). Boot-arg mp_surface_pitch64=0: as the client asked. Count of rounded surfaces.
  */
 uint64_t mapple_surface_pitch_rounded(void);
+/* mp_surface_pitch64 now (0 never, 1 default, 2 also with an explicit alloc size), -1 = boot-arg not read yet */
+int mapple_surface_pitch_mode(int set);
 
 /* Send right for the surface in task (IOSurfaceLookupFromMachPort). */
 mach_port_name_t mapple_surface_port_in_task(MappleSurface *surface, task_t task);

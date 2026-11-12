@@ -862,6 +862,16 @@ mapple_surface_pitch_rounded(void)
 	return mapple_surface_pitch_rounds;
 }
 
+/* "disp surfpitch N": for surfaces created from now on; set < 0 only reads */
+int
+mapple_surface_pitch_mode(int set)
+{
+	if (set >= 0 && set <= 2) {
+		mapple_surface_pitch64 = set;
+	}
+	return mapple_surface_pitch64;
+}
+
 /*
  * 0184: a free pool buffer for `size` bytes (retained, slot in *slot), or NULL. A buffer someone else still
  * holds (a mapping or an import that outlived its surface) is skipped.
