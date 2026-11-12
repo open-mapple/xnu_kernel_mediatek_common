@@ -6,7 +6,8 @@
 #include <stdarg.h>
 #include <stdint.h>
 
-#if defined(MT6781)
+/* viva only: on spaced 0x7bc10000 is TEE memory (secure only), so a spaced build leaves this out */
+#if defined(MT6781) && defined(VIVA_EARLY_CONSOLE)
 /*
  * MT6781: LK's video-mode framebuffer, ARGB8888, pitch 1088 px. It is
  * not 32MB-aligned, so the early console maps only the L2 block holding its

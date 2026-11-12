@@ -1072,7 +1072,7 @@ panic_trap_to_debugger(const char *panic_format_str, va_list *panic_args, unsign
 {
 #pragma clang diagnostic pop
 
-#if defined(MT6781)
+#if defined(MT6781) && defined(VIVA_EARLY_CONSOLE)
 	/* No CPU/thread/debugger state is required for this first panic copy. */
 	early_console_panic(panic_format_str, panic_args);
 #endif

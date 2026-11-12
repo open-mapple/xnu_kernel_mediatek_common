@@ -1957,7 +1957,7 @@ init_ptpages(tt_entry_t *tt, vm_map_address_t start, vm_map_address_t end, bool 
 #define ARM64_PHYSMAP_ALIGNMENT_PADDING (PTOV_TABLE_SIZE * ARM_TT_TWIG_SIZE)
 #endif
 
-#if defined(MT6781)
+#if defined(MT6781) && defined(VIVA_EARLY_CONSOLE)
 /*
  * The reserved low-globals/kernel region is excluded from VM allocation.
  * Use the otherwise empty 32MB block above low globals and below gVirtBase
@@ -2316,7 +2316,7 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
 
 	arm_set_user_tbi();
 
-#if defined(MT6781)
+#if defined(MT6781) && defined(VIVA_EARLY_CONSOLE)
 	/* phystokv() must still refer to the bootstrap aperture here. */
 	early_console_map_final();
 #endif
@@ -2325,7 +2325,7 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
 
 	ml_enable_monitor();
 
-#if defined(MT6781)
+#if defined(MT6781) && defined(VIVA_EARLY_CONSOLE)
 	/* The final TTBR1 is live; leave the outgoing VA=PA framebuffer alias. */
 	early_console_relocate(EARLY_CONSOLE_FB_VA + (EARLY_CONSOLE_FB_PHYS - EARLY_CONSOLE_FB_BLOCK));
 #endif

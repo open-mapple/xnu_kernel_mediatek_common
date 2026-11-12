@@ -7,7 +7,7 @@
  */
 #include <arm64/early_console.h>
 
-#if defined(MT6781)
+#if defined(MT6781) && defined(VIVA_EARLY_CONSOLE)
 #include <stdint.h>
 #include <kern/misc_protos.h>
 
