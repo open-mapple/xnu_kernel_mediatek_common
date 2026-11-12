@@ -1541,5 +1541,60 @@ mapple_surface_debug SYSCTL_HANDLER_ARGS
 }
 SYSCTL_PROC(_kern, OID_AUTO, mapple_gpu_surf_debug, CTLTYPE_OPAQUE | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
     0, 0, mapple_surface_debug, "-", "an IOSurface's pages and first bytes: DRAM, the CPU's view, after civac");
+
+extern "C" int task_pid(task_t task);
+
+/* Every live surface: id, size, format, users, the task that made it (and whether it still runs), GPU jobs; totals. */
+static int
+mapple_surface_list(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
+{
+	const size_t cap = 160 * MAPPLE_SURFACE_MAX_ID;
+	char *out = (char *)IOMallocData(cap);
+	size_t o = 0;
+	uint64_t n = 0, bytes = 0, gone = 0, gone_bytes = 0;
+
+	if (out == NULL) {
+		return ENOMEM;
+	}
+	IOLockLock(mapple_surface_lock);
+	for (uint32_t id = 1; id < MAPPLE_SURFACE_MAX_ID; id++) {
+		MappleSurface *s = mapple_surface_table[id];
+		if (s == NULL) {
+			continue;
+		}
+		int pid = s->owner ? task_pid(s->owner) : -1;
+		char name[32] = "-";
+		bool alive = false;
+		if (pid > 0) {
+			proc_t p = proc_find(pid);
+			if (p != NULL) {
+				alive = true;
+				proc_rele(p);
+			}
+			proc_name(pid, name, sizeof(name));
+		}
+		const uint32_t f = s->pixelFormat;
+		const char fmt[5] = { (char)(f >> 24), (char)(f >> 16), (char)(f >> 8), (char)f, 0 };
+		n++;
+		bytes += s->allocSize;
+		if (pid > 0 && !alive) {
+			gone++;
+			gone_bytes += s->allocSize;
+		}
+		if (o < cap - 160) {
+			o += snprintf(out + o, cap - o, "%u %ux%u '%s' %u KiB, %u users, by %s[%d]%s, %llu GPU jobs%s\n", id,
+			    s->width, s->height, fmt, s->allocSize >> 10, mapple_surface_users[id], name, pid,
+			    pid > 0 && !alive ? " (gone)" : "", s->gpuJobs, s->poolSlot >= 0 ? ", display pool" : "");
+		}
+	}
+	IOLockUnlock(mapple_surface_lock);
+	o += snprintf(out + o, cap - o, "%llu surfaces, %llu KiB; %llu of them, %llu KiB, made by tasks that are gone\n", n,
+	    bytes >> 10, gone, gone_bytes >> 10);
+	int err = SYSCTL_OUT(req, out, o + 1);
+	IOFreeData(out, cap);
+	return err;
+}
+SYSCTL_PROC(_kern, OID_AUTO, mapple_surf_list, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
+    0, 0, mapple_surface_list, "A", "every live IOSurface: size, format, users, maker, GPU jobs; totals");
 #endif /* DEVELOPMENT || DEBUG */
 #endif /* MT6781 */
