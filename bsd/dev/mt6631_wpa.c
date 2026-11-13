@@ -99,6 +99,8 @@ mt6631_wpa_pmk(const char *pass, const uint8_t *ssid, size_t ssid_len, uint8_t p
 			}
 		}
 		memcpy(pmk + (block - 1) * 20, t, block == 1 ? 20 : 12);
+		bzero(u, sizeof(u));
+		bzero(t, sizeof(t));
 	}
 }
 
@@ -145,10 +147,14 @@ aes_unwrap(const uint8_t kek[16], const uint8_t *in, size_t n, uint8_t *out)
 		}
 	}
 	bzero(ctx, sizeof(ctx));
+	bzero(b, sizeof(b));
+	int bad = 0;
 	for (int k = 0; k < 8; k++) {
-		if (a[k] != 0xa6) {
-			return -1;
-		}
+		bad |= a[k] ^ 0xa6;
+	}
+	if (bad) {
+		bzero(out, n * 8);
+		return -1;
 	}
 	return 0;
 }
@@ -235,8 +241,13 @@ find_gtk(struct mt6631_wpa *w, const uint8_t *kd, size_t len)
 		if (id == 0xdd && l >= 6 + 16 && kd[i + 2] == 0x00 && kd[i + 3] == 0x0f && kd[i + 4] == 0xac &&
 		    kd[i + 5] == 1) {
 			size_t glen = l - 6;
-			if (glen > sizeof(w->gtk)) {
+			uint8_t idx = kd[i + 6] & 3;
+			/* the group cipher is the one our RSN IE echoed: TKIP 32 bytes, CCMP 16; key id 0 is the PTK's */
+			if (glen != (w->rsnie[7] == 2 ? 32u : 16u) || idx == 0) {
 				return -1;
+			}
+			if (w->gtk_len == glen && w->gtk_idx == idx && timingsafe_bcmp(w->gtk, kd + i + 8, glen) == 0) {
+				return 1;               /* the key in use: installing it again would reset its replay counter */
 			}
 			w->gtk_idx = kd[i + 6] & 3;
 			w->gtk_len = (uint8_t)glen;
@@ -269,10 +280,12 @@ mt6631_wpa_rx(struct mt6631_wpa *w, const uint8_t *frame, size_t len)
 	uint8_t f[512], m[16], kd[256];
 	int act = 0;
 
-	if (len < EK_DATA || len > sizeof(f) || frame[1] != 3 || (frame[EK_DESC] != 2 && frame[EK_DESC] != 254)) {
+	if (len < EK_DATA || len > sizeof(f) || frame[1] != 3 || (frame[EK_DESC] != 2 && frame[EK_DESC] != 254) ||
+	    4 + (size_t)be16(frame + 2) < EK_DATA || 4 + (size_t)be16(frame + 2) > len) {
 		w->drops++;
 		return 0;
 	}
+	len = 4 + (size_t)be16(frame + 2);              /* the MIC covers the 802.1X body, not padding after it */
 	memcpy(f, frame, len);
 	uint16_t info = be16(f + EK_INFO), kdlen = be16(f + EK_DATALEN);
 	if ((info & KI_VER_MASK) != 2 || !(info & KI_ACK) || EK_DATA + (size_t)kdlen > len) {
@@ -290,7 +303,7 @@ mt6631_wpa_rx(struct mt6631_wpa *w, const uint8_t *frame, size_t len)
 			return 0;
 		}
 		mic(w->ptk, f, len, m);
-		if (memcmp(m, f + EK_MIC, 16) != 0) {
+		if (timingsafe_bcmp(m, f + EK_MIC, 16) != 0) {
 			w->mic_fail++;
 			return 0;
 		}
@@ -308,7 +321,11 @@ mt6631_wpa_rx(struct mt6631_wpa *w, const uint8_t *frame, size_t len)
 	}
 
 	if ((info & KI_PAIRWISE) && !(info & KI_MIC)) {
-		/* message 1: new SNonce, PTK, message 2 with our RSN IE */
+		/* message 1: new SNonce, PTK, message 2 with our RSN IE; unsigned, so ignored once a signed message was taken */
+		if (w->replay_ok) {
+			w->drops++;
+			return 0;
+		}
 		memcpy(w->anonce, f + EK_NONCE, 32);
 		read_random(w->snonce, 32);
 		derive_ptk(w);
@@ -320,31 +337,40 @@ mt6631_wpa_rx(struct mt6631_wpa *w, const uint8_t *frame, size_t len)
 		/* message 3: same ANonce as message 1, GTK in the encrypted key data, message 4, install both */
 		if (w->state < 1 || memcmp(w->anonce, f + EK_NONCE, 32) != 0) {
 			w->drops++;
-			return 0;
+			goto out;
 		}
 		memcpy(w->replay, f + EK_REPLAY, 8);
 		w->replay_ok = 1;
-		if ((info & KI_ENCDATA) && find_gtk(w, kdp, kdl) == 0) {
-			memcpy(w->gtk_rsc, f + EK_RSC, 8);
-			act |= MT6631_WPA_GTK;
+		/* a retransmitted message 3 gets message 4 again, but keys in use are never installed twice */
+		if (w->state < 2) {
+			if ((info & KI_ENCDATA) && find_gtk(w, kdp, kdl) == 0) {
+				memcpy(w->gtk_rsc, f + EK_RSC, 8);
+				act |= MT6631_WPA_GTK;
+			}
+			act |= MT6631_WPA_PTK;
 		}
 		build(w, 2 | KI_PAIRWISE | KI_MIC | KI_SECURE, f + EK_REPLAY, NULL, NULL, 0);
 		w->state = 2;
-		act |= MT6631_WPA_SEND | MT6631_WPA_PTK;
-	} else if (!(info & KI_PAIRWISE) && (info & KI_MIC) && w->state == 2) {
+		act |= MT6631_WPA_SEND;
+	} else if (!(info & KI_PAIRWISE) && (info & KI_MIC) && (info & KI_ENCDATA) && w->state == 2) {
 		/* group key handshake message 1 (rekey) */
 		memcpy(w->replay, f + EK_REPLAY, 8);
 		w->replay_ok = 1;
-		if (find_gtk(w, kdp, kdl) != 0) {
+		int g = find_gtk(w, kdp, kdl);
+		if (g < 0) {
 			w->drops++;
-			return 0;
+			goto out;
 		}
-		memcpy(w->gtk_rsc, f + EK_RSC, 8);
+		if (g == 0) {
+			memcpy(w->gtk_rsc, f + EK_RSC, 8);
+			act |= MT6631_WPA_GTK;
+		}
 		build(w, 2 | KI_MIC | KI_SECURE, f + EK_REPLAY, NULL, NULL, 0);
-		act |= MT6631_WPA_SEND | MT6631_WPA_GTK;
+		act |= MT6631_WPA_SEND;
 	} else {
 		w->drops++;
 	}
+out:
 	bzero(f, sizeof(f));
 	bzero(kd, sizeof(kd));
 	return act;
