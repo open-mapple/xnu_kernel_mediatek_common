@@ -410,8 +410,47 @@ mapple_sandbox_syscall(struct proc *p, int call, user_addr_t arg)
 	}
 }
 
+/*
+ * __mac_syscall("AMFI", 90, {u64 input flags, user pointer to u64 output}): dyld's amfi_check_dyld_policy_self.
+ * Without an answer dyld treats every process as restricted: no DYLD_ variables, no interposing (test tools'
+ * tracing libraries). DEVELOPMENT/DEBUG kernels allow all of them but a custom shared cache; release kernels and
+ * every other AMFI call answer as when no AMFI policy existed.
+ */
+#define AMFI_SYSCALL_CHECK_DYLD_POLICY_SELF     90
+#define AMFI_DYLD_OUTPUT_ALLOW_AT_PATH                  (1ULL << 0)
+#define AMFI_DYLD_OUTPUT_ALLOW_PATH_VARS                (1ULL << 1)
+#define AMFI_DYLD_OUTPUT_ALLOW_FALLBACK_PATHS           (1ULL << 3)
+#define AMFI_DYLD_OUTPUT_ALLOW_PRINT_VARS               (1ULL << 4)
+#define AMFI_DYLD_OUTPUT_ALLOW_FAILED_LIBRARY_INSERTION (1ULL << 5)
+#define AMFI_DYLD_OUTPUT_ALLOW_LIBRARY_INTERPOSING      (1ULL << 6)
+#define AMFI_DYLD_OUTPUT_ALLOW_EMBEDDED_VARS            (1ULL << 7)
+
+static int
+amfi_stub_syscall(struct proc *p __unused, int call, user_addr_t arg)
+{
+#if DEVELOPMENT || DEBUG
+	if (call == AMFI_SYSCALL_CHECK_DYLD_POLICY_SELF) {
+		uint64_t args[2];
+		uint64_t out = AMFI_DYLD_OUTPUT_ALLOW_AT_PATH | AMFI_DYLD_OUTPUT_ALLOW_PATH_VARS |
+		    AMFI_DYLD_OUTPUT_ALLOW_FALLBACK_PATHS | AMFI_DYLD_OUTPUT_ALLOW_PRINT_VARS |
+		    AMFI_DYLD_OUTPUT_ALLOW_FAILED_LIBRARY_INSERTION | AMFI_DYLD_OUTPUT_ALLOW_LIBRARY_INTERPOSING |
+		    AMFI_DYLD_OUTPUT_ALLOW_EMBEDDED_VARS;
+		int error = copyin(arg, args, sizeof(args));
+		if (error == 0) {
+			error = copyout(&out, (user_addr_t)args[1], sizeof(out));
+		}
+		return error;
+	}
+#else
+	(void)call;
+	(void)arg;
+#endif
+	return ENOPOLICY;
+}
+
 static const struct mac_policy_ops amfi_stub_mac_ops = {
 	.mpo_vnode_check_signature = amfi_stub_vnode_check_signature,
+	.mpo_policy_syscall = amfi_stub_syscall,
 };
 
 /*
@@ -465,7 +504,7 @@ static struct mac_policy_conf mapple_sandbox_mac_conf = {
 static mac_policy_handle_t mapple_sandbox_mac_handle;
 
 static struct mac_policy_conf amfi_stub_mac_conf = {
-	.mpc_name = "MT6781 AMFI",
+	.mpc_name = "AMFI",                     /* the name dyld's __mac_syscall asks for */
 	.mpc_fullname = "MT6781 built-in Mobile File Integrity",
 	.mpc_ops = &amfi_stub_mac_ops,
 };
