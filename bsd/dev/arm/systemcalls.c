@@ -45,6 +45,48 @@ extern void
 unix_syscall(struct arm_saved_state * regs, thread_t thread_act, struct proc * proc);
 
 static int      arm_get_syscall_args(uthread_t, struct arm_saved_state *, const struct sysent *);
+
+#if defined(ARM64_BOARD_CONFIG_MT6781)
+#include <sys/sysctl.h>
+/*
+ * kern.mapple_trace_pid: every failing file system call of that process on the console (call, arguments, errno,
+ * the path when it takes one): what a daemon expects of the file system (APFS-only calls on our HFS+ root).
+ */
+static int mapple_trace_pid;
+SYSCTL_INT(_kern, OID_AUTO, mapple_trace_pid, CTLFLAG_RW | CTLFLAG_LOCKED, &mapple_trace_pid, 0,
+    "pid whose failing file system calls are logged (0: none)");
+
+static void
+mapple_trace_failed_syscall(proc_t p, int code, const syscall_arg_t *a, int error)
+{
+	static const struct { int code; const char *name; int path; } calls[] = {
+		{ SYS_open, "open", 0 }, { SYS_open_nocancel, "open", 0 }, { SYS_openat, "openat", 1 },
+		{ SYS_openat_nocancel, "openat", 1 }, { SYS_link, "link", 0 }, { SYS_unlink, "unlink", 0 },
+		{ SYS_unlinkat, "unlinkat", 1 }, { SYS_rename, "rename", 0 }, { SYS_renameat, "renameat", 1 },
+		{ SYS_renameatx_np, "renameatx_np", 1 }, { SYS_mkdir, "mkdir", 0 }, { SYS_mkdirat, "mkdirat", 1 },
+		{ SYS_rmdir, "rmdir", 0 }, { SYS_chmod, "chmod", 0 }, { SYS_truncate, "truncate", 0 },
+		{ SYS_ftruncate, "ftruncate", -1 }, { SYS_fcntl, "fcntl", -1 }, { SYS_fcntl_nocancel, "fcntl", -1 },
+		{ SYS_mmap, "mmap", -1 }, { SYS_fsctl, "fsctl", 0 }, { SYS_ffsctl, "ffsctl", -1 },
+		{ SYS_setattrlist, "setattrlist", 0 }, { SYS_fsetattrlist, "fsetattrlist", -1 },
+		{ SYS_setattrlistat, "setattrlistat", 1 }, { SYS_clonefileat, "clonefileat", 1 },
+		{ SYS_fclonefileat, "fclonefileat", 2 }, { SYS_setxattr, "setxattr", 0 }, { SYS_fsetxattr, "fsetxattr", -1 },
+		{ SYS_removexattr, "removexattr", 0 }, { SYS_fremovexattr, "fremovexattr", -1 },
+	};
+	for (unsigned i = 0; i < sizeof(calls) / sizeof(calls[0]); i++) {
+		if (calls[i].code != code) {
+			continue;
+		}
+		char path[160] = "";
+		size_t len = 0;
+		if (calls[i].path >= 0) {
+			(void)copyinstr((user_addr_t)a[calls[i].path], path, sizeof(path), &len);
+		}
+		printf("SYSFAIL %s[%d] %s(0x%llx, 0x%llx, 0x%llx) = %d %s\n", p->p_comm, proc_getpid(p), calls[i].name,
+		    (unsigned long long)a[0], (unsigned long long)a[1], (unsigned long long)a[2], error, path);
+		return;
+	}
+}
+#endif
 static int      arm_get_u32_syscall_args(uthread_t, arm_saved_state32_t *, const struct sysent *);
 static void     arm_prepare_u32_syscall_return(const struct sysent *, arm_saved_state_t *, uthread_t, int);
 static void     arm_prepare_syscall_return(const struct sysent *, struct arm_saved_state *, uthread_t, int);
@@ -180,6 +222,11 @@ unix_syscall(
 	AUDIT_SYSCALL_ENTER(code, proc, uthread);
 	error = (*(callp->sy_call))(proc, &uthread->uu_arg[0], &(uthread->uu_rval[0]));
 	AUDIT_SYSCALL_EXIT(code, proc, uthread, error);
+#if defined(ARM64_BOARD_CONFIG_MT6781)
+	if (error != 0 && error != ERESTART && error != EJUSTRETURN && mapple_trace_pid != 0 && pid == mapple_trace_pid) {
+		mapple_trace_failed_syscall(proc, code, &uthread->uu_arg[0], error);
+	}
+#endif
 
 #if CONFIG_MACF
 skip_syscall:
