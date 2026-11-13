@@ -4,13 +4,17 @@
  * iOS's speaker route, its volume and its haptics, run without touching any hardware. A backend takes the samples
  * with mapple_audio_set_sink() and the haptics with mapple_audio_set_haptic() (bsd/dev/mtk_audio.c).
  *
- * The nodes are mediaserverd's (user mobile), mode 0600, and each is open once at a time (EBUSY).
+ * The nodes are mediaserverd's (user mobile), mode 0600, and each is open once at a time (EBUSY). Said: who opens a
+ * node, the speaker's first frames and then, while there is sound, its loudest sample once a second (the first 30).
  */
+#include <kern/clock.h>
 #include <kern/locks.h>
 #include <libkern/libkern.h>
+#include <mach/mach_time.h>
 #include <miscfs/devfs/devfs.h>
 #include <sys/conf.h>
 #include <sys/errno.h>
+#include <sys/kauth.h>
 #include <sys/proc.h>
 #include <sys/systm.h>
 #include <sys/uio.h>
@@ -30,7 +34,9 @@ static mapple_haptic_sink_t haptic;
 static uint32_t volume_below, volume_generation;
 static bool volume_muted, volume_set;
 static uint64_t frames_in, frames_taken, haptic_writes, mic_frames;
-static unsigned haptic_said;
+static unsigned haptic_said, sound_said;
+static uint32_t second_peak;
+static uint64_t second_start;
 
 void
 mapple_audio_set_sink(const char *name, mapple_audio_sink_t s)
@@ -80,10 +86,17 @@ audio_open(dev_t dev, __unused int flags, __unused int type, __unused struct pro
 		opened[n] = true;
 		frames_in = n == NODE_AUDIO ? 0 : frames_in;
 		frames_taken = n == NODE_AUDIO ? 0 : frames_taken;
+		sound_said = n == NODE_AUDIO ? 0 : sound_said;
 		mic_frames = n == NODE_MIC ? 0 : mic_frames;
 	}
 	lck_mtx_unlock(&audio_lock);
-	printf("audio: /dev/%s %s\n", node_names[n], error ? "is already open (EBUSY)" : "opened");
+	{
+		char name[32];
+
+		proc_selfname(name, sizeof(name));
+		printf("audio: /dev/%s %s by %s (pid %d, uid %u)\n", node_names[n], error ? "is already open (EBUSY): refused" : "opened",
+		    name, proc_selfpid(), kauth_getuid());
+	}
 	return error;
 }
 
@@ -108,6 +121,28 @@ audio_close(dev_t dev, __unused int flags, __unused int type, __unused struct pr
 	return 0;
 }
 
+/* While there is sound, its loudest sample once a second (Darwin's volume shows in it: the speaker is in software volume). */
+static void
+say_level(const int16_t *frames, uint32_t count)
+{
+	uint64_t now = mach_absolute_time(), second;
+
+	for (uint32_t i = 0; i < 2 * count; i++) {
+		uint32_t v = frames[i] < 0 ? (uint32_t)-frames[i] : (uint32_t)frames[i];
+
+		second_peak = v > second_peak ? v : second_peak;
+	}
+	nanoseconds_to_absolutetime(NSEC_PER_SEC, &second);
+	if (now - second_start >= second) {
+		if (second_peak > 0 && sound_said < 30) {
+			sound_said++;
+			printf("audio: the speaker: peak %u of 32768 in the last second\n", second_peak);
+		}
+		second_peak = 0;
+		second_start = now;
+	}
+}
+
 /* The speaker's samples (whole frames) to the sink; what it does not take is dropped. Never waits. */
 static int
 audio_write_samples(struct uio *uio)
@@ -123,9 +158,13 @@ audio_write_samples(struct uio *uio)
 			return error;
 		}
 		lck_mtx_lock(&audio_lock);
+		if (frames_in == 0) {
+			printf("audio: the speaker's first frames (%u)\n", count);
+		}
 		frames_in += count;
 		frames_taken += sink != NULL ? sink(buffer, count) : 0;
 		lck_mtx_unlock(&audio_lock);
+		say_level(buffer, count);
 	}
 	uio_update(uio, uio_resid(uio));        /* a tail of less than a frame is dropped */
 	return 0;
