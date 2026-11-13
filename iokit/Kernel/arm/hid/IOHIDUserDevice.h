@@ -29,7 +29,7 @@
  * Kernel
  */
 
-#include <IOKit/hid/IOHIDDevice.h>
+#include "IOHIDDevice.h"
 
 class IOHIDResourceDeviceUserClient;
 

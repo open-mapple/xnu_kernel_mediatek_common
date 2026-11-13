@@ -20,3 +20,12 @@
  * 
  * @APPLE_LICENSE_HEADER_END@
  */
+
+#ifndef _APPLEHIDUSAGETABLES_H
+#define _APPLEHIDUSAGETABLES_H
+
+enum {
+	kHIDPage_AppleVendor = 0xff00
+};
+
+#endif /* _APPLEHIDUSAGETABLES_H */

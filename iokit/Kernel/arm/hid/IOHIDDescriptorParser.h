@@ -45,7 +45,10 @@ typedef size_t      vm_size_t;
 
 #else
 
-#include <TargetConditionals.h>
+/* kernel build, no SDK TargetConditionals.h */
+#ifndef TARGET_OS_DRIVERKIT
+#define TARGET_OS_DRIVERKIT 0
+#endif
 
 #if TARGET_OS_DRIVERKIT
 #include <DriverKit/IOTypes.h>

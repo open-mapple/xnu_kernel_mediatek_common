@@ -25,16 +25,15 @@
 #ifndef _IOKIT_HID_IOHIDDEVICE_H
 #define _IOKIT_HID_IOHIDDEVICE_H
 
-#include <TargetConditionals.h>
 #include <IOKit/IOService.h>
 #include <IOKit/IOMessage.h>
 #include <IOKit/IOBufferMemoryDescriptor.h>
-#include <IOKit/hidsystem/IOHIDDescriptorParser.h>
-#include <IOKit/hid/IOHIDKeys.h>
-#include <IOKit/hid/IOHIDUsageTables.h>
+#include "IOHIDDescriptorParser.h"
+#include "IOHIDKeys.h"
+#include "IOHIDUsageTables.h"
 #include <IOKit/IOEventSource.h>
-#include <IOKit/hid/IOHIDDeviceTypes.h>
-#include <IOKit/IOReporter.h>
+#include "IOHIDDeviceTypes.h"
+#include <IOKit/IOKernelReporters.h>
 #include <HIDDriverKit/IOHIDDevice.h>
 #include <sys/queue.h>
 

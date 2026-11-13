@@ -24,7 +24,6 @@
 #include <AssertMacros.h>
 #include <IOKit/IOLib.h>
 #include <sys/proc.h>
-#include <TargetConditionals.h>
 #include <os/overflow.h>
 #include <IOKit/IOKitKeys.h>
 #include <stdatomic.h>

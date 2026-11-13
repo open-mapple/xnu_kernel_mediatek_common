@@ -10,7 +10,7 @@
 #include "IOHIDDescriptorParserPrivate.h"
 #include "IOHIDDebug.h"
 #include "IOHIDElementPrivate.h"
-#include <IOKit/hid/IOHIDUsageTables.h>
+#include "IOHIDUsageTables.h"
 #include "IOHIDDevice.h"
 
 #define super OSObject

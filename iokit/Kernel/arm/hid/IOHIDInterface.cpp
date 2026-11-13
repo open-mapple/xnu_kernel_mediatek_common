@@ -29,7 +29,7 @@
 #include "IOHIDLibUserClient.h"
 #include "OSStackRetain.h"
 #include "IOHIDDebug.h"
-#include <IOKit/hidsystem/IOHIDShared.h>
+#include "IOHIDShared.h"
 #include <AssertMacros.h>
 #include "IOHIDFamilyTrace.h"
 #include <IOKitUser/IODataQueueDispatchSource.h>

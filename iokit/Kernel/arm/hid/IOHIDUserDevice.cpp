@@ -26,7 +26,7 @@
 #include "IOHIDKeys.h"
 #include "IOHIDParameter.h"
 #include <IOKit/IOLib.h>
-#include <IOKit/hid/IOHIDPrivateKeys.h>
+#include "IOHIDPrivateKeys.h"
 
 #define super IOHIDDevice
 

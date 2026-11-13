@@ -26,7 +26,7 @@
 #define _IOKIT_HID_IOHIDINTERFACE_H
 
 #include <IOKit/IOService.h>
-#include <IOKit/hid/IOHIDKeys.h>
+#include "IOHIDKeys.h"
 #include <HIDDriverKit/IOHIDInterface.h>
 #include <IOKit/IOWorkLoop.h>
 #include <IOKit/IOCommandGate.h>

@@ -26,7 +26,7 @@
 #define _IOKIT_HID_IOHIDELEMENTPRIVATE_H
 
 #include <libkern/c++/OSArray.h>
-#include <IOKit/hidsystem/IOHIDDescriptorParser.h>
+#include "IOHIDDescriptorParser.h"
 #include "IOHIDElement.h"
 #include "IOHIDDescriptorParserPrivate.h"
 #include "IOHIDLibUserClient.h"

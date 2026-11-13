@@ -28,7 +28,7 @@
 #ifndef _IOKIT_IOHIDLibUserClient_H_
 #define _IOKIT_IOHIDLibUserClient_H_
 
-#include <IOKit/hid/IOHIDKeys.h>
+#include "IOHIDKeys.h"
 
 #define kMaxLocalCookieArrayLength  512
 #define kIOHIDDefaultMaxReportSize   8192        // 8K

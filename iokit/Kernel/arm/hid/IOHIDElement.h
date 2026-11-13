@@ -27,7 +27,7 @@
 
 #include <libkern/c++/OSArray.h>
 #include <libkern/c++/OSData.h>
-#include <IOKit/hid/IOHIDKeys.h>
+#include "IOHIDKeys.h"
 
 //===========================================================================
 // An object that describes a single HID element.

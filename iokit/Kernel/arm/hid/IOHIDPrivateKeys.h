@@ -205,6 +205,18 @@ typedef enum {
     kIOHIDHomeButtonTypeNone        = 2
 } IOHIDHomeButtonType;
 
+/*
+ * Keys IOHIDFamily-1915.140.3's device classes take from Apple's internal
+ * headers; the strings are the ones in macOS 13.5's IOHIDFamily kext.
+ */
+#define kIOHIDRegisterServiceKey                "RegisterService"
+#define kIOHIDMultipleInterfaceEnabledKey       "MultipleInterfaceEnabled"
+#define kIOHIDRequiresTCCAuthorizationKey       "RequiresTCCAuthorization"
+#define kIOHIDProtectedAccessKey                "ProtectedAccess"
+#define kIOHIDDeviceForceInterfaceRematchKey    "IOHIDDeviceForceInterfaceRematch"
+#define kIOHIDDevicePrivilegedKey               "Privileged"
+#define kIOHIDUserDeviceSuspendKey              "IOHIDUserDeviceSuspend"
+
 
 
 __END_DECLS

@@ -24,7 +24,7 @@
 #ifndef _IOHIDRESOURCE_USERCLIENT_H
 #define _IOHIDRESOURCE_USERCLIENT_H
 
-#include <IOKit/hid/IOHIDKeys.h>
+#include "IOHIDKeys.h"
 /*!
     @enum IOHIDResourceUserClientType
     @abstract List of support user client types

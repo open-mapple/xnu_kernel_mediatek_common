@@ -23,7 +23,6 @@
  */
 
 #include <AssertMacros.h>
-#include <TargetConditionals.h>
 
 #include <IOKit/IOLib.h>    // IOMalloc*/IOFree*
 #include <IOKit/IOBufferMemoryDescriptor.h>
@@ -34,7 +33,7 @@
 #include <IOKit/IOKitKeys.h>
 
 #include "IOHIDFamilyPrivate.h"
-#include <IOKit/hid/IOHIDDevice.h>
+#include "IOHIDDevice.h"
 #include "IOHIDElementPrivate.h"
 #include "IOHIDDescriptorParserPrivate.h"
 #include "IOHIDInterface.h"
@@ -58,16 +57,16 @@
 #include "IOHIKeyboard.h"
 #include "IOHIPointing.h"
 
-#include <IOKit/hidsystem/IOHIDShared.h>
+#include "IOHIDShared.h"
 
 //@todo we need this to be configrable
 #define kHIDClientTimeoutUS     1000000ULL
 
-#define HIDDeviceLogFault(fmt, ...)   HIDLogFault("%s:0x%llx " fmt "\n", getName(), getRegistryEntryID(), ##__VA_ARGS__)
-#define HIDDeviceLogError(fmt, ...)   HIDLogError("%s:0x%llx " fmt "\n", getName(), getRegistryEntryID(), ##__VA_ARGS__)
-#define HIDDeviceLog(fmt, ...)        HIDLog("%s:0x%llx " fmt "\n", getName(), getRegistryEntryID(), ##__VA_ARGS__)
-#define HIDDeviceLogInfo(fmt, ...)    HIDLogInfo("%s:0x%llx " fmt "\n", getName(), getRegistryEntryID(), ##__VA_ARGS__)
-#define HIDDeviceLogDebug(fmt, ...)   HIDLogDebug("%s:0x%llx " fmt "\n", getName(), getRegistryEntryID(), ##__VA_ARGS__)
+#define HIDDeviceLogFault(fmt, ...)   HIDLogFault("%s:0x%llx " fmt, getName(), getRegistryEntryID(), ##__VA_ARGS__)
+#define HIDDeviceLogError(fmt, ...)   HIDLogError("%s:0x%llx " fmt, getName(), getRegistryEntryID(), ##__VA_ARGS__)
+#define HIDDeviceLog(fmt, ...)        HIDLog("%s:0x%llx " fmt, getName(), getRegistryEntryID(), ##__VA_ARGS__)
+#define HIDDeviceLogInfo(fmt, ...)    HIDLogInfo("%s:0x%llx " fmt, getName(), getRegistryEntryID(), ##__VA_ARGS__)
+#define HIDDeviceLogDebug(fmt, ...)   HIDLogDebug("%s:0x%llx " fmt, getName(), getRegistryEntryID(), ##__VA_ARGS__)
 #define HIDDeviceLogTest(fmt, ...)    HIDDeviceLog(" DEBUG " fmt, ##__VA_ARGS__)
 
 //===========================================================================

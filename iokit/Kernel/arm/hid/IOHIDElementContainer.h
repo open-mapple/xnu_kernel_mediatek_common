@@ -12,8 +12,8 @@
 #include <libkern/c++/OSArray.h>
 #include <IOKit/IOTypes.h>
 #include <IOKit/IOBufferMemoryDescriptor.h>
-#include <IOKit/hidsystem/IOHIDDescriptorParser.h>
-#include <IOKit/hid/IOHIDKeys.h>
+#include "IOHIDDescriptorParser.h"
+#include "IOHIDKeys.h"
 
 class IOHIDElementPrivate;
 class IOHIDElement;
