@@ -234,7 +234,8 @@ mtk_bt_send(const uint8_t *bytes, unsigned length)
  * own log (BTLOG, src/inject.c's watcher) says which command it stopped at.
  *  - Apple's vendor commands (OGF 0x3f) are Broadcom's; the MediaTek controller says "Unknown HCI Command" (Command Status, status 1) to each
  *    and bluetoothd restarts ("VSC stall detected", reason 3602). Each is answered as done: Command Complete, status 0, and the data its parser
- *    reads after the status -- a byte for 0xfd48, 16 for 0xfce2 with sub-command 0x15 or 0x36, 64 (the first 0x51) for 0xfd1b, none for the rest
+ *    reads after the status -- a byte for 0xfd48, 16 for 0xfce2 with sub-command 0x15 or 0x36, 8 for 0xfce2 with 0x0d (profiling: four
+ *    16-bit counts; bluetoothd of iOS 16.7 asks every few minutes and aborts on less), 64 (the first 0x51) for 0xfd1b, none for the rest
  *    (data on 0xfce9 left the next command unsent).
  *  - Write_Default_Erroneous_Data_Reporting (0x0c5b), also "Unknown HCI Command", is answered as done.
  *  - Read_Local_Supported_Commands: the controller leaves the LE commands of octets 25-28 and LE Host Support of octet 24 clear although it
@@ -242,6 +243,7 @@ mtk_bt_send(const uint8_t *bytes, unsigned length)
  *    are Read/Write Default Erroneous Data Reporting (octet 18, bits 2-3): bluetoothd of iOS 16.7 refuses 0x0c5b itself without them.
  */
 static uint8_t skel_vsc_sub;            /* the first parameter of the last 0xfce2 command sent: its kind */
+static uint32_t skel_vsc_said;          /* vendor-command lines said since bluetoothd connected */
 
 /*
  * sysctl kern.mapple_bt_quirks: more rules of these kinds without a rebuild, one bluetoothd log at a time. "mask:OCTET:BITS" ORs BITS (hex)
@@ -318,9 +320,10 @@ skel_quirks(uint8_t *packet, unsigned length)
 	if (length == 7 && packet[0] == 0x04 && packet[1] == 0x0f && packet[2] == 0x04 && packet[3] == 0x01 && packet[4] == 0x01 &&
 	    ((packet[6] >> 2) == 0x3f || skel_extra_is_done((uint16_t)(packet[5] | packet[6] << 8)))) {
 		const bool antenna = packet[5] == 0xe2 && packet[6] == 0xfc && (skel_vsc_sub == 0x15 || skel_vsc_sub == 0x36);
+		const bool profiling = packet[5] == 0xe2 && packet[6] == 0xfc && skel_vsc_sub == 0x0d;
 		const bool cal = packet[5] == 0x1b && packet[6] == 0xfd;
 		const bool data = antenna || cal || (packet[5] == 0x48 && packet[6] == 0xfd);
-		const unsigned extra = cal ? 64 : (antenna ? 16 : (data ? 1 : 0));
+		const unsigned extra = cal ? 64 : (antenna ? 16 : (profiling ? 8 : (data ? 1 : 0)));
 
 		packet[1] = 0x0e;
 		packet[2] = (uint8_t)(4 + extra);
@@ -390,6 +393,7 @@ skel_ctl_connect(__unused kern_ctl_ref ref, struct sockaddr_ctl *sac, __unused v
 
 	proc_selfname(name, sizeof(name));
 	say("control connected by %s (pid %d): unit %u", name, proc_selfpid(), sac->sc_unit);
+	skel_vsc_said = 0;
 	return 0;
 }
 
@@ -764,8 +768,7 @@ skel_hci(const char *what, uint16_t opcode)
 	return false;
 }
 
-/* bluetoothd's vendor commands (OGF 0x3f) and Read_Local_Version on the real channel, and their answers: the first 300 lines */
-static uint32_t skel_vsc_said;
+/* bluetoothd's vendor commands (OGF 0x3f) and Read_Local_Version on the real channel, and their answers: 300 lines a connection */
 
 static bool
 skel_vsc_watched(uint16_t opcode)
@@ -779,7 +782,11 @@ skel_vsc_out(const uint8_t *packet, unsigned length)
 	uint16_t opcode = length >= 4 ? (uint16_t)(packet[1] | packet[2] << 8) : 0;
 
 	if (length >= 4 && packet[0] == 0x01 && skel_vsc_watched(opcode) && skel_vsc_said++ < 300) {
-		say("bluetoothd sends %#06x, %u bytes of parameters", opcode, packet[3]);
+		if (length >= 5 && packet[3] > 0) {
+			say("bluetoothd sends %#06x, %u bytes of parameters, the first %#04x", opcode, packet[3], packet[4]);
+		} else {
+			say("bluetoothd sends %#06x, %u bytes of parameters", opcode, packet[3]);
+		}
 	}
 }
 
