@@ -15,7 +15,7 @@ extern "C" bool bq27z561_present(void);
 /* bsd/dev/mt6358_gauge.c: the MT6358 fuel gauge (mp_gauge=) */
 extern "C" bool mt6358_gauge_init(void);
 extern "C" bool mt6358_gauge_read(int32_t *percent_hundredths, int32_t *mv, int32_t *ma, bool *external,
-    bool *current, int *status);
+    bool *current, int *status, int32_t *temp_decic, bool *temp);
 
 class MapplePowerSource : public IOPMPowerSource {
 	OSDeclareDefaultStructors(MapplePowerSource);
@@ -32,7 +32,7 @@ private:
 	void putNumber(const char *key, UInt32 value);
 	void putBool(const char *key, bool value);
 	void publish(unsigned percent, unsigned mv, int ma, bool external,
-	    bool capable, bool charging, bool full, bool measured, bool currentValid);
+	    bool capable, bool charging, bool full, bool measured, bool currentValid, int centic, bool tempValid);
 	void poll(void);
 	static void timerFired(OSObject *owner, IOTimerEventSource *sender);
 	static IOReturn stopPolling(OSObject *owner, void *, void *, void *, void *);
@@ -98,7 +98,7 @@ MapplePowerSource::putBool(const char *key, bool value)
 
 void
 MapplePowerSource::publish(unsigned percent, unsigned mv, int ma, bool external,
-    bool capable, bool charging, bool full, bool measured, bool currentValid)
+    bool capable, bool charging, bool full, bool measured, bool currentValid, int centic, bool tempValid)
 {
 	/* Use consistent mAh units (DT nominal=5020). powerd computes C*100/M. */
 	const unsigned capacity = (5020u * percent + 50u) / 100u;
@@ -121,12 +121,12 @@ MapplePowerSource::publish(unsigned percent, unsigned mv, int ma, bool external,
 	putNumber("AppleRawMaxCapacity", 5020);
 	putNumber("DesignCapacity", 5020);
 	putNumber("InstantAmperage", (UInt32)ma);
-	/* iOS battery convention: centidegrees C; fixed 25 C, NOT measured. */
-	putNumber("Temperature", 2500);
+	/* iOS battery convention: centidegrees C; 25 C without a reading. */
+	putNumber("Temperature", tempValid ? (UInt32)centic : 2500);
 	putBool("MapplePowerSourceHardwareSampleValid", measured);
 	putBool("MapplePowerSourceCurrentValid", currentValid);
 	putBool("MapplePowerSourceSOCEstimated", measured);
-	putBool("MapplePowerSourceTemperatureEstimated", true);
+	putBool("MapplePowerSourceTemperatureEstimated", !tempValid);
 	putBool("MapplePowerSourceFallback", !measured);
 	putNumber("MapplePowerSourcePercent", percent);
 
@@ -162,16 +162,16 @@ MapplePowerSource::publish(unsigned percent, unsigned mv, int ma, bool external,
 void
 MapplePowerSource::poll(void)
 {
-	int32_t hundredths, gmv, gma;
-	bool gexternal, gcurrent;
+	int32_t hundredths, gmv, gma, decic;
+	bool gexternal, gcurrent, gtemp;
 	int status;
-	if (fGauge && mt6358_gauge_read(&hundredths, &gmv, &gma, &gexternal, &gcurrent, &status)) {
+	if (fGauge && mt6358_gauge_read(&hundredths, &gmv, &gma, &gexternal, &gcurrent, &status, &decic, &gtemp)) {
 		/* status as Linux numbers it: 1 charging, 4 full */
 		publish((unsigned)(hundredths + 50) / 100, (unsigned)gmv, gma, gexternal, gexternal, status == 1, status == 4,
-		    true, gcurrent);
+		    true, gcurrent, decic * 10, gtemp);
 		return;
 	}
-	publish(100, 4200, 0, true, true, false, true, false, false);
+	publish(100, 4200, 0, true, true, false, true, false, false, 2500, false);
 }
 
 void

@@ -26,9 +26,11 @@
  *    at -357 mA is 94% by it where Android says 99. If the two ways are more than 30 points apart the voltage is believed.
  * A charger on the port: RGS_CHRDET, bit 5 of CHR_CON0 (0xa88), the name Android's PMIC header gives it; 0x62 with the cable
  * in. It has not been seen at 0 yet (the cable is how the phone is run). "Charging" is said only while the current goes in.
- * Not done: the charger itself (bq25601d on I2C: nothing sets or feeds it here), the temperature (25 degrees is said).
+ * The battery's temperature: BAT_TEMP, channel 3, asked for the same way (bit 3 of AUXADC_RQST0, its result AUXADC_ADC3,
+ * 0x108e: 12 bits, bit 15 "ready"), made degrees the way Android does (mt6358_ntc.h).
+ * Not done: the charger itself (bq25601d on I2C: nothing sets or feeds it here).
  * The PMIC is reached through MTKPwrap, which allows writes to the two gauge fields only (FGADC_CON1 bits 0 and 3,
- * AUXADC_RQST0 bit 0).
+ * AUXADC_RQST0 bits 0 and 3).
  */
 #include <kern/clock.h>
 #include <kern/locks.h>
@@ -37,9 +39,11 @@
 #include <mach/mach_types.h>
 #include <pexpert/pexpert.h>
 #include <sys/systm.h>
+#include "mt6358_ntc.h"
 
 extern int mtk_pwrap_read(uint32_t addr, uint32_t *value);                          /* iokit/Kernel/arm/MTKPwrap.cpp */
 extern int mtk_pwrap_write_gauge(uint32_t addr, uint32_t mask, uint32_t value);
+int mapple_battery_temp_decic(int32_t *out);
 
 #define MT6358_RTC_AL_MTH       0x05aa          /* bits 14:8: the percentage Android's gauge shows */
 #define MT6358_CHR_CON0         0x0a88
@@ -53,6 +57,7 @@ extern int mtk_pwrap_write_gauge(uint32_t addr, uint32_t mask, uint32_t value);
 #define MT6358_FGADC_CAR_CON1   0x0d16
 #define MT6358_FGADC_CUR_CON0   0x0d8a
 #define MT6358_AUXADC_ADC0      0x1088          /* BATADC */
+#define MT6358_AUXADC_ADC3      0x108e          /* BAT_TEMP */
 #define MT6358_AUXADC_RQST0     0x1108
 
 #define COUNT_NV                164795          /* 1.8 V x 3 / 32768, in nV a count */
@@ -64,13 +69,14 @@ extern int mtk_pwrap_write_gauge(uint32_t addr, uint32_t mask, uint32_t value);
 #define APART_HUNDREDTHS        3000
 
 struct mtkbatt_state {
-	int32_t percent_hundredths, voltage_uv, current_ua;
-	bool external, current;
+	int32_t percent_hundredths, voltage_uv, current_ua, temp_decic;
+	bool external, current, temp;
 	int status;
 };
 
 static LCK_GRP_DECLARE(mtkbatt_grp, "mp_gauge");
 static LCK_MTX_DECLARE(mtkbatt_lock, &mtkbatt_grp);
+static LCK_MTX_DECLARE(auxadc_lock, &mtkbatt_grp);
 static struct mtkbatt_state mtkbatt_last;
 static bool mtkbatt_have;
 
@@ -105,25 +111,55 @@ pmic_until(uint32_t reg, uint16_t mask, uint16_t want, unsigned ms, uint16_t *la
 	return false;
 }
 
-/* one conversion of the battery's voltage, asked for now: counts, or -1 with the reason said once */
+/* one conversion of AUXADC channel `ch', asked for now: counts, or -1 with the reason said once a channel */
+static int32_t
+auxadc_convert(unsigned ch, uint32_t reg, uint16_t bits, const char *name)
+{
+	static bool said[4];
+	uint16_t raw = 0;
+	bool ok;
+
+	lck_mtx_lock(&auxadc_lock);
+	ok = pmic_write(MT6358_AUXADC_RQST0, (uint16_t)(1u << ch), (uint16_t)(1u << ch));
+	if (ok) {
+		/* the last conversion's "ready" may still be up: the converter is given its time before the look */
+		delay_for_interval(3, NSEC_PER_MSEC);
+		ok = pmic_until(reg, 0x8000, 0x8000, 50, &raw);
+	}
+	lck_mtx_unlock(&auxadc_lock);
+	if (ok) {
+		return raw & bits;
+	}
+	if (!said[ch]) {
+		said[ch] = true;
+		printf("mp_gauge: no conversion of %s in 50 ms after the request (%#x: %#x): no reading is given\n", name, reg, raw);
+	}
+	return -1;
+}
+
 static int32_t
 batadc_convert(void)
 {
-	static bool said;
-	uint16_t raw = 0;
+	return auxadc_convert(0, MT6358_AUXADC_ADC0, 0x7fff, "BATADC");
+}
 
-	if (pmic_write(MT6358_AUXADC_RQST0, 1, 1)) {
-		/* the last conversion's "ready" may still be up: the converter is given its time before the look */
-		delay_for_interval(3, NSEC_PER_MSEC);
-		if (pmic_until(MT6358_AUXADC_ADC0, 0x8000, 0x8000, 50, &raw)) {
-			return raw & 0x7fff;
-		}
+/* the battery's temperature now in tenths of a degree, with the cell's current `ma' (more than 0 into it) */
+static bool
+bat_temp(int32_t ma, int32_t *counts, int32_t *decic)
+{
+	*counts = auxadc_convert(3, MT6358_AUXADC_ADC3, 0x0fff, "BAT_TEMP");
+	return *counts >= 0 && mt6358_bat_temp_decic((uint32_t)*counts, ma, decic);
+}
+
+static void
+say_temp(bool ok, int32_t counts, int32_t decic)
+{
+	if (ok) {
+		printf("battery %s%d.%d C (BAT_TEMP %d counts)", decic < 0 ? "-" : "", (decic < 0 ? -decic : decic) / 10,
+		    (decic < 0 ? -decic : decic) % 10, counts);
+	} else {
+		printf("no battery temperature (BAT_TEMP %d counts)", counts);
 	}
-	if (!said) {
-		said = true;
-		printf("mp_gauge: no conversion of BATADC in 50 ms after the request (ADC0 %#x): no reading is given\n", raw);
-	}
-	return -1;
 }
 
 /*
@@ -190,10 +226,15 @@ mtkbatt_thread(__unused void *arg, __unused wait_result_t wr)
 	int32_t start_hundredths = -1;  /* Android's percentage, or -1 */
 	uint32_t start_charge = 0;
 	uint16_t rtc = 0;
-	bool counted = false, apart_said = false;
+	bool counted = false, apart_said = false, temp;
+	int32_t temp_counts, temp_decic = 0;
 
 	PE_parse_boot_argn_alias("mp_gauge", "mtkbatt", &level, sizeof(level));
 	delay_for_interval(20000, NSEC_PER_MSEC);      /* MTKPwrap is up by then */
+	temp = bat_temp(0, &temp_counts, &temp_decic);
+	printf("mp_gauge: at the start, ");
+	say_temp(temp, temp_counts, temp_decic);
+	printf("\n");
 	if (pmic_read(MT6358_RTC_AL_MTH, &rtc) && ((rtc >> 8) & 0x7f) >= 1 && ((rtc >> 8) & 0x7f) <= 100) {
 		start_hundredths = (int32_t)((rtc >> 8) & 0x7f) * 100;
 	}
@@ -228,6 +269,7 @@ mtkbatt_thread(__unused void *arg, __unused wait_result_t wr)
 		if (current) {
 			ma = (int32_t)((int64_t)gauge * FG_COUNT_NA / 1000000);
 		}
+		temp = bat_temp(current ? ma : 0, &temp_counts, &temp_decic);
 		rest_mv = mv - ma * CELL_MOHM / 1000;
 		kept_mv = kept_mv == 0 ? rest_mv : (kept_mv * 3 + rest_mv) / 4;
 		kept_ma = (kept_ma * 3 + ma) / 4;
@@ -259,6 +301,8 @@ mtkbatt_thread(__unused void *arg, __unused wait_result_t wr)
 		b.current_ua = current ? ma * 1000 : 0;
 		b.current = current;
 		b.external = charger;
+		b.temp = temp;
+		b.temp_decic = temp_decic;
 		/* Linux's numbers: 1 charging, 2 discharging, 3 not charging, 4 full */
 		if (!charger) {
 			b.status = 2;
@@ -278,19 +322,22 @@ mtkbatt_thread(__unused void *arg, __unused wait_result_t wr)
 			    b.percent_hundredths / 100, b.percent_hundredths % 100, by_charge >= 0 ? "by the charge" : "by the voltage",
 			    sum / good, low, high, good, mv, charger ? "in" : "out", chr, b.status);
 			if (current) {
-				printf("; gauge %d counts = %d mA, charge counter %#x, at rest %d mV = %d.%02d%% by the voltage\n", gauge, ma, charge,
+				printf("; gauge %d counts = %d mA, charge counter %#x, at rest %d mV = %d.%02d%% by the voltage; ", gauge, ma, charge,
 				    kept_mv, by_voltage / 100, by_voltage % 100);
 			} else {
-				printf("; no current\n");
+				printf("; no current; ");
 			}
+			say_temp(temp, temp_counts, temp_decic);
+			printf("\n");
 		}
 		looks++;
 	}
 }
 
-/* MapplePowerSource.cpp: the last reading, false before the first one */
+/* MapplePowerSource.cpp: the last reading, false before the first one; *temp says whether *temp_decic is one */
 bool
-mt6358_gauge_read(int32_t *percent_hundredths, int32_t *mv, int32_t *ma, bool *external, bool *current, int *status)
+mt6358_gauge_read(int32_t *percent_hundredths, int32_t *mv, int32_t *ma, bool *external, bool *current, int *status,
+    int32_t *temp_decic, bool *temp)
 {
 	struct mtkbatt_state b;
 	bool have;
@@ -306,8 +353,28 @@ mt6358_gauge_read(int32_t *percent_hundredths, int32_t *mv, int32_t *ma, bool *e
 		*external = b.external;
 		*current = b.current;
 		*status = b.status;
+		*temp_decic = b.temp_decic;
+		*temp = b.temp;
 	}
 	return have;
+}
+
+/*
+ * For other drivers (a torch's limit): the battery's temperature now, in tenths of a degree, read for the call; 0, or -1
+ * without a reading. The gauge's last current corrects it when there is one (1 mV a 100 mA, about 0.1 degree). It sleeps,
+ * up to about 55 ms.
+ */
+int
+mapple_battery_temp_decic(int32_t *out)
+{
+	int32_t ma = 0, counts;
+
+	lck_mtx_lock(&mtkbatt_lock);
+	if (mtkbatt_have && mtkbatt_last.current) {
+		ma = mtkbatt_last.current_ua / 1000;
+	}
+	lck_mtx_unlock(&mtkbatt_lock);
+	return bat_temp(ma, &counts, out) ? 0 : -1;
 }
 
 /* MapplePowerSource.cpp: true if mp_gauge= asks for it and its thread runs */

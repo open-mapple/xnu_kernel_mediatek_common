@@ -268,7 +268,7 @@ static const struct {
 	uint16_t addr, mask, status;    /* status: read-only bits, written as 0 */
 } gMappleGaugeRegs[] = {
 	{ 0x0d0a, 0x0009, 0x8000 },     /* FGADC_CON1: bit 0 latch the counter and current, bit 3 release; 15 latched */
-	{ 0x1108, 0x0001, 0x0000 },     /* AUXADC_RQST0: bit 0 one BATADC conversion */
+	{ 0x1108, 0x0009, 0x0000 },     /* AUXADC_RQST0: bit 0 one BATADC conversion, bit 3 one BAT_TEMP */
 };
 
 IOReturn
