@@ -5,7 +5,8 @@
  * FLEDEN (0x7E) CS1 (bit 1) and TORCH_EN (bit 3). STROBE_EN (0x7E bit 2) is never set; found set, nothing is lit.
  * Facts from realme's mt6370_pmu_fled.c, mt6370_pmu_irq.c and flashlights-mt6370.c, and Android's sysfs.
  *
- * Boot-arg mp_torch_steps (default 0): 0 status, read only (the chip's ID, 0x75, 0x7A, 0x7E, FLEDSTAT1/2, BASESTAT);
+ * Boot-arg mp_torch_steps (default 1; 0 on a safe boot, whose line has mp_bootrec=0): 0 status, read only
+ * (the chip's ID, 0x75, 0x7A, 0x7E, FLEDSTAT1/2, BASESTAT);
  * 1 levels 1-3 from the USB link ("torch on [1-3]|off|status") and sysctl kern.mapple_torch (root; reads the level,
  * plus 0x100 while overheated). While lit, once a second: the status registers and the battery's temperature. Off
  * after 10 minutes, on a flash fault (low voltage, short), and, as overheated, at 45 C, with the chip's
@@ -301,7 +302,10 @@ void
 mtk_torch_start(void)
 {
 	thread_t t;
+	uint32_t record = 1;
 
+	(void)PE_parse_boot_argn("mp_bootrec", &record, sizeof(record));
+	steps = record == 0 ? 0 : 1;
 	(void)PE_parse_boot_argn("mp_torch_steps", &steps, sizeof(steps));
 	steps = steps > 1 ? 1 : steps;
 	printf("torch: mp_torch_steps=%u\n", steps);
