@@ -305,8 +305,8 @@ MTKPwrap::writeGauge(uint32_t addr, uint32_t mask, uint32_t value)
 /*
  * The MT6366 codec's speaker (line-out) path and the VIBR motor rail (bsd/dev/mtk_audio.c; registers from the realme
  * 8i's mt6358.c and upmu_hw.h). A field may be written within [min, max]; min/max 0/0xffff = any value. The line-out
- * gains never go above 0 dB (code 8, Android's default; lower codes are louder), VIBR never above 3.0 V (code 11, the
- * phone's vib_vol). No regulator voltage of the codec's (VAUD28, VA12) can be written.
+ * gains never go above 0 dB (code 8, Android's default; lower codes are louder). VIBR's voltage only as Android's
+ * regulator has it: that one code, which mtk_audio.c's VIBR_VOSEL must match. No codec rail (VAUD28, VA12) is written.
  */
 static const struct {
 	uint16_t addr, mask, min, max;
@@ -342,7 +342,7 @@ static const struct {
 	{ 0x248a, 0x0f80, 8, 0x1f },    /* ZCD_CON1 [11:7]: LOR gain, the same */
 	{ 0x1d08, 0x0001, 0, 0xffff },  /* LDO_VIBR_CON0: RG_LDO_VIBR_EN */
 	{ 0x1d0a, 0x0001, 0, 0xffff },  /* LDO_VIBR_OP_EN: SW_OP_EN */
-	{ 0x1e44, 0x0f00, 0, 11 },      /* VIBR_ANA_CON0: RG_VIBR_VOSEL, <= 3.0 V */
+	{ 0x1e44, 0x0f00, 0xff, 0xff }, /* VIBR_ANA_CON0: RG_VIBR_VOSEL, Android's code only; not known yet (0xff: none) */
 };
 
 IOReturn

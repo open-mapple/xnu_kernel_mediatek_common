@@ -16,9 +16,9 @@
  * mp_audio_below (default 160 = 20 dB, at most 90 dB) how far under Android's level the speaker stays (Darwin's volume
  * is under that); mp_audio_gain (default 0, at most 12 dB) the guard's gain; mp_audio_secs (default 5) for steps 1-3.
  *
- * Boot-arg mp_vib_steps (default 0): 0 status; 1 one 100 ms buzz at 3.0 V (the phone's vib_vol); 2 /dev/mapple-haptic
- * runs the motor while iOS's haptic waveform is loud enough: at least 30 ms (Android's vib_timer), at most 1 s at a
- * time, then 1 s off.
+ * Boot-arg mp_vib_steps (default 0): 0 status; 1 one 100 ms buzz at Android's VIBR voltage; 2 /dev/mapple-haptic runs
+ * the motor while iOS's haptic waveform is loud enough: at least 30 ms (Android's vib_timer), at most 1 s at a time,
+ * then 1 s off. Refused while VIBR_VOSEL is not Android's (a voltage write: its first run is a run of its own).
  */
 #if defined(ARM64_BOARD_CONFIG_MT6781)
 #include <stdbool.h>
@@ -51,6 +51,8 @@ extern void mt6781_afe_down(void);
 #define AW87319         0x58
 #define SIA8109         0x28
 #define SIA_MODE        6               /* the phone's owi_mode: the only one sent */
+#define VIBR_VOSEL      0xff            /* Android's VIBR_ANA_CON0 [11:8] (AUDIO.md, the VIBR dump), as in MTKPwrap.cpp's
+                                         * whitelist; 0xff: not known yet, the motor stays off */
 
 static uint32_t steps, vib_steps, below_base = 160, gain, secs = 5;
 
@@ -678,13 +680,16 @@ vib_thread(__unused void *arg, __unused wait_result_t w)
 	uint64_t second, since = 0, rest = 0;
 	bool on = false;
 
-	if (mtk_pwrap_write_audio(0x1e44, 0x0f00, 11 << 8) != 0 ||     /* 3.0 V, the phone's vib_vol */
-	    mtk_pwrap_write_audio(0x1d0a, 0x0001, 0x0001) != 0) {
+	if (VIBR_VOSEL > 15) {
+		printf("audio: vibr: mp_vib_steps=%u refused: Android's VIBR voltage is not known yet\n", vib_steps);
+		thread_terminate(current_thread());
+	}
+	if (mtk_pwrap_write_audio(0x1e44, 0x0f00, VIBR_VOSEL << 8) != 0 || mtk_pwrap_write_audio(0x1d0a, 0x0001, 0x0001) != 0) {
 		printf("audio: vibr: could not be set up\n");
 		thread_terminate(current_thread());
 	}
 	if (vib_steps == 1) {
-		printf("audio: vibr: one 100 ms buzz: %s\n", vib(true) ? "on" : "FAILED");
+		printf("audio: vibr: one 100 ms buzz at vosel %u: %s\n", VIBR_VOSEL, vib(true) ? "on" : "FAILED");
 		ms(100);
 		vib(false);
 		printf("audio: vibr: off; en %04x status %04x\n", pmic(0x1d08), pmic(0x1d16));
