@@ -8,6 +8,7 @@
 
 #include "IOHIDEventService.h"
 #include "IOHIDUsageTables.h"
+#include "../MappleLetterbox.h"
 
 /*
  * Touch screen: digitizer collection events with finger children,
@@ -35,6 +36,7 @@ protected:
 protected:
 	IOLock *fLock;
 	int fLogicalW, fLogicalH, fOffX, fOffY;
+	struct mapple_lb fLb;		/* mp_fb_letterbox: the picture on the panel, w 0 = off */
 	bool fDown[MAPPLE_TOUCH_FINGERS];
 	bool fEdge[MAPPLE_TOUCH_FINGERS];
 	IOFixed fX[MAPPLE_TOUCH_FINGERS];

@@ -414,6 +414,13 @@ MappleHIDTouch::start(IOService *provider)
 	fLogicalH = native ? 2400 : 2436;
 	fOffX = (fLogicalW - 1080) / 2;
 	fOffY = (fLogicalH - 2400) / 2;
+	uint32_t lb = 0;
+	PE_parse_boot_argn("mp_fb_letterbox", &lb, sizeof(lb));
+	if (!native && lb != 0) {
+		PE_Video video;
+		PE_current_console(&video);
+		fLb = mapple_lb_rect((int32_t)video.v_width, (int32_t)video.v_height, fLogicalW, fLogicalH, lb);
+	}
 	/* The digitizer covers the main display (backboardd maps it 1:1). */
 	setProperty("DisplayIntegrated", kOSBooleanTrue);
 	setProperty("SurfaceWidth", (unsigned long long)(68 << 16), 32);	/* mm, 16.16 */
@@ -434,22 +441,33 @@ MappleHIDTouch::touch(int finger, bool down, int x, int y)
 	if (finger < 0 || finger >= MAPPLE_TOUCH_FINGERS) {
 		return;
 	}
-	x = x < 0 ? 0 : (x > 1079 ? 1079 : x);
-	y = y < 0 ? 0 : (y > 2399 ? 2399 : y);
+	int maxX = 1079, maxY = 2399;
+	if (fLb.w != 0) {
+		x = mapple_lb_clamp(x, fLb.x, fLb.w);
+		y = mapple_lb_clamp(y, fLb.y, fLb.h);
+		maxX = fLb.w - 1;
+		maxY = fLb.h - 1;
+	}
+	x = x < 0 ? 0 : (x > maxX ? maxX : x);
+	y = y < 0 ? 0 : (y > maxY ? maxY : y);
 
 	IOLockLock(fLock);
 	bool was = fDown[finger];
-	/* Panel pixels -> the presented 1125x2436 display (MappleFramebuffer.cpp). */
+	/* Panel (or letterbox picture) pixels -> the presented 1125x2436 display (MappleFramebuffer.cpp). */
 	IOFixed nx = (IOFixed)(((int64_t)(x + fOffX) << 16) / fLogicalW);
 	IOFixed ny = (IOFixed)(((int64_t)(y + fOffY) << 16) / fLogicalH);
+	if (fLb.w != 0) {
+		nx = mapple_lb_norm(x, fLb.w);
+		ny = mapple_lb_norm(y, fLb.h);
+	}
 	bool moved = down && (nx != fX[finger] || ny != fY[finger]);
 	if (was == down && !moved) {
 		IOLockUnlock(fLock);
 		return;
 	}
 	if (!was && down) {
-		fEdge[finger] = x < MAPPLE_TOUCH_EDGE_PX || x > 1079 - MAPPLE_TOUCH_EDGE_PX ||
-		    y < MAPPLE_TOUCH_EDGE_PX || y > 2399 - MAPPLE_TOUCH_EDGE_PX;
+		fEdge[finger] = x < MAPPLE_TOUCH_EDGE_PX || x > maxX - MAPPLE_TOUCH_EDGE_PX ||
+		    y < MAPPLE_TOUCH_EDGE_PX || y > maxY - MAPPLE_TOUCH_EDGE_PX;
 	}
 
 	collection = IOHIDEvent::digitizerEvent(now, 0, kIOHIDDigitizerTransducerTypeHand, false, 0, 0, 0);

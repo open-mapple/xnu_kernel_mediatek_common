@@ -117,6 +117,8 @@ extern "C" void mt6781_cpufreq_ui_activity(void);        /* osfmk/arm64/mt6781_c
 #include <machine/machine_routines.h>
 #include <sys/proc.h>
 
+#include "MappleLetterbox.h"
+
 enum {
 	kMappleFBGetLayerDefaultSurface  = 3,
 	kMappleFBSwapBegin               = 4,
@@ -144,7 +146,8 @@ enum {
  * rdar://45025538 bar for 360x800 points). The display is therefore
  * presented as the iPhone X panel, 1125x2436 (375x812 points @3x), and the
  * centered 1080x2400 part of it is shown on the 1080x2400 panel.
- * Boot-arg mp_fb_native=1 presents the real panel size instead.
+ * Boot-arg mp_fb_native=1 presents the real panel size instead; mp_fb_letterbox
+ * scales the whole of it onto the panel under a black strip (MappleLetterbox.h).
  */
 #define MAPPLE_FB_LOGICAL_W              1125
 #define MAPPLE_FB_LOGICAL_H              2436
@@ -185,6 +188,13 @@ public:
 	uint32_t      fWidth, fHeight, fRowBytes;
 	uint32_t      fLogicalW, fLogicalH;     /* size reported to userland */
 	int32_t       fOffX, fOffY;             /* logical origin of the panel */
+	struct mapple_lb fLb;                   /* mp_fb_letterbox: the picture on the panel, w 0 = off */
+	uint32_t     *fLbCol, *fLbRow;          /* logical position each picture column / row samples, 16.16 */
+	uint64_t     *fLbLine;                  /* a logical row blended vertically (mapple_lb_spread lanes) */
+	uint32_t     *fLbConv[2];               /* converted source rows of extended-range formats */
+	void lbBlit(uintptr_t dst, MappleSurface *s, uintptr_t src, int32_t sx, int32_t sy, int32_t dx, int32_t dy,
+	    int32_t w, int32_t h, uint32_t bpe, uint32_t fmt, bool convert);
+	void lbBars(uintptr_t dst);
 	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
 	IOMemoryMap  *fMap;
 	MappleSurface *fSurface;         /* the panel memory as an IOSurface */
@@ -432,6 +442,29 @@ AppleCLCD::start(IOService *provider)
 	}
 	fOffX = (int32_t)(fLogicalW - fWidth) / 2;
 	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
+	uint32_t lb = 0;
+	PE_parse_boot_argn("mp_fb_letterbox", &lb, sizeof(lb));
+	if (lb != 0 && fLogicalW == MAPPLE_FB_LOGICAL_W) {
+		fLb = mapple_lb_rect((int32_t)fWidth, (int32_t)fHeight, (int32_t)fLogicalW, (int32_t)fLogicalH, lb);
+		void *m = IOMallocData((size_t)fLogicalW * 16 + (size_t)(fLb.w + fLb.h) * 4);
+		if (m == NULL) {
+			fLb.w = 0;
+		} else {
+			fLbLine = (uint64_t *)m;
+			fLbConv[0] = (uint32_t *)(fLbLine + fLogicalW);
+			fLbConv[1] = fLbConv[0] + fLogicalW;
+			fLbCol = fLbConv[1] + fLogicalW;
+			fLbRow = fLbCol + fLb.w;
+			for (int32_t i = 0; i < fLb.w; i++) {
+				fLbCol[i] = mapple_lb_src(i, fLb.w, (int32_t)fLogicalW);
+			}
+			for (int32_t j = 0; j < fLb.h; j++) {
+				fLbRow[j] = mapple_lb_src(j, fLb.h, (int32_t)fLogicalH);
+			}
+			IOLog("FB: letterbox (mp_fb_letterbox=%u): picture %dx%d at %d,%d, black strip %d rows\n", lb,
+			    fLb.w, fLb.h, fLb.x, fLb.y, fLb.y);
+		}
+	}
 	fLock = IOLockAlloc();
 	fClients = OSArray::withCapacity(4);
 	fSurface = mapple_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, MAPPLE_FB_FORMAT_BGRA);
@@ -963,6 +996,90 @@ AppleCLCD::presentQueued(const uint8_t *recs, uint32_t n, bool early)
 	return present(recs + (size_t)pick * MAPPLE_FB_SWAP_REC_SIZE, force, jobs) ? pick : -1;
 }
 
+/* The letterbox's strip and side bars, opaque black: LK's layer blends by per-pixel alpha. */
+void
+AppleCLCD::lbBars(uintptr_t dst)
+{
+	for (int32_t y = 0; y < (int32_t)fHeight; y++) {
+		uint32_t *row = (uint32_t *)(dst + (uint64_t)y * fRowBytes);
+		int32_t a = y < fLb.y ? (int32_t)fWidth : fLb.x, b = y < fLb.y ? (int32_t)fWidth : fLb.x + fLb.w;
+		for (int32_t x = 0; x < a; x++) {
+			row[x] = 0xff000000u;
+		}
+		for (int32_t x = b; x < (int32_t)fWidth; x++) {
+			row[x] = 0xff000000u;
+		}
+	}
+}
+
+/*
+ * One layer (logical rect dx, dy, w x h, read from sx, sy of its surface) into the letterbox picture, bilinear: each
+ * picture row blends two logical rows into fLbLine, each picture pixel two of its entries. Several times the cost of
+ * the plain copy on the CPU; the MDP's resizer (MTKMDP.cpp) could take it over.
+ */
+void
+AppleCLCD::lbBlit(uintptr_t dst, MappleSurface *s, uintptr_t src, int32_t sx, int32_t sy, int32_t dx, int32_t dy,
+    int32_t w, int32_t h, uint32_t bpe, uint32_t fmt, bool convert)
+{
+	/* the picture columns and rows whose centres fall inside the layer */
+	int32_t i0 = 0, i1, j0 = 0, j1;
+	while (i0 < fLb.w && (int32_t)((fLbCol[i0] + 0x8000) >> 16) < dx) {
+		i0++;
+	}
+	for (i1 = i0; i1 < fLb.w && (int32_t)((fLbCol[i1] + 0x8000) >> 16) < dx + w; i1++) {
+	}
+	while (j0 < fLb.h && (int32_t)((fLbRow[j0] + 0x8000) >> 16) < dy) {
+		j0++;
+	}
+	for (j1 = j0; j1 < fLb.h && (int32_t)((fLbRow[j1] + 0x8000) >> 16) < dy + h; j1++) {
+	}
+	uintptr_t base = src + s->offset + (size_t)sx * bpe;
+	uint32_t *conv[2] = { fLbConv[0], fLbConv[1] };
+	int32_t convY[2] = { -1, -1 };
+	for (int32_t j = j0; j < j1; j++) {
+		int32_t ya = (int32_t)(fLbRow[j] >> 16) - dy;
+		ya = ya < 0 ? 0 : ya > h - 1 ? h - 1 : ya;
+		int32_t yb = ya < h - 1 ? ya + 1 : ya;
+		uint32_t wy = (fLbRow[j] >> 8) & 0xff;
+		uintptr_t pa = base + (size_t)(sy + ya) * s->bytesPerRow;
+		uintptr_t pb = base + (size_t)(sy + yb) * s->bytesPerRow;
+		const uint32_t *ra, *rb;
+		if (convert) {
+			if (convY[0] != ya && convY[1] == ya) {
+				uint32_t *t = conv[0];
+				conv[0] = conv[1];
+				conv[1] = t;
+				convY[1] = convY[0];
+				convY[0] = ya;
+			}
+			if (convY[0] != ya) {
+				mapple_fb_convert_row(conv[0], (const uint8_t *)pa, w, fmt);
+				convY[0] = ya;
+			}
+			if (convY[1] != yb) {
+				mapple_fb_convert_row(conv[1], (const uint8_t *)pb, w, fmt);
+				convY[1] = yb;
+			}
+			ra = conv[0];
+			rb = conv[1];
+		} else {
+			ra = (const uint32_t *)pa;
+			rb = (const uint32_t *)pb;
+		}
+		for (int32_t x = 0; x < w; x++) {
+			uint64_t a = mapple_lb_spread(ra[x]);
+			fLbLine[x] = wy ? mapple_lb_mix(a, mapple_lb_spread(rb[x]), wy) : a;
+		}
+		uint32_t *to = (uint32_t *)(dst + (uint64_t)(fLb.y + j) * fRowBytes) + fLb.x;
+		for (int32_t i = i0; i < i1; i++) {
+			int32_t xa = (int32_t)(fLbCol[i] >> 16) - dx;
+			xa = xa < 0 ? 0 : xa > w - 1 ? w - 1 : xa;
+			int32_t xb = xa < w - 1 ? xa + 1 : xa;
+			to[i] = mapple_lb_pack(mapple_lb_mix(fLbLine[xa], fLbLine[xb], (fLbCol[i] >> 8) & 0xff));
+		}
+	}
+}
+
 /*
  * Show a swap whose surfaces the GPU has finished (jobs = their GPU job count then; force: shown as it is). false:
  * a new GPU job used a surface during the copy, which may be mixed: redo it at the next tick.
@@ -1044,9 +1161,15 @@ AppleCLCD::present(const uint8_t *rec, bool force, uint64_t jobs)
 		if (dx < 0 || dy < 0) {
 			dx = dy = 0;
 		}
-		/* Logical (presented) display coordinates -> panel coordinates. */
-		dx -= fOffX;
-		dy -= fOffY;
+		/* Logical (presented) display coordinates -> panel coordinates; the letterbox scales logical ones. */
+		int32_t outW = (int32_t)fWidth, outH = (int32_t)fHeight;
+		if (fLb.w != 0) {
+			outW = (int32_t)fLogicalW;
+			outH = (int32_t)fLogicalH;
+		} else {
+			dx -= fOffX;
+			dy -= fOffY;
+		}
 		if (dx < 0) {
 			sx -= dx;
 			w += dx;
@@ -1063,11 +1186,11 @@ AppleCLCD::present(const uint8_t *rec, bool force, uint64_t jobs)
 		if (h > (int32_t)s->height - sy) {
 			h = (int32_t)s->height - sy;
 		}
-		if (w > (int32_t)fWidth - dx) {
-			w = (int32_t)fWidth - dx;
+		if (w > outW - dx) {
+			w = outW - dx;
 		}
-		if (h > (int32_t)fHeight - dy) {
-			h = (int32_t)fHeight - dy;
+		if (h > outH - dy) {
+			h = outH - dy;
 		}
 		uint64_t last = (uint64_t)s->offset + (uint64_t)(sy + h - 1) * s->bytesPerRow +
 		    (uint64_t)(sx + w) * bpe;
@@ -1081,7 +1204,7 @@ AppleCLCD::present(const uint8_t *rec, bool force, uint64_t jobs)
 		if (src != 0 && !convert && bpe != 4) {
 			src = 0;
 		}
-		if (src != 0 && dx == 0 && dy == 0 && w == (int32_t)fWidth && h == (int32_t)fHeight) {
+		if (src != 0 && dx == 0 && dy == 0 && w == outW && h == outH) {
 			full = true;
 		}
 		blit[nblit++] = { s, src, sx, sy, dx, dy, w, h, bpe };
@@ -1101,6 +1224,9 @@ AppleCLCD::present(const uint8_t *rec, bool force, uint64_t jobs)
 		buf = shownBuf >= 0 ? shownBuf : 0;
 	}
 	uintptr_t dst = fBufKVA[buf];
+	if (fLb.w != 0 && nblit != 0) {
+		lbBars(dst);
+	}
 	for (uint32_t i = 0; i < nblit; i++) {
 		Blit *bl = &blit[i];
 		MappleSurface *s = bl->s;
@@ -1109,14 +1235,20 @@ AppleCLCD::present(const uint8_t *rec, bool force, uint64_t jobs)
 			uint32_t fmt = s->pixelFormat;
 			bool convert = fmt == MAPPLE_FB_FORMAT_W30R || fmt == MAPPLE_FB_FORMAT_L10R ||
 			    ((fmt == MAPPLE_FB_FORMAT_W40A || fmt == MAPPLE_FB_FORMAT_W40M) && bl->bpe == 8);
-			for (int32_t y = 0; y < bl->h; y++) {
-				uint32_t *to = (uint32_t *)(dst + (uint64_t)(bl->dy + y) * fRowBytes + (uint64_t)bl->dx * 4);
-				const uint8_t *from = (const uint8_t *)(bl->src + s->offset + (uint64_t)(bl->sy + y) * s->bytesPerRow +
-				    (uint64_t)bl->sx * bl->bpe);
-				if (convert) {
-					mapple_fb_convert_row(to, from, bl->w, fmt);
-				} else {
-					memcpy(to, from, (size_t)bl->w * 4);
+			if (fLb.w != 0) {
+				lbBlit(dst, s, bl->src, bl->sx, bl->sy, bl->dx, bl->dy, bl->w, bl->h, bl->bpe, fmt,
+				    convert);
+			} else {
+				for (int32_t y = 0; y < bl->h; y++) {
+					uint32_t *to = (uint32_t *)(dst + (uint64_t)(bl->dy + y) * fRowBytes +
+					    (uint64_t)bl->dx * 4);
+					const uint8_t *from = (const uint8_t *)(bl->src + s->offset +
+					    (uint64_t)(bl->sy + y) * s->bytesPerRow + (uint64_t)bl->sx * bl->bpe);
+					if (convert) {
+						mapple_fb_convert_row(to, from, bl->w, fmt);
+					} else {
+						memcpy(to, from, (size_t)bl->w * 4);
+					}
 				}
 			}
 		}
@@ -1332,7 +1464,9 @@ AppleCLCD::scanout(const uint8_t *rec)
 	MappleSurface *s = layers == 1 ? mapple_surface_copy(id) : NULL;
 	const char *why = NULL;
 	uint64_t pa = 0;
-	if (layers != 1) {
+	if (fLb.w != 0) {
+		why = "letterbox: the picture is scaled";
+	} else if (layers != 1) {
 		why = "not exactly one layer";
 	} else if (s == NULL || !s->contig) {
 		why = "surface not contiguous";
