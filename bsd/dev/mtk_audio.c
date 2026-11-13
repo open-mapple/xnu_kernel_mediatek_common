@@ -53,8 +53,8 @@ extern void mt6781_afe_down(void);
 #define AW87319         0x58
 #define SIA8109         0x28
 #define SIA_MODE        6               /* the phone's owi_mode: the only one sent */
-#define VIBR_VOSEL      4               /* 1.8 V: Android's VIBR_ANA_CON0 [11:8] (its vibrator's vmax, at most 9 = 2.8 V),
-                                         * as in MTKPwrap.cpp's whitelist */
+#define VIBR_VOSEL      9               /* 2.8 V: Android's VIBR_ANA_CON0 [11:8] at full strength (its vmax_max), as in
+                                         * MTKPwrap.cpp's whitelist */
 
 static uint32_t steps, vib_steps, below_base = 160, gain, secs = 5;
 

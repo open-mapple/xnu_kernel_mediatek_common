@@ -342,7 +342,7 @@ static const struct {
 	{ 0x248a, 0x0f80, 8, 0x1f },    /* ZCD_CON1 [11:7]: LOR gain, the same */
 	{ 0x1d08, 0x0001, 0, 0xffff },  /* LDO_VIBR_CON0: RG_LDO_VIBR_EN */
 	{ 0x1d0a, 0x0001, 0, 0xffff },  /* LDO_VIBR_OP_EN: SW_OP_EN */
-	{ 0x1e44, 0x0f00, 4, 4 },       /* VIBR_ANA_CON0: RG_VIBR_VOSEL, Android's code only (1.8 V) */
+	{ 0x1e44, 0x0f00, 9, 9 },       /* VIBR_ANA_CON0: RG_VIBR_VOSEL, Android's full-strength code only (2.8 V) */
 };
 
 IOReturn
