@@ -40,12 +40,12 @@
  * back only that much later. Everything is integer arithmetic (the kernel's threads do no
  * floating point); fractions are in Q30 unless said otherwise.
  *
- * One caller at a time (the feeder); hakios_guard_attenuation() and hakios_guard_monitor() may
+ * One caller at a time (the feeder); speaker_guard_attenuation() and speaker_guard_monitor() may
  * be called from another thread.
  */
 #include <stdbool.h>
 #include <stdint.h>
-#include <sys/hakios.audio.h>
+#include <sys/mapple_audio.h>
 
 #define ONE                     (1ll << 30)
 #define FULL_SCALE              32768
@@ -79,14 +79,14 @@ static const int64_t hpf_a1 = -2107733822, hpf_a2 = 1034714513;
 static struct {
 	bool hpf;
 	uint64_t gain;                          /* the gain before everything, Q30 (1 to 4) */
-	volatile uint32_t attenuation;          /* the amplifiers' level under Android's, eighths of a dB; HAKIOS_GUARD_SILENT: off */
+	volatile uint32_t attenuation;          /* the amplifiers' level under Android's, eighths of a dB; SPEAKER_GUARD_SILENT: off */
 	volatile uint32_t monitor;              /* the monitor's reduction, eighths of a dB */
 	int64_t x1[2], x2[2], y1[2], y2[2];     /* the filter's past, in 1/256 of a sample */
 	uint64_t rms[2], fast[2], slow[2];      /* average powers at each speaker, Q30 of a full-scale square wave at Android's level */
 	uint64_t level;                         /* the power guard's and the monitor's gain at the end of the last block */
 	uint64_t envelope;                      /* the peak limiter's, 1/65536 of a sample */
-	struct hakios_guard_report report;
-} guard = { .hpf = true, .attenuation = HAKIOS_GUARD_SILENT, .gain = ONE, .level = ONE, .report = { .least_gain = ONE, .least_peak_gain = 65536 } };
+	struct speaker_guard_report report;
+} guard = { .hpf = true, .attenuation = SPEAKER_GUARD_SILENT, .gain = ONE, .level = ONE, .report = { .least_gain = ONE, .least_peak_gain = 65536 } };
 
 static int32_t work[2 * MAX_FRAMES];
 
@@ -133,21 +133,21 @@ headroom(uint64_t power, uint64_t limit)
 }
 
 void
-hakios_guard_configure(bool hpf, uint32_t gain)
+speaker_guard_configure(bool hpf, uint32_t gain)
 {
 	guard.hpf = hpf;
 	/* 10^(gain/160): one over the attenuation by as much */
-	guard.gain = (1ull << 60) / amplitude(gain > HAKIOS_GUARD_MAX_GAIN ? HAKIOS_GUARD_MAX_GAIN : gain);
+	guard.gain = (1ull << 60) / amplitude(gain > SPEAKER_GUARD_MAX_GAIN ? SPEAKER_GUARD_MAX_GAIN : gain);
 }
 
 void
-hakios_guard_attenuation(uint32_t below)
+speaker_guard_attenuation(uint32_t below)
 {
 	guard.attenuation = below;
 }
 
 void
-hakios_guard_monitor(uint32_t below)
+speaker_guard_monitor(uint32_t below)
 {
 	guard.monitor = below;
 }
@@ -156,11 +156,11 @@ static void
 block(int16_t *frames, uint32_t count)
 {
 	uint32_t attenuation = guard.attenuation;
-	struct hakios_guard_report *r = &guard.report;
+	struct speaker_guard_report *r = &guard.report;
 	/* (2 * attenuation is kept from wrapping in 32 bits: a wrapped value says nothing about the level, and for some it is
 	   a huge one, which makes the power limits see no power at all while the amplifiers are not turned down) */
-	uint64_t to_speaker = attenuation == HAKIOS_GUARD_SILENT ? 0 :
-	    amplitude(attenuation > HAKIOS_GUARD_SILENT / 2 ? HAKIOS_GUARD_SILENT - 1 : 2 * attenuation);
+	uint64_t to_speaker = attenuation == SPEAKER_GUARD_SILENT ? 0 :
+	    amplitude(attenuation > SPEAKER_GUARD_SILENT / 2 ? SPEAKER_GUARD_SILENT - 1 : 2 * attenuation);
 	uint64_t sum[2] = { 0, 0 }, g2 = ONE, g, start = guard.level, ceiling;
 	uint32_t binding = 0;
 
@@ -225,7 +225,7 @@ block(int16_t *frames, uint32_t count)
 
 	/* the peaks: no sample over the limit at the speaker (and none over full scale) */
 	ceiling = FULL_SCALE - 1;
-	if (attenuation != HAKIOS_GUARD_SILENT && attenuation < PEAK_LIMIT) {
+	if (attenuation != SPEAKER_GUARD_SILENT && attenuation < PEAK_LIMIT) {
 		ceiling = (uint64_t)FULL_SCALE * amplitude(PEAK_LIMIT - attenuation) >> 30;
 	}
 	for (uint32_t f = 0; f < count; f++) {
@@ -272,7 +272,7 @@ block(int16_t *frames, uint32_t count)
 }
 
 void
-hakios_guard_process(int16_t *frames, uint32_t count)
+speaker_guard_process(int16_t *frames, uint32_t count)
 {
 	while (count > 0) {
 		uint32_t n = count < MAX_FRAMES ? count : MAX_FRAMES;
@@ -285,15 +285,15 @@ hakios_guard_process(int16_t *frames, uint32_t count)
 
 /* What has happened since the last call (and the averages and the gain as they are now). */
 void
-hakios_guard_take_report(struct hakios_guard_report *report)
+speaker_guard_take_report(struct speaker_guard_report *report)
 {
 	*report = guard.report;
-	guard.report = (struct hakios_guard_report){ .least_gain = ONE, .least_peak_gain = 65536 };
+	guard.report = (struct speaker_guard_report){ .least_gain = ONE, .least_peak_gain = 65536 };
 }
 
 /* 10 log10 of a Q30 ratio, in tenths of a dB (for what is said) */
 int
-hakios_guard_decibels(uint64_t ratio)
+speaker_guard_decibels(uint64_t ratio)
 {
 	static const uint16_t fraction[17] = {
 		0, 5732, 11136, 16248, 21098, 25711, 30109, 34312, 38336, 42196, 45904, 49472, 52911, 56229, 59434, 62534, 65535,
