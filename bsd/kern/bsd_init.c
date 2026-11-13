@@ -695,6 +695,9 @@ bsd_init(void)
 	/* AMFI's MAC policy is built in on MT6781 (bsd/kern/amfi_stub.c). */
 	extern void amfi_stub_policy_register(void);
 	amfi_stub_policy_register();
+	/* the audio plug-in's /dev nodes (bsd/dev/mapple_audio.c) */
+	extern void mapple_audio_init(void);
+	mapple_audio_init();
 #endif
 
 #if HFS_STAGED
