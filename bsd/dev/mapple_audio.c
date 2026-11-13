@@ -2,7 +2,8 @@
  * /dev/mapple-audio, /dev/mapple-mic and /dev/mapple-haptic: the kernel's end of the audio plug-in (mapple_userland,
  * audio/audio_plugin.c). With no backend they drop what is written and give silence, so the plug-in, and through it
  * iOS's speaker route, its volume and its haptics, run without touching any hardware. A backend takes the samples
- * with mapple_audio_set_sink() and the haptics with mapple_audio_set_haptic() (bsd/dev/mtk_audio.c).
+ * with mapple_audio_set_sink() and the haptics with mapple_audio_set_haptic(), and gives the mic's with
+ * mapple_audio_set_source() (bsd/dev/mtk_audio.c).
  *
  * The nodes are mediaserverd's (user mobile), mode 0600, and each is open once at a time (EBUSY). Said: who opens a
  * node, the speaker's first frames and then, while there is sound, its loudest sample once a second (the first 30).
@@ -31,9 +32,11 @@ static bool opened[NODES];
 static mapple_audio_sink_t sink;
 static const char *sink_name = "nothing";
 static mapple_haptic_sink_t haptic;
+static mapple_audio_source_t source;
+static const char *source_name = "silence";
 static uint32_t volume_below, volume_generation;
 static bool volume_muted, volume_set;
-static uint64_t frames_in, frames_taken, haptic_writes, mic_frames;
+static uint64_t frames_in, frames_taken, haptic_writes, mic_frames, mic_heard;
 static unsigned haptic_said, sound_said;
 static uint32_t second_peak;
 static uint64_t second_start;
@@ -46,6 +49,22 @@ mapple_audio_set_sink(const char *name, mapple_audio_sink_t s)
 	sink_name = s != NULL ? name : "nothing";
 	lck_mtx_unlock(&audio_lock);
 	printf("audio: the sound goes to %s\n", s != NULL ? name : "nothing");
+}
+
+void
+mapple_audio_set_source(const char *name, mapple_audio_source_t s)
+{
+	lck_mtx_lock(&audio_lock);
+	source = s;
+	source_name = s != NULL ? name : "silence";
+	lck_mtx_unlock(&audio_lock);
+	printf("audio: the mic's samples come from %s\n", s != NULL ? name : "nothing (silence)");
+}
+
+bool
+mapple_audio_mic_open(void)
+{
+	return __atomic_load_n(&opened[NODE_MIC], __ATOMIC_RELAXED);
 }
 
 void
@@ -88,6 +107,7 @@ audio_open(dev_t dev, __unused int flags, __unused int type, __unused struct pro
 		frames_taken = n == NODE_AUDIO ? 0 : frames_taken;
 		sound_said = n == NODE_AUDIO ? 0 : sound_said;
 		mic_frames = n == NODE_MIC ? 0 : mic_frames;
+		mic_heard = n == NODE_MIC ? 0 : mic_heard;
 	}
 	lck_mtx_unlock(&audio_lock);
 	{
@@ -114,7 +134,7 @@ audio_close(dev_t dev, __unused int flags, __unused int type, __unused struct pr
 	if (n == NODE_AUDIO) {
 		printf("audio: /dev/mapple-audio closed: %llu frames written, %llu taken by %s\n", frames_in, frames_taken, sink_name);
 	} else if (n == NODE_MIC) {
-		printf("audio: /dev/mapple-mic closed: %llu frames of silence given\n", mic_frames);
+		printf("audio: /dev/mapple-mic closed: %llu frames given, %llu of them from %s\n", mic_frames, mic_heard, source_name);
 	} else {
 		printf("audio: /dev/mapple-haptic closed: %llu writes\n", haptic_writes);
 	}
@@ -219,14 +239,33 @@ audio_write(dev_t dev, struct uio *uio, __unused int ioflag)
 	}
 }
 
-/* The microphone: silence, as much as is asked for. */
+/* The microphone: what its source has (never waiting for more), or with none, silence, as much as is asked for. */
 static int
 audio_read(dev_t dev, struct uio *uio, __unused int ioflag)
 {
 	static const int16_t zeros[512];
+	int16_t samples[256];
+	mapple_audio_source_t s;
 
 	if (minor(dev) != NODE_MIC) {
 		return ENODEV;
+	}
+	lck_mtx_lock(&audio_lock);
+	s = source;
+	lck_mtx_unlock(&audio_lock);
+	while (s != NULL && uio_resid(uio) >= 2) {
+		user_ssize_t want = uio_resid(uio) / 2;
+		uint32_t n = s(samples, (uint32_t)(want < 256 ? want : 256));
+		int error;
+
+		if (n == 0) {
+			return 0;
+		}
+		if ((error = uiomove((caddr_t)samples, (int)n * 2, uio)) != 0) {
+			return error;
+		}
+		mic_frames += n;
+		mic_heard += n;
 	}
 	while (uio_resid(uio) >= 2) {
 		user_ssize_t want = uio_resid(uio) & ~(user_ssize_t)1;

@@ -51,6 +51,10 @@ typedef uint32_t (*mapple_audio_sink_t)(const int16_t *frames, uint32_t count);
 void mapple_audio_set_sink(const char *name, mapple_audio_sink_t sink);
 /* The volume Darwin has set last (MAPPLE_AUDIO_SET_VOLUME): false if it has set none; *generation counts the settings. */
 bool mapple_audio_volume(uint32_t *below, bool *muted, uint32_t *generation);
+/* /dev/mapple-mic: a source gives up to `count' samples (48 kHz, one channel) and says how many; it must not wait. */
+typedef uint32_t (*mapple_audio_source_t)(int16_t *samples, uint32_t count);
+void mapple_audio_set_source(const char *name, mapple_audio_source_t source);
+bool mapple_audio_mic_open(void);       /* whether /dev/mapple-mic is open: the mic is wanted */
 /* /dev/mapple-haptic: each write's loudest sample and its length in frames (48 kHz, one channel); same rules as a sink */
 typedef void (*mapple_haptic_sink_t)(uint32_t peak, uint32_t frames);
 void mapple_audio_set_haptic(mapple_haptic_sink_t sink);
