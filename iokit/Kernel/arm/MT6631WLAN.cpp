@@ -14,6 +14,8 @@
  *     uses the SIOCGA80211/SIOCSA80211 ioctls on en0.
  *   IONetworkStack on IOResources with an openable user client that refuses the naming command: en0 is born
  *     named, but configd's InterfaceNamer only reports quiet after opening it.
+ *   AppleOLYHAL, the controller's child, only when the node has wifi-vendor: its vendor-id string is
+ *     MobileGestalt's WifiVendor (the first AppleOLYHAL service's), which BlueTool chooses its built-in script by.
  * Names would clash with a real IONetworkingFamily port (none planned).
  */
 #include <pexpert/arm64/board_config.h>
@@ -75,6 +77,11 @@ public:
 	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
 };
 OSDefineMetaClassAndStructors(MT6631WLAN, IO80211Controller);
+
+class AppleOLYHAL : public IOService {
+	OSDeclareDefaultStructors(AppleOLYHAL);
+};
+OSDefineMetaClassAndStructors(AppleOLYHAL, IOService);
 
 static MT6631WLANInterface *gMappleWLANInterface;
 
@@ -147,6 +154,17 @@ MT6631WLAN::start(IOService *provider)
 	ifc->registerService();
 	gMappleWLANInterface = ifc;
 	IOLog("WLAN: IO80211Controller + en0 interface registered\n");
+
+	OSData *vendor = OSDynamicCast(OSData, provider->getProperty("wifi-vendor"));
+	AppleOLYHAL *hal = vendor != NULL ? OSTypeAlloc(AppleOLYHAL) : NULL;
+	if (hal != NULL && hal->init() && hal->attach(this) && hal->start(this)) {
+		char name[32] = "";
+		strlcpy(name, (const char *)vendor->getBytesNoCopy(), vendor->getLength() < sizeof(name) ? vendor->getLength() + 1 : sizeof(name));
+		hal->setProperty("vendor-id", name);
+		hal->registerService();
+		IOLog("WLAN: AppleOLYHAL registered, vendor-id \"%s\"\n", name);
+	}
+	OSSafeReleaseNULL(hal);
 	return true;
 }
 
