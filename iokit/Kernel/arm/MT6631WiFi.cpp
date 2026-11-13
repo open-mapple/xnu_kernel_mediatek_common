@@ -34,12 +34,17 @@ mt6631_wifi_emi_alloc(uint32_t size, uint64_t *pa)
 			return NULL;
 		}
 		gMappleWiFiEMI = IOMemoryDescriptor::withPhysicalAddress(fixed, size, kIODirectionInOut);
-		gMappleWiFiEMIMap = gMappleWiFiEMI ? gMappleWiFiEMI->map() : NULL;
+		/* normal cacheable memory: a physical range outside the managed pages maps as device memory by default */
+		gMappleWiFiEMIMap = gMappleWiFiEMI ? gMappleWiFiEMI->map(kIOMapCopybackCache) : NULL;
 		if (gMappleWiFiEMIMap == NULL) {
 			OSSafeReleaseNULL(gMappleWiFiEMI);
 			return NULL;
 		}
-		bzero((void *)gMappleWiFiEMIMap->getVirtualAddress(), size);
+		/* aligned 8-byte stores: legal whatever the mapping's attributes (bzero's DC ZVA faults on device memory) */
+		volatile uint64_t *w = (volatile uint64_t *)gMappleWiFiEMIMap->getVirtualAddress();
+		for (uint32_t i = 0; i < size / 8; i++) {
+			w[i] = 0;
+		}
 		gMappleWiFiEMI->performOperation(kIOMemoryIncoherentIOFlush, 0, size);
 	}
 	if (gMappleWiFiEMIMap != NULL) {
