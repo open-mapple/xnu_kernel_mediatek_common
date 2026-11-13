@@ -194,7 +194,7 @@ lineout_up(uint32_t code)
 	cw(0x2426, 0x0001, 0x0001);
 	delay_for_interval(100, NSEC_PER_USEC);
 	cw(0x241e, 0x0007, 0);
-	cw(0x2488, 0x07ff, 0x010b);
+	cw(0x2488, 0x07ff, 0x000b);         /* ZCD_CON0 as Android has it while it plays */
 	cw(0x2416, 0x0010, 0x0010);
 	lol_gain(LOL_QUIETEST);
 	cw(0x2420, 0xffff, 0x0055);
