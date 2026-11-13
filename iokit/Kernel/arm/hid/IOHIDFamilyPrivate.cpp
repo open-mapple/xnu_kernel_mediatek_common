@@ -23,7 +23,6 @@
 
 #include "IOHIDFamilyPrivate.h"
 
-#include "IOHIDSystem.h"
 #include "OSStackRetain.h"
 #include "IOHIDPrivateKeys.h"
 #include "IOHIDDebug.h"
@@ -469,11 +468,6 @@ bool IsIOHIDRestrictedIOKitPropertyDictionary(const OSDictionary* properties)
 void IOHIDSystemActivityTickle(SInt32 nxEventType, IOService *sender)
 {
     HIDLogInfo("HID Activity Tickle (type:%d sender:%llx)", nxEventType, sender ? sender->getRegistryEntryID() : 0);
-    IOHIDSystem *ioSys = IOHIDSystem::instance();
-    if (ioSys) {
-        intptr_t event = nxEventType;
-        ioSys->message(kIOHIDSystemActivityTickle, sender, (void*)event);
-    }
 }
 
 extern "C" int  kern_stack_snapshot_with_reason(char *reason);

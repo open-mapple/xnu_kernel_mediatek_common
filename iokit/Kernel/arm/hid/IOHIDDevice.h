@@ -34,7 +34,6 @@
 #include <IOKit/IOEventSource.h>
 #include "IOHIDDeviceTypes.h"
 #include <IOKit/IOKernelReporters.h>
-#include <HIDDriverKit/IOHIDDevice.h>
 #include <sys/queue.h>
 
 class   IOHIDSystem;
@@ -76,7 +75,7 @@ class __deprecated_msg("Use DriverKit") IOHIDDevice : public IOService
 class IOHIDDevice : public IOService
 #endif
 {
-    OSDeclareDefaultStructorsWithDispatch ( IOHIDDevice )
+    OSDeclareDefaultStructors ( IOHIDDevice )
 
     friend class IOHIDLibUserClient;
     friend class IOHIDDeviceShim;

@@ -26,8 +26,8 @@
 
 #include <IOKit/IOLib.h>    // IOMalloc*/IOFree*
 #include <IOKit/IOBufferMemoryDescriptor.h>
-#include <IOKit/hidsystem/IOHIDSystem.h>
 #include <IOKit/IOEventSource.h>
+#include <IOKit/IOTimerEventSource.h>
 #include <IOKit/IOMessage.h>
 #include <libkern/OSKextLib.h>
 #include <IOKit/IOKitKeys.h>
@@ -54,10 +54,9 @@
 #include <stdatomic.h>
 #include <libkern/c++/OSBoundedArrayRef.h>
 
-#include "IOHIKeyboard.h"
-#include "IOHIPointing.h"
 
 #include "IOHIDShared.h"
+#include "IOLLEvent.h"
 
 //@todo we need this to be configrable
 #define kHIDClientTimeoutUS     1000000ULL
@@ -437,13 +436,6 @@ bool IOHIDDevice::start( IOService * provider )
     require_noerr_action(ret, exit, HIDDeviceLogError("failed to parse report descriptor"));
     
     createReporters();
-
-    // Enable multiple interfaces if the first top-level collection has usage pair kHIDPage_AppleVendor, kHIDUsage_AppleVendor_MultipleInterfaces
-    if (_elementArray->getCount() > 1 &&
-        ((IOHIDElement *)_elementArray->getObject(1))->getUsagePage() == kHIDPage_AppleVendor &&
-        ((IOHIDElement *)_elementArray->getObject(1))->getUsage() == kHIDUsage_AppleVendor_MultipleInterfaces) {
-        setProperty(kIOHIDMultipleInterfaceEnabledKey, kOSBooleanTrue);
-    }
 
     multipleInterface = (getProperty(kIOHIDMultipleInterfaceEnabledKey) == kOSBooleanTrue);
 
@@ -1041,14 +1033,6 @@ bool IOHIDDevice::handleOpen(IOService * client, IOOptionBits options, void * ar
     if (options & kIOHIDOptionsTypeSeizeDevice && !_seizedClient) {
         _seizedClient = client;
         messageClients(kIOMessageServiceIsRequestingClose, (void*)(intptr_t)options);
-
-        IOHIKeyboard * keyboard = OSDynamicCast(IOHIKeyboard, getProvider());
-        IOHIPointing * pointing = OSDynamicCast(IOHIPointing, getProvider());
-        if (keyboard) {
-            keyboard->IOHIKeyboard::message(kIOHIDSystemDeviceSeizeRequestMessage, this, (void *)true);
-        } else if (pointing) {
-            pointing->IOHIPointing::message(kIOHIDSystemDeviceSeizeRequestMessage, this, (void *)true);
-        }
     }
 
 exit:
@@ -1070,14 +1054,6 @@ void IOHIDDevice::handleClose(IOService * client, IOOptionBits options __unused)
 
         if (client == _seizedClient) {
             _seizedClient = NULL;
-
-            IOHIKeyboard * keyboard = OSDynamicCast(IOHIKeyboard, getProvider());
-            IOHIPointing * pointing = OSDynamicCast(IOHIPointing, getProvider());
-            if (keyboard) {
-                keyboard->IOHIKeyboard::message(kIOHIDSystemDeviceSeizeRequestMessage, this, (void *)false);
-            } else if (pointing) {
-                pointing->IOHIPointing::message(kIOHIDSystemDeviceSeizeRequestMessage, this, (void *)false);
-            }
         }
 
         _performTickle = ShouldPostDisplayActivityTickles(this, _clientSet, _seizedClient);
@@ -1130,43 +1106,14 @@ IOReturn IOHIDDevice::newUserClient( task_t          owningTask,
     return super::newUserClient( owningTask, security_id, type, properties, handler );
 }
 
-IOReturn IOHIDDevice::newUserClientInternal( task_t          owningTask,
-                                          void *          security_id,
-                                          OSDictionary *  properties,
-                                          IOUserClient ** handler )
+IOReturn IOHIDDevice::newUserClientInternal( task_t          owningTask __unused,
+                                          void *          security_id __unused,
+                                          OSDictionary *  properties __unused,
+                                          IOUserClient ** handler __unused)
 {
-    IOUserClient *  client = new IOHIDLibUserClient;
-    IOReturn        ret = kIOReturnSuccess;
-
-    do {
-        if ( !client->initWithTask( owningTask, security_id, kIOHIDLibUserClientConnectManager, properties ) ) {
-            client->release();
-            ret = kIOReturnBadArgument;
-            break;
-        }
-
-        if ( !client->attach( this ) ) {
-            client->release();
-            ret = kIOReturnUnsupported;
-            break;
-        }
-
-        if ( !client->start( this ) ) {
-            client->detach( this );
-            client->release();
-            ret = kIOReturnUnsupported;
-            break;
-        }
-
-        *handler = client;
-
-    } while (false);
-
-    if (ret != kIOReturnSuccess) {
-        HIDDeviceLogError("failed to create user client: 0x%x", (unsigned int)ret);
-    }
-
-    return ret;
+    // IOHIDLibUserClient (IOHIDDeviceCreate from user space) is not built.
+    HIDDeviceLogError("IOHIDLibUserClient unsupported");
+    return kIOReturnUnsupported;
 }
 
 //---------------------------------------------------------------------------
@@ -1189,8 +1136,6 @@ IOReturn IOHIDDevice::message( UInt32 type, IOService * provider, void * argumen
 //---------------------------------------------------------------------------
 // Handle properties.
 
-static const OSSymbol * msgProps[] = {kIOHIDDeviceMessagePropertyUpdateKeys};
-
 bool IOHIDDevice::setProperty( const OSSymbol * key, OSObject * object)
 {
     bool ret;
@@ -1202,17 +1147,7 @@ bool IOHIDDevice::setProperty( const OSSymbol * key, OSObject * object)
         return true;
     }
 
-    // Update the property table before notifying clients of property changes.
     ret = super::setProperty(key, object);
-    require(ret, exit);
-
-    for (const OSSymbol * prop : msgProps) {
-        if (key->isEqualTo(prop)) {
-            messageClients(kIOMessageServicePropertyChange);
-        }
-    }
-
-exit:
     return ret;
 }
 
@@ -2619,63 +2554,3 @@ OSMetaClassDefineReservedUnused(IOHIDDevice, 37);
 OSMetaClassDefineReservedUnused(IOHIDDevice, 38);
 OSMetaClassDefineReservedUnused(IOHIDDevice, 39);
 OSMetaClassDefineReservedUnused(IOHIDDevice, 40);
-
-#pragma clang diagnostic ignored "-Wunused-parameter"
-
-#include <IOKit/IOUserServer.h>
-
-kern_return_t
-IMPL(IOHIDDevice, _Start)
-{
-    setProperty(kIOHIDDKStartKey, kOSBooleanTrue);
-    
-    bool ret = start(provider);
-    
-    return ret ? kIOReturnSuccess : kIOReturnError;
-}
-
-
-void
-IMPL(IOHIDDevice, _SetProperty)
-{
-    
-}
-
-
-void
-IMPL(IOHIDDevice, _ProcessReport)
-{
-
-}
-
-kern_return_t
-IMPL(IOHIDDevice, _HandleReport)
-{
-    kern_return_t   ret = kIOReturnSuccess;
-    IOBufferMemoryDescriptor *bmd = OSDynamicCast(IOBufferMemoryDescriptor, report);
-    
-    if (bmd) {
-        
-        require_action(reportLength <= bmd->getCapacity(), exit, ret = kIOReturnBadArgument; HIDDeviceLogError("HandleReport reportLength:%d capacity:%d\n", (int)reportLength, (int)bmd->getCapacity()););
-        
-        bmd->setLength(reportLength);
-    }
-    
-    this->handleReportWithTime (timestamp, report, reportType, options);
-    
-    if (bmd) {
-        bmd->setLength(bmd->getCapacity());
-    }
-    
-exit:
-    
-    return ret;
-}
-
-void
-IMPL(IOHIDDevice, _CompleteReport)
-{
-    this->completeReport(action, status, actualByteCount);
-}
-
-

@@ -27,7 +27,6 @@
 
 #include <IOKit/IOService.h>
 #include "IOHIDKeys.h"
-#include <HIDDriverKit/IOHIDInterface.h>
 #include <IOKit/IOWorkLoop.h>
 #include <IOKit/IOCommandGate.h>
 
@@ -45,7 +44,7 @@ class __deprecated_msg("Use DriverKit") IOHIDInterface : public IOService
 class IOHIDInterface : public IOService
 #endif
 {
-    OSDeclareDefaultStructorsWithDispatch( IOHIDInterface )
+    OSDeclareDefaultStructors( IOHIDInterface )
     
 public:
 
@@ -117,24 +116,9 @@ private:
         Reserved for future use.  (Internal use only)  */
     ExpansionData *             _reserved;
 	
-    bool openGated(IOService *forClient, IOOptionBits options, OSAction *action);
-    void handleReportGated(AbsoluteTime timestamp,
-                           IOMemoryDescriptor *report,
-                           IOHIDReportType type,
-                           UInt32 reportID,
-                           void *ctx);
-    IOReturn addReportToPoolGated(IOMemoryDescriptor *report);
-
 	bool serializeDebugState(void *ref, OSSerialize *serializer);
     
 protected:
-	
-	void HandleReportPrivate(AbsoluteTime timestamp,
-							 IOMemoryDescriptor * report,
-							 IOHIDReportType type,
-							 UInt32 reportID,
-							 void * ctx);
-
 	
     /*! 
         @function free

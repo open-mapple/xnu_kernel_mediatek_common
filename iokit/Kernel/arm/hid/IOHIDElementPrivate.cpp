@@ -27,7 +27,6 @@
 #include <IOKit/IOLib.h>
 #include "IOHIDElementPrivate.h"
 #include "IOHIDEventQueue.h"
-#include "IOHIDReportElementQueue.h"
 #include "IOHIDDescriptorParserPrivate.h"
 #include "IOHIDPrivateKeys.h"
 #include "IOHIDDebug.h"
@@ -289,12 +288,6 @@ IOHIDElementPrivate::valueElement( IOHIDElementContainer *     owner,
         element->_reportCount = 1;
     }
   
-    if (parent && parent->getUsagePage() == kHIDPage_AppleVendor &&
-       (parent->getUsage() == kHIDUsage_AppleVendor_Message ||
-        parent->getUsage() == kHIDUsage_AppleVendor_Payload))
-    {
-        element->_variableSize |= kIOHIDElementVariableSizeElement;
-    }
     // Register with owner and parent, then spawn sub-elements.
 
     if ( ( owner->registerElement( element, &element->_cookie ) == true )
@@ -1039,7 +1032,6 @@ bool IOHIDElementPrivate::enqueueValue(IOHIDElementValue *value)
 {
     bool result = false;
     IOHIDEventQueue *queue = NULL;
-    IOHIDReportElementQueue *reportQueue = NULL;
 
     require(_queueArray, exit);
 
@@ -1049,12 +1041,7 @@ bool IOHIDElementPrivate::enqueueValue(IOHIDElementValue *value)
             continue;
         }
 
-        reportQueue = OSDynamicCast(IOHIDReportElementQueue, queue);
-        if (reportQueue) {
-            result = reportQueue->enqueue(value);
-        } else {
-            result = queue->enqueue(value, value->totalSize);
-        }
+        result = queue->enqueue(value, value->totalSize);
 
         if (!result) {
             IOHID_DEBUG(kIOHIDDebugCode_HIDDeviceEnqueueFail, mach_continuous_time(), 0, 0, 0);
@@ -1215,12 +1202,7 @@ bool IOHIDElementPrivate::processReport(
                 uint32_t  enqueueSize = ALIGN_DATA_SIZE(_elementValue->totalSize);
                 if ( shouldProcess || (queue->getOptions() & kIOHIDQueueOptionsTypeEnqueueAll)) {
                     bool result;
-                    IOHIDReportElementQueue *elementQueue = OSDynamicCast(IOHIDReportElementQueue, queue);
-                    if (elementQueue) {
-                        result = elementQueue->enqueue(_elementValue);
-                    } else {
-                        result = queue->enqueue( (void*) _elementValue, enqueueSize);
-                    }
+                    result = queue->enqueue( (void*) _elementValue, enqueueSize);
                     if (!result) {
                         IOHID_DEBUG(kIOHIDDebugCode_HIDDeviceEnqueueFail, mach_continuous_time(), 0, 0, 0);
                     }
