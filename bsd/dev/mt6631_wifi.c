@@ -2391,7 +2391,7 @@ sta_join(const struct vwl_join *j, char *out, size_t len, size_t *po)
 	sj.state = 2;
 	struct wl_bss *e = bss_pick(j);
 	for (int k = 0; e == NULL && k < 2; k++) {
-		say("join: \"%.*s\" not heard recently, scanning for it\n", j->ssid_len, j->ssid);
+		say("join: the network was not heard recently, scanning for it\n");
 		if (scan_send(j->ssid, j->ssid_len, NULL, 0, false, out, len, &o) == 0) {
 			(void)scan_wait(10000);
 		}
@@ -2562,7 +2562,7 @@ sta_leave(char *out, size_t len, size_t *po)
 		vn.bits |= NOTE_DOWN;
 		vn.reason = 0;
 	}
-	say("leave: disconnected from \"%.*s\"\n", sj.ap.ssid_len, sj.ap.ssid);
+	say("leave: disconnected\n");
 	bzero(&sj, sizeof(sj));
 	*po = o;
 }
@@ -3524,9 +3524,8 @@ wifi_sta(char *out, size_t len, size_t o)
 {
 	struct vwl_status s;
 	mt6631_wifi_get_status(&s);
-	say("sta: radio %s (asked %s), state %u, link %u, result %u, \"%.*s\" ch %u %d dBm, aid %u\n",
-	    wl.init ? "up" : "down", s.power ? "on" : "off", sj.state, sj.link, sj.result, sj.ap.ssid_len, sj.ap.ssid,
-	    sj.ap.ch, sj.rssi, sj.aid);
+	say("sta: radio %s (asked %s), state %u, link %u, result %u, ch %u %d dBm, aid %u\n",
+	    wl.init ? "up" : "down", s.power ? "on" : "off", sj.state, sj.link, sj.result, sj.ap.ch, sj.rssi, sj.aid);
 	say("sta: data tx %u (drops %u) rx %u (drops %u), EAPOL in %u out %u (wpa state %u, drops %u, mic failures %u), "
 	    "%u events, %u frames, %u data\n", sj.tx, sj.txDrops, sj.rx, sj.rxDrops, sj.eapolRx, sj.eapolTx, sj.wpa.state,
 	    sj.wpa.drops, sj.wpa.mic_fail, wl.events, wl.frames, wl.dataFrames);
