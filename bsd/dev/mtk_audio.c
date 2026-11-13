@@ -327,6 +327,28 @@ sia_mode(unsigned mode)
 	return false;
 }
 
+/* The AW87319's ID as Android reads it: up to 5 tries, 2 ms apart; each value logged when one is not 0x9b. */
+static bool
+aw_id(uint8_t *last)
+{
+	char seen[5 * 5 + 1] = "";
+
+	for (int i = 0; i < 5; i++) {
+		bool ok = pa_read(AW87319, 0x00, last);
+
+		if (ok && *last == 0x9b) {
+			if (i > 0) {
+				printf("audio: amplifier: AW87319 id 0x9b at try %d (before:%s)\n", i + 1, seen);
+			}
+			return true;
+		}
+		snprintf(seen + strlen(seen), sizeof(seen) - strlen(seen), ok ? " %02x" : " --", *last);
+		ms(2);
+	}
+	printf("audio: amplifier: AW87319 id reads:%s\n", seen);
+	return false;
+}
+
 /* Which amplifier: with its pin high, the AW87319 answers 0x9b at 0x58; an SIA8109 may answer 0x09 at 0x28 (0x41). */
 static bool
 pa_detect(void)
@@ -361,7 +383,7 @@ pa_detect(void)
 			return false;
 		}
 	}
-	if (pa_read(AW87319, 0x00, &aw) && aw == 0x9b) {
+	if (aw_id(&aw)) {
 		pa_kind = PA_AW87319;
 	} else {
 		pa_kind = PA_SIA8109;
@@ -408,7 +430,7 @@ pa_start(void)
 		ms(2);
 		ok = ok && pin(1);
 		ms(2);
-		ok = ok && pa_read(AW87319, 0x00, &id) && id == 0x9b && pa_write(AW87319, 0x01, aw_android[0x01] & ~0x04);
+		ok = ok && aw_id(&id) && pa_write(AW87319, 0x01, aw_android[0x01] & ~0x04);
 		for (uint8_t r = 0x02; ok && r <= 0x09; r++) {
 			ok = pa_write(AW87319, r, aw_android[r]);
 		}
