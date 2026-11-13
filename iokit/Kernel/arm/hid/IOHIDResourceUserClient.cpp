@@ -1304,7 +1304,7 @@ Boolean IOHIDResourceQueue::enqueueReport(IOHIDResourceDataQueueHeader * header,
 
             entry->size = dataSize;
             
-            bcopy(header, &entry->data, headerSize);
+            __nochk_bcopy(header, &entry->data, headerSize);
             
 
             if ( report ) {
@@ -1333,7 +1333,7 @@ Boolean IOHIDResourceQueue::enqueueReport(IOHIDResourceDataQueueHeader * header,
                 ((IODataQueueEntry *)((UInt8 *)dataQueue->queue + tail))->size = dataSize;
             }
 
-            bcopy(header, &dataQueue->queue->data, sizeof(IOHIDResourceDataQueueHeader));
+            __nochk_bcopy(header, &dataQueue->queue->data, sizeof(IOHIDResourceDataQueueHeader));
 
             if ( report ) {
                 report->readBytes(0, ((UInt8*)&dataQueue->queue->data) + headerSize, reportSize);
@@ -1357,7 +1357,7 @@ Boolean IOHIDResourceQueue::enqueueReport(IOHIDResourceDataQueueHeader * header,
 
             entry->size = dataSize;
 
-            bcopy(header, &entry->data, sizeof(IOHIDResourceDataQueueHeader));
+            __nochk_bcopy(header, &entry->data, sizeof(IOHIDResourceDataQueueHeader));
             if ( report ) {
                 report->readBytes(0, ((UInt8*)&entry->data) + headerSize, reportSize);
             }
