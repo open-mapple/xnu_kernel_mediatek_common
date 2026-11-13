@@ -244,6 +244,7 @@ mtk_bt_send(const uint8_t *bytes, unsigned length)
  */
 static uint8_t skel_vsc_sub;            /* the first parameter of the last 0xfce2 command sent: its kind */
 static uint32_t skel_vsc_said;          /* vendor-command lines said since bluetoothd connected */
+static uint32_t skel_pair_said;         /* pairing, encryption and L2CAP signalling lines, the same */
 
 /*
  * sysctl kern.mapple_bt_quirks: more rules of these kinds without a rebuild, one bluetoothd log at a time. "mask:OCTET:BITS" ORs BITS (hex)
@@ -363,6 +364,172 @@ skel_quirks(uint8_t *packet, unsigned length)
 }
 
 /*
+ * Pairing, encryption and L2CAP signalling, in either direction, as one line: what was asked and what came back, codes and
+ * results only -- never an address, a key, a passkey or a payload. False for anything else.
+ */
+static uint16_t
+skel_le16(const uint8_t *bytes)
+{
+	return (uint16_t)(bytes[0] | bytes[1] << 8);
+}
+
+static bool
+skel_pair_command(uint16_t opcode)
+{
+	switch (opcode) {
+	case 0x0405: case 0x0406: case 0x0409: case 0x040b: case 0x040c: case 0x0411: case 0x0413: case 0x042b: case 0x042c:
+	case 0x042d: case 0x0434: case 0x0c56: case 0x0c7a:
+		return true;
+	}
+	return false;
+}
+
+static bool
+skel_pair_line(const uint8_t *p, unsigned n, bool out, char *line, size_t room)
+{
+	const char *who = out ? "bluetoothd" : "the MT6631";
+
+	if (n >= 4 && p[0] == 0x01 && skel_pair_command(skel_le16(p + 1)) && n >= 4u + p[3]) {
+		uint16_t opcode = skel_le16(p + 1);
+		const uint8_t *a = p + 4;
+
+		if (opcode == 0x0406 && p[3] >= 3) {
+			snprintf(line, room, "%s: Disconnect, handle %#x, reason %#x", who, skel_le16(a) & 0xfff, a[2]);
+		} else if (opcode == 0x0411 && p[3] >= 2) {
+			snprintf(line, room, "%s: Authentication_Requested, handle %#x", who, skel_le16(a) & 0xfff);
+		} else if (opcode == 0x0413 && p[3] >= 3) {
+			snprintf(line, room, "%s: Set_Connection_Encryption, handle %#x, %s", who, skel_le16(a) & 0xfff, a[2] ? "on" : "off");
+		} else if (opcode == 0x042b && p[3] >= 9) {
+			snprintf(line, room, "%s: IO_Capability_Request_Reply, io %u, oob %u, auth %#x", who, a[6], a[7], a[8]);
+		} else if ((opcode == 0x0c56 || opcode == 0x0c7a) && p[3] >= 1) {
+			snprintf(line, room, "%s: %s %u", who, opcode == 0x0c56 ? "Write_Simple_Pairing_Mode" : "Write_Secure_Connections_Host_Support", a[0]);
+		} else {
+			snprintf(line, room, "%s: command %#06x", who, opcode);
+		}
+		return true;
+	}
+	if (n >= 3 && p[0] == 0x04 && n >= 3u + p[2]) {
+		const uint8_t code = p[1], len = p[2], *a = p + 3;
+
+		switch (code) {
+		case 0x0e:
+			if (len >= 4 && skel_pair_command(skel_le16(a + 1))) {
+				snprintf(line, room, "%s: %#06x done, status %#x", who, skel_le16(a + 1), a[3]);
+				return true;
+			}
+			return false;
+		case 0x0f:
+			if (len >= 4 && skel_pair_command(skel_le16(a + 2))) {
+				snprintf(line, room, "%s: %#06x pending, status %#x", who, skel_le16(a + 2), a[0]);
+				return true;
+			}
+			return false;
+		case 0x03:
+			if (len >= 11) {
+				snprintf(line, room, "%s: Connection Complete, status %#x, handle %#x, link %u, encryption %u", who, a[0], skel_le16(a + 1) & 0xfff, a[9], a[10]);
+				return true;
+			}
+			return false;
+		case 0x05:
+			if (len >= 4) {
+				snprintf(line, room, "%s: Disconnection Complete, status %#x, handle %#x, reason %#x", who, a[0], skel_le16(a + 1) & 0xfff, a[3]);
+				return true;
+			}
+			return false;
+		case 0x06: case 0x30:
+			if (len >= 3) {
+				snprintf(line, room, "%s: %s, status %#x, handle %#x", who, code == 0x06 ? "Authentication Complete" : "Encryption Key Refresh Complete",
+				    a[0], skel_le16(a + 1) & 0xfff);
+				return true;
+			}
+			return false;
+		case 0x08:
+			if (len >= 4) {
+				snprintf(line, room, "%s: Encryption Change, status %#x, handle %#x, enabled %u", who, a[0], skel_le16(a + 1) & 0xfff, a[3]);
+				return true;
+			}
+			return false;
+		case 0x12:
+			if (len >= 8) {
+				snprintf(line, room, "%s: Role Change, status %#x, role %u", who, a[0], a[7]);
+				return true;
+			}
+			return false;
+		case 0x14:
+			if (len >= 6) {
+				snprintf(line, room, "%s: Mode Change, status %#x, handle %#x, mode %u", who, a[0], skel_le16(a + 1) & 0xfff, a[3]);
+				return true;
+			}
+			return false;
+		case 0x18:
+			if (len >= 23) {
+				snprintf(line, room, "%s: Link Key Notification, key type %u", who, a[22]);
+				return true;
+			}
+			return false;
+		case 0x32:
+			if (len >= 9) {
+				snprintf(line, room, "%s: IO Capability Response, io %u, oob %u, auth %#x", who, a[6], a[7], a[8]);
+				return true;
+			}
+			return false;
+		case 0x36:
+			if (len >= 1) {
+				snprintf(line, room, "%s: Simple Pairing Complete, status %#x", who, a[0]);
+				return true;
+			}
+			return false;
+		case 0x17: case 0x31: case 0x33: case 0x34: case 0x3b:
+			snprintf(line, room, "%s: %s", who, code == 0x17 ? "Link Key Request" : code == 0x31 ? "IO Capability Request" :
+			    code == 0x33 ? "User Confirmation Request" : code == 0x34 ? "User Passkey Request" : "User Passkey Notification");
+			return true;
+		}
+		return false;
+	}
+	/* L2CAP signalling (CID 1) in the first fragment of an ACL packet: the first command */
+	if (n >= 13 && p[0] == 0x02 && ((p[2] >> 4) & 3) != 1 && skel_le16(p + 7) == 0x0001) {
+		const uint8_t code = p[9], *a = p + 13;
+		const unsigned len = skel_le16(p + 11);
+
+		if (n < 13 + len) {
+			return false;
+		}
+		switch (code) {
+		case 0x01:
+			snprintf(line, room, "%s: L2CAP Command Reject, reason %u", who, len >= 2 ? skel_le16(a) : 0);
+			break;
+		case 0x02:
+			snprintf(line, room, "%s: L2CAP Connection Request, psm %#x, scid %#x", who, len >= 4 ? skel_le16(a) : 0, len >= 4 ? skel_le16(a + 2) : 0);
+			break;
+		case 0x03:
+			snprintf(line, room, "%s: L2CAP Connection Response, dcid %#x, scid %#x, result %u, status %u", who, len >= 8 ? skel_le16(a) : 0,
+			    len >= 8 ? skel_le16(a + 2) : 0, len >= 8 ? skel_le16(a + 4) : 0, len >= 8 ? skel_le16(a + 6) : 0);
+			break;
+		case 0x04:
+			snprintf(line, room, "%s: L2CAP Configure Request, dcid %#x, flags %u", who, len >= 4 ? skel_le16(a) : 0, len >= 4 ? skel_le16(a + 2) : 0);
+			break;
+		case 0x05:
+			snprintf(line, room, "%s: L2CAP Configure Response, scid %#x, flags %u, result %u", who, len >= 6 ? skel_le16(a) : 0,
+			    len >= 6 ? skel_le16(a + 2) : 0, len >= 6 ? skel_le16(a + 4) : 0);
+			break;
+		case 0x06: case 0x07:
+			snprintf(line, room, "%s: L2CAP Disconnection %s, dcid %#x, scid %#x", who, code == 0x06 ? "Request" : "Response",
+			    len >= 4 ? skel_le16(a) : 0, len >= 4 ? skel_le16(a + 2) : 0);
+			break;
+		case 0x0a: case 0x0b:
+			snprintf(line, room, "%s: L2CAP Information %s, type %u%s", who, code == 0x0a ? "Request" : "Response", len >= 2 ? skel_le16(a) : 0,
+			    code == 0x0b && len >= 4 && skel_le16(a + 2) != 0 ? ", not supported" : "");
+			break;
+		default:
+			snprintf(line, room, "%s: L2CAP signalling code %#x", who, code);
+			break;
+		}
+		return true;
+	}
+	return false;
+}
+
+/*
  * A command the controller must not see: LE Read Periodic Advertiser List Size (0x204a). After one periodic or extended advertising command the
  * MT6631 refuses the legacy scan and advertising commands with Command Disallowed (LE Set Scan Parameters, 0x0c), and bluetoothd restarts
  * ("Could not start LE scan", 712); it uses neither extended advertising nor scanning. Answered here, a list of none. True when answered.
@@ -394,6 +561,7 @@ skel_ctl_connect(__unused kern_ctl_ref ref, struct sockaddr_ctl *sac, __unused v
 	proc_selfname(name, sizeof(name));
 	say("control connected by %s (pid %d): unit %u", name, proc_selfpid(), sac->sc_unit);
 	skel_vsc_said = 0;
+	skel_pair_said = 0;
 	return 0;
 }
 
@@ -847,6 +1015,14 @@ skel_bridge(void)
 			}
 			skel_dump("out", skel_packet, n, &skel_said_out);
 			skel_vsc_out(skel_packet, n);
+			{
+				char line[160];
+
+				if (skel_pair_said < 400 && skel_pair_line(skel_packet, n, true, line, sizeof(line))) {
+					skel_pair_said++;
+					say("%s", line);
+				}
+			}
 			if (skel_local(skel_packet, n)) {
 				say("%#06x answered here, not sent", (unsigned)(skel_packet[1] | skel_packet[2] << 8));
 				continue;
@@ -886,6 +1062,14 @@ skel_bridge(void)
 
 			memcpy(head, skel_frame, MIN(sizeof(head), (unsigned)length));
 			skel_vsc_in(skel_frame, (unsigned)length, "the MT6631 answers");
+			{
+				char line[160];
+
+				if (skel_pair_said < 400 && skel_pair_line(skel_frame, (unsigned)length, false, line, sizeof(line))) {
+					skel_pair_said++;
+					say("%s", line);
+				}
+			}
 			length = (int)skel_quirks(skel_frame, (unsigned)length);
 			if (length >= 7 && memcmp(head, skel_frame, sizeof(head)) != 0) {
 				skel_vsc_in(skel_frame, (unsigned)length, "the bridge answers instead");
