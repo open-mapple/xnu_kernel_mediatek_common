@@ -482,6 +482,9 @@ pinmux_restore(void)
 
 static void wl_reset(void);      /* station state, defined with it */
 
+static LCK_GRP_DECLARE(btif_lck_grp, "mt6631_btif");
+static LCK_MTX_DECLARE(btif_mtx, &btif_lck_grp);       /* BTIF and st: "wifi wmt" and Bluetooth (bsd/dev/mtk_bt.c) */
+
 static size_t
 wifi_off(char *out, size_t len, size_t o)
 {
@@ -489,6 +492,9 @@ wifi_off(char *out, size_t len, size_t o)
 		say("off: not on (wifi on)\n");
 		return o;
 	}
+	lck_mtx_lock(&btif_mtx);
+	vw.wmt = false;                                 /* Bluetooth stops touching BTIF before CONNSYS goes */
+	lck_mtx_unlock(&btif_mtx);
 	rmw(TOPRGU_SWSYSRST, 0xff001000, 0x88001000);  /* CPU back in reset first */
 	o = conn_off(out, len, o);
 	pinmux_restore();
@@ -664,9 +670,6 @@ static struct {
 	uint8_t txseq, txack, rxseq;
 	uint16_t crc[256];
 } st;
-
-static LCK_GRP_DECLARE(btif_lck_grp, "mt6631_btif");
-static LCK_MTX_DECLARE(btif_mtx, &btif_lck_grp);       /* BTIF and st: "wifi wmt" and Bluetooth (bsd/dev/mtk_bt.c) */
 
 static void
 crc_init(void)
@@ -3275,11 +3278,31 @@ vw_kick_locked(uint32_t req)
 	wakeup(&vw_chan);
 }
 
+/*
+ * Boot-arg mp_wifi_steps: how far the link and the WLAN layer may go (default 0: status only). 1 detect (the A-die
+ * probe, Android's at every boot, restored after), 2 on/off (rails incl. VCN33's voltage, MTCMOS, RAM patches),
+ * 3 wmt/fw/cap, 4 init/up/scan (and power from Settings), 5 join/leave/sta/ring (and joins from Settings).
+ */
+static int
+wifi_steps(void)
+{
+	static int steps = -1;
+	if (steps < 0) {
+		int s = 0;
+		PE_parse_boot_argn("mp_wifi_steps", &s, sizeof(s));
+		steps = s;
+	}
+	return steps;
+}
+
 /* ---- API for mt6631_wlan.c ---- */
 
 int
 mt6631_wifi_set_power(bool on)
 {
+	if (on && wifi_steps() < 4) {
+		return EPERM;
+	}
 	lck_mtx_lock(&vs_mtx);
 	vs.want = on;
 	vw_kick_locked(REQ_POWER | REQ_POWER_EVENT);
@@ -3326,6 +3349,9 @@ mt6631_wifi_current_bss(struct vwl_bss *out)
 int
 mt6631_wifi_join(const struct vwl_join *j)
 {
+	if (wifi_steps() < 5) {
+		return EPERM;
+	}
 	lck_mtx_lock(&vs_mtx);
 	if (!vs.want) {
 		lck_mtx_unlock(&vs_mtx);
@@ -3521,16 +3547,7 @@ mt6631_wifi_link(const char *args, char *out, size_t len)
 	while (*args == ' ') {
 		args++;
 	}
-	/*
-	 * Boot-arg mp_wifi_steps: how far the link may go (default 0: status only). 1 detect (the A-die probe, Android's
-	 * at every boot, restored after), 2 on/off (rails incl. VCN33's voltage, MTCMOS, RAM patches), 3 wmt/fw/cap,
-	 * 4 init/up/scan, 5 join/leave/sta/ring.
-	 */
-	static int steps = -1;
-	if (steps < 0) {
-		steps = 0;
-		PE_parse_boot_argn("mp_wifi_steps", &steps, sizeof(steps));
-	}
+	int steps = wifi_steps();
 	static const struct { const char *cmd; int step; } need[] = {
 		{ "detect", 1 }, { "on", 2 }, { "off", 2 }, { "wmt", 3 }, { "fw", 3 }, { "cap", 3 }, { "init", 4 }, { "up", 4 },
 		{ "scan", 4 }, { "join", 5 }, { "leave", 5 }, { "sta", 5 }, { "ring", 5 },
