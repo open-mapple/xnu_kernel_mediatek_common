@@ -1871,7 +1871,8 @@ vl_rx(void)
 	if (vl.reply_pos < vl.reply_len || vl.reply_end) {
 		return;                 /* previous reply still going out: one command at a time */
 	}
-	printf("LINK: command \"%s\"\n", vl.cmd);
+	/* "wifi join SSID PASSPHRASE" is not logged as typed */
+	printf("LINK: command \"%s\"\n", strnstr(vl.cmd, "join", sizeof(vl.cmd)) != NULL ? "wifi join ..." : vl.cmd);
 	vl_command();
 }
 
