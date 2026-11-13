@@ -3387,6 +3387,26 @@ mt6631_wifi_link(const char *args, char *out, size_t len)
 	while (*args == ' ') {
 		args++;
 	}
+	/*
+	 * Boot-arg mp_wifi_steps: how far the link may go (default 0: status only). 1 detect (the A-die probe, Android's
+	 * at every boot, restored after), 2 on/off (rails incl. VCN33's voltage, MTCMOS, RAM patches), 3 wmt/fw/cap,
+	 * 4 init/up/scan/join/leave/sta/ring.
+	 */
+	static int steps = -1;
+	if (steps < 0) {
+		steps = 0;
+		PE_parse_boot_argn("mp_wifi_steps", &steps, sizeof(steps));
+	}
+	static const struct { const char *cmd; int step; } need[] = {
+		{ "detect", 1 }, { "on", 2 }, { "off", 2 }, { "wmt", 3 }, { "fw", 3 }, { "cap", 3 }, { "init", 4 }, { "up", 4 },
+		{ "scan", 4 }, { "join", 4 }, { "leave", 4 }, { "sta", 4 }, { "ring", 4 },
+	};
+	for (unsigned i = 0; i < sizeof(need) / sizeof(need[0]); i++) {
+		if (strncmp(args, need[i].cmd, strlen(need[i].cmd)) == 0 && need[i].step > steps) {
+			snprintf(out, len, "wifi %s needs mp_wifi_steps=%d (now %d)\n", need[i].cmd, need[i].step, steps);
+			return;
+		}
+	}
 	lck_mtx_lock(&vw_mtx);
 	if (strncmp(args, "on", 2) == 0) {
 		printf("WIFI: power on\n");
