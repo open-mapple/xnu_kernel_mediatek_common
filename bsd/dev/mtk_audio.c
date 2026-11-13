@@ -14,6 +14,7 @@
  *   2  the codec's line-out up and a 1 kHz tone through DL1, the amplifier off; held, then down
  *   3  the amplifier checked and on, the tone through the guard; held, then down
  *   4  iOS plays: /dev/mapple-audio through the guard; the amplifier on while there is sound, off after 3 s without
+ *   5  the mic too: AIN0 through the codec's UL and VUL12 to /dev/mapple-mic, up only while that is open
  * Steps 3 and 4 are refused (taken as 2) while PA_FITTED is not set, and for an AW87319 while AW_ANDROID is not.
  * mp_audio_below (default 160 = 20 dB, at most 90 dB) how far under Android's level the speaker stays (Darwin's volume
  * is under that); mp_audio_gain (default 0, at most 12 dB) the guard's gain; mp_audio_secs (default 5) for steps 1-3.
@@ -46,6 +47,9 @@ extern void mt6781_gpio_pin(uint32_t pin, uint32_t *mode, bool *output, bool *hi
 extern bool mt6781_afe_up(void);
 extern bool mt6781_afe_dl1_start(volatile uint32_t **ring, uint32_t *bytes);
 extern uint32_t mt6781_afe_dl1_position(void);
+extern bool mt6781_afe_ul_start(volatile uint32_t **ring, uint32_t *bytes);
+extern uint32_t mt6781_afe_ul_position(void);
+extern void mt6781_afe_ul_stop(void);
 extern void mt6781_afe_down(void);
 
 #define PA_PIN          164
@@ -609,6 +613,149 @@ report(const char *when)
 	    db(r.gain, a), db(r.least_gain, b), r.limited_frames);
 }
 
+/* ---- the mic ---- */
+
+#define PGA_ANDROID     2               /* the mic's PGA while Android records (AUDENC_ANA_CON0/1 [10:8]): 12 dB */
+#define MICBIAS_VREF    2               /* mic bias 0 at 1.9 V, Android's (AUDENC_ANA_CON9 [6:4]) */
+#define MIC_FRAMES      8192            /* 170 ms between VUL12 and /dev/mapple-mic */
+
+static volatile uint32_t *ul;
+static uint32_t ul_bytes, ul_read, mic_peak, mic_overruns;
+static int16_t mic_ring[MIC_FRAMES];
+static uint32_t mic_head, mic_tail;     /* samples; head: the poller's, tail: the reader's */
+static bool mic_on, mic_failed;
+static uint64_t mic_second;
+
+/* The mic (AIN0 into ADC L and R, mic bias 0) up: mt6358.c's DAPM order, the values Android has while it records. */
+static bool
+mic_codec_up(void)
+{
+	uint32_t rc;
+
+	failed = false;
+	if (pmic(0x003c) != 0x8888) {
+		cw(0x003c, 0xffff, 0x8888);
+	}
+	cw(0x2422, 0x0020, 0x0020);
+	cw(0x238e, 0xffff, 0);
+	cw(0x2424, 0x2500, 0x0100);
+	cw(0x2424, 0x2500, 0x2500);
+	cw(0x2292, 0x0029, 0);
+	cw(0x2292, 0x0004, 0);
+	cw(0x239a, 0xff00, 0);
+	cw(0x239a, 0x0070, MICBIAS_VREF << 4);
+	cw(0x239a, 0x0001, 0x0001);
+	for (uint32_t r = 0x2388; r <= 0x238a; r += 2) {
+		cw(r, 0x0700, PGA_ANDROID << 8);
+		cw(r, 0xf8ff, 0);
+		cw(r, 0x00c0, 0x0040);
+		cw(r, 0x0001, 0x0001);
+		ms(1);
+		cw(r, 0x6000, 0x4000);
+		cw(r, 0x1000, 0x1000);
+	}
+	ms(1);
+	rc = pmic(0x23a0);
+	if ((rc & 0x1f) == 0 || (rc & 0x1f) == 0x1f || (rc & 0x1f00) == 0 || (rc & 0x1f00) == 0x1f00) {
+		/* the ADCs' RC tune did not settle: their power-up again, as Android does */
+		cw(0x2388, 0x1000, 0);
+		cw(0x238a, 0x1000, 0);
+		cw(0x2388, 0x1000, 0x1000);
+		cw(0x238a, 0x1000, 0x1000);
+	}
+	cw(0x22b4, 0xffff, 0);
+	cw(0x22cc, 0xff00, 0x3100);
+	cw(0x228c, 0xffff, 0);
+	cw(0x228e, 0x0001, 0x0001);
+	cw(0x00de, 0x0fff, 0x0249);
+	printf("audio: codec: mic %s (PGA 12 dB, mic bias 1.9 V, RC tune %04x)\n", failed ? "FAILED" : "up", rc);
+	return !failed;
+}
+
+/* Android's order down; mic bias 0's voltage code stays (its enable is what turns it off). */
+static void
+mic_codec_down(void)
+{
+	cwd(0x228e, 0x0001, 0);
+	cwd(0x22cc, 0xff00, 0x3000);
+	for (uint32_t r = 0x2388; r <= 0x238a; r += 2) {
+		cwd(r, 0xf000, 0);
+		cwd(r, 0x08fb, 0);
+		cwd(r, 0x0004, 0);
+	}
+	cwd(0x239a, 0x0001, 0);
+	cwd(0x00de, 0x0fff, 0);
+	cwd(0x0088, 0xf000, 0);
+	cwd(0x2424, 0x2500, 0x0100);
+	cwd(0x2424, 0x2500, 0);
+	cwd(0x238e, 0xffff, 0);
+	cwd(0x2422, 0x0020, 0);
+	printf("audio: codec: mic down\n");
+}
+
+/* /dev/mapple-mic's source (the reader's thread): what the poller has, never waiting. */
+static uint32_t
+mic_source(int16_t *samples, uint32_t count)
+{
+	uint32_t tail = mic_tail, have = __atomic_load_n(&mic_head, __ATOMIC_ACQUIRE) - tail, n = have < count ? have : count;
+
+	for (uint32_t i = 0; i < n; i++) {
+		samples[i] = mic_ring[(tail + i) % MIC_FRAMES];
+	}
+	__atomic_store_n(&mic_tail, tail + n, __ATOMIC_RELEASE);
+	return n;
+}
+
+/* Step 5, each round: the mic up while /dev/mapple-mic is open, down when it closes; VUL12's new frames (left: AIN0) on. */
+static void
+mic_poll(void)
+{
+	bool want = mapple_audio_mic_open();
+	uint64_t second, now = mach_absolute_time();
+	uint32_t pos;
+
+	if (want && !mic_on && !mic_failed) {
+		mic_on = mic_codec_up() && mt6781_afe_ul_start(&ul, &ul_bytes);
+		if (!mic_on) {
+			mt6781_afe_ul_stop();
+			mic_codec_down();
+			mic_failed = true;
+			printf("audio: the mic did not come up: it stays off\n");
+			return;
+		}
+		ul_read = mt6781_afe_ul_position();
+		__atomic_store_n(&mic_head, __atomic_load_n(&mic_tail, __ATOMIC_ACQUIRE), __ATOMIC_RELEASE);
+		mic_overruns = 0;
+		mic_second = now;
+	} else if (!want && mic_on) {
+		mt6781_afe_ul_stop();
+		mic_codec_down();
+		mic_on = false;
+		printf("audio: the mic off: %u samples lost to a full ring\n", mic_overruns);
+	}
+	if (!mic_on) {
+		return;
+	}
+	for (pos = mt6781_afe_ul_position(); ul_read != pos; ul_read = (ul_read + 4) % ul_bytes) {
+		int16_t left = (int16_t)(ul[ul_read / 4] & 0xffff);
+		uint32_t head = mic_head, v = left < 0 ? (uint32_t)-left : (uint32_t)left;
+
+		mic_peak = v > mic_peak ? v : mic_peak;
+		if (head - __atomic_load_n(&mic_tail, __ATOMIC_ACQUIRE) < MIC_FRAMES) {
+			mic_ring[head % MIC_FRAMES] = left;
+			__atomic_store_n(&mic_head, head + 1, __ATOMIC_RELEASE);
+		} else {
+			mic_overruns++;
+		}
+	}
+	nanoseconds_to_absolutetime(NSEC_PER_SEC, &second);
+	if (now - mic_second >= second) {
+		mic_second = now;
+		printf("audio: the mic: peak %u of 32768 in the last second\n", mic_peak);
+		mic_peak = 0;
+	}
+}
+
 /* The amplifier's waits, DL1 kept topped up meanwhile: a start takes longer than the 43 ms queued ahead. */
 static void
 pa_wait(uint32_t n)
@@ -652,7 +799,10 @@ audio_thread(__unused void *arg, __unused wait_result_t w)
 	}
 	status();
 	nanoseconds_to_absolutetime(NSEC_PER_SEC, &second);
-	if (steps == 4 && dl1 && pa_kind != PA_NONE) {
+	if (steps >= 4 && dl1 && pa_kind != PA_NONE) {
+		if (steps == 5) {
+			mapple_audio_set_source("the mic", mic_source);
+		}
 		/* iOS: for good. The amplifier on with the first sound, off after 3 s without. */
 		mapple_audio_set_sink("the speaker", sink);
 		for (;;) {
@@ -670,6 +820,9 @@ audio_thread(__unused void *arg, __unused wait_result_t w)
 			} else if (pa_on && mach_absolute_time() - last_sound > 3 * second) {
 				pa_off();
 				report("3 s of silence, the amplifier off");
+			}
+			if (steps == 5) {
+				mic_poll();
 			}
 			ms(5);
 		}
@@ -787,7 +940,7 @@ mtk_audio_start(void)
 	(void)PE_parse_boot_argn("mp_audio_gain", &gain, sizeof(gain));
 	(void)PE_parse_boot_argn("mp_audio_secs", &secs, sizeof(secs));
 	(void)PE_parse_boot_argn("mp_vib_steps", &vib_steps, sizeof(vib_steps));
-	steps = steps > 4 ? 4 : steps;
+	steps = steps > 5 ? 5 : steps;
 	if (steps >= 3 && (PA_FITTED == PA_NONE || (PA_FITTED == PA_AW87319 && !AW_ANDROID))) {
 		printf("audio: mp_audio_steps=%u refused: the amplifier (and an AW87319's registers) not known from Android yet; "
 		    "taken as 2\n", steps);

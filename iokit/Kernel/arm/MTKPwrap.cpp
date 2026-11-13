@@ -312,8 +312,11 @@ static const struct {
 	uint16_t addr, mask, min, max;
 } gMappleAudioRegs[] = {
 	{ 0x0030, 0x0ff0, 0, 0xffff },  /* SMT_CON1: AUD pad Schmitt triggers */
+	{ 0x003c, 0xffff, 0x8888, 0x8888 }, /* DRV_CON3: AUD MISO pads' drive, Android's 4 mA only */
 	{ 0x0088, 0x0f00, 0, 0xffff },  /* GPIO_DIR0: AUD MOSI pads */
+	{ 0x0088, 0xf000, 0, 0 },       /* GPIO_DIR0: AUD MISO pads, inputs only */
 	{ 0x00d8, 0x0fff, 0, 0xffff },  /* GPIO_MODE2: AUD MOSI pad functions */
+	{ 0x00de, 0x0fff, 0, 0xffff },  /* GPIO_MODE3: AUD MISO pad functions */
 	{ 0x07ac, 0x2000, 0, 0xffff },  /* DCXO_CW14: RG_XO_AUDIO_EN_M (shared register: this bit only) */
 	{ 0x220c, 0x0066, 0, 0xffff },  /* AUD_TOP_CKPDN_CON0: AUDNCP, ZCD13M, AUDIF, AUD clocks (not bit 0, accdet's) */
 	{ 0x223a, 0x0001, 0, 0xffff },  /* AUDNCP_CLKDIV_CON0..4: the negative charge pump */
@@ -322,11 +325,23 @@ static const struct {
 	{ 0x2240, 0x0001, 0, 0xffff },
 	{ 0x2242, 0x0003, 0, 0xffff },
 	{ 0x2288, 0x0001, 0, 0xffff },  /* AFE_UL_DL_CON0: AFE_ON */
+	{ 0x228c, 0xffff, 0, 0 },       /* AFE_UL_SRC_CON0_H: no DMIC */
+	{ 0x228e, 0x0001, 0, 0xffff },  /* AFE_UL_SRC_CON0_L: UL SRC on */
 	{ 0x228a, 0x0001, 0, 0xffff },  /* AFE_DL_SRC2_CON0_L: DL SRC on */
-	{ 0x2292, 0x00c4, 0, 0xffff },  /* AUDIO_TOP_CON0: AFE_CTL, DAC_CTL, PWR_CLK power-downs */
+	{ 0x2292, 0x00ed, 0, 0xffff },  /* AUDIO_TOP_CON0: AFE_CTL, DAC_CTL, PWR_CLK, ADC_CTL, I2S_DL power-downs */
 	{ 0x2296, 0xffff, 0, 0xffff },  /* AFUNC_AUD_CON0: scrambler */
+	{ 0x22b4, 0xffff, 0, 0 },       /* AFE_ADDA_MTKAIF_CFG0: protocol 1 */
+	{ 0x22cc, 0xff00, 0x30, 0x31 }, /* AFE_AUD_PAD_TOP: TX FIFO off or on, Android's values */
 	{ 0x229a, 0x000f, 0, 0xffff },  /* AFUNC_AUD_CON2: SDM */
+	{ 0x2388, 0xf8ff, 0, 0xffff },  /* AUDENC_ANA_CON0: left preamp and ADC, input AIN0 */
+	{ 0x2388, 0x0700, 2, 2 },       /* AUDENC_ANA_CON0 [10:8]: PGA gain, Android's 12 dB only */
+	{ 0x238a, 0xf8ff, 0, 0xffff },  /* AUDENC_ANA_CON1: right */
+	{ 0x238a, 0x0700, 2, 2 },
+	{ 0x238e, 0xffff, 0, 0 },       /* AUDENC_ANA_CON3: ADC clock 13 MHz */
 	{ 0x2394, 0x0003, 0, 0xffff },  /* AUDENC_ANA_CON6: 26 MHz clock squarer */
+	{ 0x239a, 0x0001, 0, 0xffff },  /* AUDENC_ANA_CON9: mic bias 0 on */
+	{ 0x239a, 0x0070, 2, 2 },       /* AUDENC_ANA_CON9 [6:4]: its voltage, Android's 1.9 V only */
+	{ 0x239a, 0xff00, 0, 0 },
 	{ 0x2408, 0x0006, 0, 0xffff },  /* AUDDEC_ANA_CON0: DAC R, DAC VA28 */
 	{ 0x240c, 0xffff, 0, 0xffff },  /* AUDDEC_ANA_CON2 */
 	{ 0x2416, 0x011f, 0, 0xffff },  /* AUDDEC_ANA_CON7: line-out power, bias, mux, short-circuit, stability */
@@ -334,8 +349,8 @@ static const struct {
 	{ 0x241c, 0xffff, 0, 0xffff },  /* AUDDEC_ANA_CON10 */
 	{ 0x241e, 0xff87, 0, 0xffff },  /* AUDDEC_ANA_CON11: ZCD select, HP driver bias */
 	{ 0x2420, 0xffff, 0, 0xffff },  /* AUDDEC_ANA_CON12: IBIST */
-	{ 0x2422, 0x0011, 0, 0xffff },  /* AUDDEC_ANA_CON13: decoder reset, global bias */
-	{ 0x2424, 0x1055, 0, 0xffff },  /* AUDDEC_ANA_CON14: the codec's own 1.5 V LDOs (enables only) */
+	{ 0x2422, 0x0031, 0, 0xffff },  /* AUDDEC_ANA_CON13: decoder reset, global bias, ADC clock generator */
+	{ 0x2424, 0x3555, 0, 0xffff },  /* AUDDEC_ANA_CON14: the codec's own 1.5 V LDOs, DL's and the ADC's (enables only) */
 	{ 0x2426, 0x0001, 0, 0xffff },  /* AUDDEC_ANA_CON15: the codec's own -1.2 V regulator (enable only) */
 	{ 0x2488, 0x07ff, 0, 0xffff },  /* ZCD_CON0: zero-cross detector */
 	{ 0x248a, 0x001f, 8, 0x1f },    /* ZCD_CON1 [4:0]: LOL gain, 8 (0 dB) .. 18 (-10 dB), 0x1f mute */
