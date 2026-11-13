@@ -316,6 +316,10 @@ mapple_sandbox_container_path(struct proc *p, user_addr_t arg)
 	}
 	proc_t t = pid == 0 || pid == proc_pid(p) ? p : proc_find(pid);
 	if (t == NULL) {
+		char name[32];
+
+		proc_name(proc_pid(p), name, sizeof(name));
+		printf("Sandbox: %s op 4: no process %d (ESRCH)\n", name, pid);
 		return ESRCH;
 	}
 	kauth_cred_t cred = kauth_cred_proc_ref(t);
