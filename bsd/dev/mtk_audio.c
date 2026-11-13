@@ -2,7 +2,8 @@
  * The realme 8i's speaker and vibration motor, behind the audio plug-in's /dev nodes (bsd/dev/mapple_audio.c).
  *
  * Speaker: AFE memif DL1 -> ADDA DL (osfmk/arm64/mt6781_afe.c) -> the MT6366 codec's line-out (left, from DAC R) ->
- * an analog amplifier on GPIO164: an SIA8109 (one-wire, mode 6) or an AW87319 (I2C3 0x58), told apart at run time.
+ * an analog amplifier on GPIO164: an SIA8109 (one-wire, mode 6) or an AW87319 (I2C3 0x58). Which one this phone has
+ * comes from Android (PA_FITTED), and the run checks it.
  * Facts from the realme kernel (mt6358.c, mt6781-mt6366.c, sia81xx.c) and the AW87319 datasheet. Android's levels
  * are the ceiling, and the writes enforce it: MTKPwrap::writeAudio (codec, VIBR), mt6781_afe.c (clocks, AFE),
  * pa_write() here (the amplifier). The samples go through the speaker guard (bsd/dev/speaker_guard.c) last.
@@ -11,8 +12,9 @@
  *   0  status, read only: the codec's rails and IDs, the AFE's clocks and pins, the amplifier's pin, the motor's rail
  *   1  clocks, AFE, ADDA DL and the codec's supplies and digital path up; held mp_audio_secs, then all down
  *   2  the codec's line-out up and a 1 kHz tone through DL1, the amplifier off; held, then down
- *   3  the amplifier found and on, the tone through the guard; held, then down
+ *   3  the amplifier checked and on, the tone through the guard; held, then down
  *   4  iOS plays: /dev/mapple-audio through the guard; the amplifier on while there is sound, off after 3 s without
+ * Steps 3 and 4 are refused (taken as 2) while PA_FITTED is not set, and for an AW87319 while AW_ANDROID is not.
  * mp_audio_below (default 160 = 20 dB, at most 90 dB) how far under Android's level the speaker stays (Darwin's volume
  * is under that); mp_audio_gain (default 0, at most 12 dB) the guard's gain; mp_audio_secs (default 5) for steps 1-3.
  *
@@ -235,23 +237,17 @@ lineout_down(void)
 /* ---- the amplifier ---- */
 
 enum { PA_NONE, PA_AW87319, PA_SIA8109 };
+#define PA_FITTED       PA_NONE         /* the amplifier this phone has, from Android (AUDIO.md: the I2C3 probe) */
 static int pa_kind;
 static bool pa_on;
 static bool sia_i2c;            /* the SIA8109 answers on I2C (0x41 reads 0x09): Android's registers are written */
 
-/* AW87319 registers and the values allowed (the datasheet's defaults, the gain from 18 dB up to its default 24 dB). */
-static const struct {
-	uint8_t reg, min, max;
-} aw_regs[] = {
-	{ 0x01, 0x00, 0x07 },   /* SYSCTRL: EN_SW, class D, boost */
-	{ 0x02, 0x28, 0x28 },   /* BATSAFE */
-	{ 0x03, 0x04, 0x05 },   /* boost: 7.75 or 8.0 V */
-	{ 0x04, 0x04, 0x04 },   /* inductor current */
-	{ 0x05, 0x09, 0x0d },   /* gain: 18 .. 24 dB */
-	{ 0x06, 0x00, 0x03 },   /* AGC3 power limit: at most 0.8 W into 8 ohms */
-	{ 0x07, 0x52, 0x52 }, { 0x08, 0x28, 0x28 }, { 0x09, 0x02, 0x02 },
-};
-#define AW_GAIN         0x09    /* 18 dB, the least: Android's own (odm aw87319_spk.bin) is not known yet */
+/*
+ * AW87319: registers 0x01-0x09 as Android has them while it plays on the speaker (AUDIO.md: the I2C3 dump), the only
+ * values written, in this order, SYSCTRL (0x01) last; switched off by SYSCTRL without EN_SW (bit 2). 0 until known.
+ */
+#define AW_ANDROID      0
+static const uint8_t aw_android[10] = { 0 };
 
 /* SIA8109: Android's register values (sia8109_regs.c), the only ones written; 0x02 = 0xcc is its boost, 8.5 V. */
 static const uint8_t sia_regs[14] = { 0x07, 0x80, 0xcc, 0x19, 0x26, 0x0a, 0x02, 0x28, 0x05, 0x8a, 0x00, 0x00, 0x00, 0x00 };
@@ -269,9 +265,8 @@ pa_write(uint8_t addr, uint8_t reg, uint8_t value)
 	bool allowed = false;
 
 	if (addr == AW87319) {
-		for (unsigned i = 0; i < sizeof(aw_regs) / sizeof(aw_regs[0]); i++) {
-			allowed |= aw_regs[i].reg == reg && value >= aw_regs[i].min && value <= aw_regs[i].max;
-		}
+		allowed = AW_ANDROID && reg >= 0x01 && reg <= 0x09 &&
+		    (value == aw_android[reg] || (reg == 0x01 && value == (aw_android[0x01] & ~0x04)));
 	} else if (addr == SIA8109) {
 		allowed = reg < sizeof(sia_regs) && value == sia_regs[reg];
 	}
@@ -376,6 +371,11 @@ pa_detect(void)
 	ms(2);
 	printf("audio: amplifier: %s (AW87319 id %#x, SIA8109 id %#x)\n", pa_kind == PA_AW87319 ? "AW87319" :
 	    sia_i2c ? "SIA8109, on I2C too" : "taken for an SIA8109 on one-wire only", aw, sia);
+	if (pa_kind != PA_FITTED) {
+		printf("audio: amplifier: not the one Android has (PA_FITTED): left off\n");
+		pa_kind = PA_NONE;
+		return false;
+	}
 	return true;
 }
 
@@ -384,7 +384,7 @@ static void
 pa_off(void)
 {
 	if (pa_kind == PA_AW87319) {
-		(void)pa_write(AW87319, 0x01, 0x03);
+		(void)pa_write(AW87319, 0x01, aw_android[0x01] & ~0x04);
 	}
 	if (pin(0)) {
 		pa_on = false;
@@ -408,10 +408,11 @@ pa_start(void)
 		ms(2);
 		ok = ok && pin(1);
 		ms(2);
-		ok = ok && pa_read(AW87319, 0x00, &id) && id == 0x9b && pa_write(AW87319, 0x01, 0x03) && pa_write(AW87319, 0x02, 0x28) &&
-		    pa_write(AW87319, 0x03, 0x05) && pa_write(AW87319, 0x04, 0x04) && pa_write(AW87319, 0x05, AW_GAIN) &&
-		    pa_write(AW87319, 0x06, 0x03) && pa_write(AW87319, 0x07, 0x52) && pa_write(AW87319, 0x08, 0x28) &&
-		    pa_write(AW87319, 0x09, 0x02) && pa_write(AW87319, 0x01, 0x07);
+		ok = ok && pa_read(AW87319, 0x00, &id) && id == 0x9b && pa_write(AW87319, 0x01, aw_android[0x01] & ~0x04);
+		for (uint8_t r = 0x02; ok && r <= 0x09; r++) {
+			ok = pa_write(AW87319, r, aw_android[r]);
+		}
+		ok = ok && pa_write(AW87319, 0x01, aw_android[0x01]);
 		ms(40);
 	} else if (pa_kind == PA_SIA8109) {
 		ok = sia_mode(SIA_MODE);
@@ -724,6 +725,11 @@ mtk_audio_start(void)
 	(void)PE_parse_boot_argn("mp_audio_secs", &secs, sizeof(secs));
 	(void)PE_parse_boot_argn("mp_vib_steps", &vib_steps, sizeof(vib_steps));
 	steps = steps > 4 ? 4 : steps;
+	if (steps >= 3 && (PA_FITTED == PA_NONE || (PA_FITTED == PA_AW87319 && !AW_ANDROID))) {
+		printf("audio: mp_audio_steps=%u refused: the amplifier (and an AW87319's registers) not known from Android yet; "
+		    "taken as 2\n", steps);
+		steps = 2;
+	}
 	below_base = below_base > 90 * 8 ? 90 * 8 : below_base;
 	gain = gain > SPEAKER_GUARD_MAX_GAIN ? SPEAKER_GUARD_MAX_GAIN : gain;
 	secs = secs < 1 ? 1 : secs > 60 ? 60 : secs;
