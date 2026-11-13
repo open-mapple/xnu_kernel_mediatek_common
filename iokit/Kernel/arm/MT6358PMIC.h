@@ -40,6 +40,8 @@ public:
 	IOReturn writeRegulator(uint32_t addr, uint32_t mask, uint32_t value);
 	/* The fuel gauge's latch and the AUXADC request bits only (gMappleGaugeRegs): read-modify-write, not read back. */
 	IOReturn writeGauge(uint32_t addr, uint32_t mask, uint32_t value);
+	/* The codec's speaker path and the VIBR rail (gMappleAudioRegs), gains and voltage capped: RMW, read back. */
+	IOReturn writeAudio(uint32_t addr, uint32_t mask, uint32_t value);
 	/* The started instance, waiting for it if needed (NULL after timeout). */
 	static MTKPwrap *wait(void);
 

@@ -56,6 +56,7 @@ OSDefineMetaClassAndStructors(MTKPwrap, IOService);
 extern "C" void mt6631_wifi_reserve(void);
 extern "C" int mapple_rtc_read(uint64_t *secs);        /* MT6631WiFi.cpp: CONNSYS memory, before the scanout fragments it */
 extern "C" void mt6781_cpufreq_start(void);       /* osfmk/arm64/mt6781_cpufreq.c: CPU DVFS needs the PMIC */
+extern "C" void mtk_audio_start(void);            /* bsd/dev/mtk_audio.c: the codec and the motor are on the PMIC */
 
 static MTKPwrap *gMapplePwrap;
 
@@ -101,6 +102,7 @@ MTKPwrap::start(IOService *provider)
 	mt6631_wifi_reserve();
 	gMapplePwrap = this;
 	mt6781_cpufreq_start();
+	mtk_audio_start();
 	registerService();
 	{
 		/* the PMIC's RTC (kept by Android / LK, UTC): the calendar at boot (IOKitInitializeTime waits up to
@@ -300,6 +302,91 @@ MTKPwrap::writeGauge(uint32_t addr, uint32_t mask, uint32_t value)
 	return ret;
 }
 
+/*
+ * The MT6366 codec's speaker (line-out) path and the VIBR motor rail (bsd/dev/mtk_audio.c; registers from the realme
+ * 8i's mt6358.c and upmu_hw.h). A field may be written within [min, max]; min/max 0/0xffff = any value. The line-out
+ * gains never go above 0 dB (code 8, Android's default; lower codes are louder), VIBR never above 3.0 V (code 11, the
+ * phone's vib_vol). No regulator voltage of the codec's (VAUD28, VA12) can be written.
+ */
+static const struct {
+	uint16_t addr, mask, min, max;
+} gMappleAudioRegs[] = {
+	{ 0x0030, 0x0ff0, 0, 0xffff },  /* SMT_CON1: AUD pad Schmitt triggers */
+	{ 0x0088, 0x0f00, 0, 0xffff },  /* GPIO_DIR0: AUD MOSI pads */
+	{ 0x00d8, 0x0fff, 0, 0xffff },  /* GPIO_MODE2: AUD MOSI pad functions */
+	{ 0x07ac, 0x2000, 0, 0xffff },  /* DCXO_CW14: RG_XO_AUDIO_EN_M (shared register: this bit only) */
+	{ 0x220c, 0x0066, 0, 0xffff },  /* AUD_TOP_CKPDN_CON0: AUDNCP, ZCD13M, AUDIF, AUD clocks (not bit 0, accdet's) */
+	{ 0x223a, 0x0001, 0, 0xffff },  /* AUDNCP_CLKDIV_CON0..4: the negative charge pump */
+	{ 0x223c, 0x0001, 0, 0xffff },
+	{ 0x223e, 0x003f, 0, 0xffff },
+	{ 0x2240, 0x0001, 0, 0xffff },
+	{ 0x2242, 0x0003, 0, 0xffff },
+	{ 0x2288, 0x0001, 0, 0xffff },  /* AFE_UL_DL_CON0: AFE_ON */
+	{ 0x228a, 0x0001, 0, 0xffff },  /* AFE_DL_SRC2_CON0_L: DL SRC on */
+	{ 0x2292, 0x00c4, 0, 0xffff },  /* AUDIO_TOP_CON0: AFE_CTL, DAC_CTL, PWR_CLK power-downs */
+	{ 0x2296, 0xffff, 0, 0xffff },  /* AFUNC_AUD_CON0: scrambler */
+	{ 0x229a, 0x000f, 0, 0xffff },  /* AFUNC_AUD_CON2: SDM */
+	{ 0x2394, 0x0003, 0, 0xffff },  /* AUDENC_ANA_CON6: 26 MHz clock squarer */
+	{ 0x2408, 0x0006, 0, 0xffff },  /* AUDDEC_ANA_CON0: DAC R, DAC VA28 */
+	{ 0x240c, 0xffff, 0, 0xffff },  /* AUDDEC_ANA_CON2 */
+	{ 0x2416, 0x011f, 0, 0xffff },  /* AUDDEC_ANA_CON7: line-out power, bias, mux, short-circuit, stability */
+	{ 0x241a, 0xff01, 0, 0xffff },  /* AUDDEC_ANA_CON9 */
+	{ 0x241c, 0xffff, 0, 0xffff },  /* AUDDEC_ANA_CON10 */
+	{ 0x241e, 0xff87, 0, 0xffff },  /* AUDDEC_ANA_CON11: ZCD select, HP driver bias */
+	{ 0x2420, 0xffff, 0, 0xffff },  /* AUDDEC_ANA_CON12: IBIST */
+	{ 0x2422, 0x0011, 0, 0xffff },  /* AUDDEC_ANA_CON13: decoder reset, global bias */
+	{ 0x2424, 0x1055, 0, 0xffff },  /* AUDDEC_ANA_CON14: the codec's own 1.5 V LDOs (enables only) */
+	{ 0x2426, 0x0001, 0, 0xffff },  /* AUDDEC_ANA_CON15: the codec's own -1.2 V regulator (enable only) */
+	{ 0x2488, 0x07ff, 0, 0xffff },  /* ZCD_CON0: zero-cross detector */
+	{ 0x248a, 0x001f, 8, 0x1f },    /* ZCD_CON1 [4:0]: LOL gain, 8 (0 dB) .. 18 (-10 dB), 0x1f mute */
+	{ 0x248a, 0x0f80, 8, 0x1f },    /* ZCD_CON1 [11:7]: LOR gain, the same */
+	{ 0x1d08, 0x0001, 0, 0xffff },  /* LDO_VIBR_CON0: RG_LDO_VIBR_EN */
+	{ 0x1d0a, 0x0001, 0, 0xffff },  /* LDO_VIBR_OP_EN: SW_OP_EN */
+	{ 0x1e44, 0x0f00, 0, 11 },      /* VIBR_ANA_CON0: RG_VIBR_VOSEL, <= 3.0 V */
+};
+
+IOReturn
+MTKPwrap::writeAudio(uint32_t addr, uint32_t mask, uint32_t value)
+{
+	unsigned int i;
+	for (i = 0; i < sizeof(gMappleAudioRegs) / sizeof(gMappleAudioRegs[0]); i++) {
+		if (gMappleAudioRegs[i].addr == addr && mask != 0 && !(mask & ~gMappleAudioRegs[i].mask)) {
+			break;
+		}
+	}
+	bool ranged = i < sizeof(gMappleAudioRegs) / sizeof(gMappleAudioRegs[0]) &&
+	    (gMappleAudioRegs[i].min != 0 || gMappleAudioRegs[i].max != 0xffff);
+	if (i == sizeof(gMappleAudioRegs) / sizeof(gMappleAudioRegs[0]) || (value & ~mask) ||
+	    (ranged && (mask != gMappleAudioRegs[i].mask || value / (mask & -mask) < gMappleAudioRegs[i].min ||
+	    value / (mask & -mask) > gMappleAudioRegs[i].max))) {
+		IOLog("PWRAP: refused audio write 0x%04x mask 0x%x <- 0x%x\n", addr, mask, value);
+		return kIOReturnNotPermitted;
+	}
+	uint32_t old = 0, now = 0;
+	IOReturn ret = readPMIC(addr, &old);
+	if (ret != kIOReturnSuccess) {
+		return ret;
+	}
+	uint32_t v = (old & ~mask) | value;
+	IOLockLock(fLock);
+	ret = kIOReturnTimeout;
+	if (WACS_FSM(rd32(PWRAP_WACS2_RDATA)) == WACS_FSM_WFVLDCLR) {
+		wr32(PWRAP_WACS2_VLDCLR, 1);
+	}
+	if (waitFSM(WACS_FSM_IDLE)) {
+		wr32(PWRAP_WACS2_CMD, 0x80000000u | ((addr >> 1) << 16) | (v & 0xffff));
+		ret = waitFSM(WACS_FSM_IDLE) ? kIOReturnSuccess : kIOReturnTimeout;
+	}
+	IOLockUnlock(fLock);
+	if (ret == kIOReturnSuccess && (readPMIC(addr, &now) != kIOReturnSuccess || (now & mask) != value)) {
+		ret = kIOReturnIOError;
+	}
+	if (ret != kIOReturnSuccess) {
+		IOLog("PWRAP: audio 0x%04x 0x%04x -> 0x%04x (reads 0x%04x) FAILED\n", addr, old, v, now);
+	}
+	return ret;
+}
+
 MTKPwrap *
 MTKPwrap::wait(void)
 {
@@ -364,6 +451,16 @@ mtk_pwrap_write_gauge(uint32_t addr, uint32_t mask, uint32_t value)
 		return -1;
 	}
 	return gMapplePwrap->writeGauge(addr, mask, value) == kIOReturnSuccess ? 0 : -2;
+}
+
+/* bsd/dev/mtk_audio.c: the codec's and the motor's whitelisted fields (writeAudio). */
+extern "C" int
+mtk_pwrap_write_audio(uint32_t addr, uint32_t mask, uint32_t value)
+{
+	if (gMapplePwrap == NULL) {
+		return -1;
+	}
+	return gMapplePwrap->writeAudio(addr, mask, value) == kIOReturnSuccess ? 0 : -2;
 }
 
 extern "C" int

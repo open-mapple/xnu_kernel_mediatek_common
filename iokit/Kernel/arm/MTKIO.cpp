@@ -277,6 +277,16 @@ MTKI2C::wait(uint32_t busId)
 	return gMappleI2C[busId];
 }
 
+/* bsd/dev/mtk_audio.c: a pin from the device tree's "output-pins" driven (the speaker amplifier's). */
+extern "C" int
+mapple_gpio_set(uint32_t pin, int high)
+{
+	if (gMappleGPIO == NULL) {
+		return -1;
+	}
+	return gMappleGPIO->setOutput(pin, high != 0) == kIOReturnSuccess ? 0 : -2;
+}
+
 /* USB link "i2c"/"i2c8" commands (bsd/dev/usb_link.c): one transaction on a bus. */
 extern "C" int
 mapple_i2c_xfer_bus(uint32_t bus, uint8_t addr, const uint8_t *wbuf, uint32_t wlen, uint8_t *rbuf, uint32_t rlen)
