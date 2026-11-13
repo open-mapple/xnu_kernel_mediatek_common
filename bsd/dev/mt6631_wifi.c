@@ -57,6 +57,7 @@
 #include <sys/fcntl.h>
 #include <sys/uio.h>
 #include <sys/random.h>
+#include <sys/sysctl.h>
 #include <kern/locks.h>
 #include <kern/thread.h>
 #include <sys/kpi_mbuf.h>
@@ -1076,21 +1077,42 @@ desc(uint32_t off, uint32_t i)
 extern void flush_dcache(vm_offset_t addr, unsigned length, boolean_t phys);
 
 /*
- * Boot-arg mp_wifi_rx (default 3): bit 0, a descriptor's status word is read only after its line is cleaned and
- * invalidated through the cacheable mapping (the same pages are also mapped cacheable, by wd.va and the physmap, and a
- * non-cacheable read may be served from a line a prefetch left there), with barriers after the DMA index is read and
- * between a done bit and its buffer; bit 1, each resync skip is logged with the whole ring.
+ * Boot-arg mp_wifi_rx (default 6): bit 0, a descriptor's status word is read only after its line is cleaned and
+ * invalidated through the cacheable mapping, with barriers after the DMA index is read and between a done bit and its
+ * buffer; bit 1, each resync skip is logged with the whole ring; bit 2, RX entries go back to the DMA four at a time,
+ * a whole 64-byte line once all four are done with: the CPU never writes or cleans a line the DMA still owns part of
+ * (holes of exactly one line, runs 22 and 23).
  */
 static int
 rx_mode(void)
 {
 	static int mode = -1;
 	if (mode < 0) {
-		int m = 3;
+		int m = 6;
 		PE_parse_boot_argn("mp_wifi_rx", &m, sizeof(m));
 		mode = m;
 	}
 	return mode;
+}
+
+/* sysctl kern.mapple_wifi_rxholes: the resync steps over a hole of any length, not only one entry (frames in it are lost) */
+static int rx_holes;
+SYSCTL_INT(_kern, OID_AUTO, mapple_wifi_rxholes, CTLFLAG_RW | CTLFLAG_LOCKED, &rx_holes, 0, "");
+
+/* RX entry i of ring r is done with (copied out or stepped over): rearm it and give it back to the DMA */
+static void
+rx_give_back(uint32_t r, uint32_t i)
+{
+	uint32_t first = (rx_mode() & 4) ? i - 3 : i;
+
+	if ((rx_mode() & 4) && (i & 3) != 3) {
+		return;                                 /* its line goes back with its last entry */
+	}
+	for (uint32_t k = first; k <= i; k++) {
+		desc(OFF_RX(r), k)[1] = (uint32_t)RX_BUF_LEN << 16;
+	}
+	mt6631_wifi_dma_flush(OFF_RX(r) + 16 * first, 16 * (i - first + 1));
+	wr(WF_RX_RING(r) + 8, i);
 }
 
 static uint32_t
@@ -1178,9 +1200,7 @@ wfdma_rx(uint32_t r, uint8_t *out, uint32_t max, uint32_t us)
 			}
 			mt6631_wifi_dma_flush(boff, BUF_SZ);
 			memcpy(out, wd.va + boff, MIN(n, max));
-			d[1] = (uint32_t)RX_BUF_LEN << 16;
-			mt6631_wifi_dma_flush(OFF_RX(r) + 16 * i, 16);
-			wr(WF_RX_RING(r) + 8, i);              /* give the entry back */
+			rx_give_back(r, i);
 			wd.rxIdx[r] = (i + 1) % RING_N;
 			wd.rxGot[r]++;
 			return n ? n : 1;
@@ -1196,7 +1216,14 @@ wfdma_rx(uint32_t r, uint8_t *out, uint32_t max, uint32_t us)
 	if (rx_mode() & 1) {
 		__builtin_arm_dmb(0xf);                 /* the DMA index before the descriptors */
 	}
-	if (didx != i && (desc_d1(OFF_RX(r), (i + 1) % RING_N) & DESC_DMADONE)) {
+	bool later = false;
+	for (uint32_t k = (i + 1) % RING_N; didx != i && k != didx && !later; k = (k + 1) % RING_N) {
+		later = (desc_d1(OFF_RX(r), k) & DESC_DMADONE) != 0;
+		if (!rx_holes) {
+			break;                          /* only the next entry */
+		}
+	}
+	if (later) {
 		wd.rxSkipped[r]++;
 		wd.rxSkipD1[r] = d[1];
 		if ((rx_mode() & 2) && wd.rxSkipped[r] <= 16) {
@@ -1214,8 +1241,7 @@ wfdma_rx(uint32_t r, uint8_t *out, uint32_t max, uint32_t us)
 			    wd.rxSkipped[r], i, didx, rd(WF_RX_RING(r) + 8) & 0xfff, wd.rxGot[r], d[1],
 			    desc(OFF_RX(r), (i + 1) % RING_N)[1], seen, fresh);
 		}
-		d[1] = (uint32_t)RX_BUF_LEN << 16;
-		wr(WF_RX_RING(r) + 8, i);
+		rx_give_back(r, i);
 		wd.rxIdx[r] = (i + 1) % RING_N;
 	}
 	return 0;
