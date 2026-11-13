@@ -3,7 +3,7 @@
 # The kernel's header is all it needs, and an empty sys/ioccom.h beside it (the ioctl numbers are not used).
 set -e
 cd "$(dirname "$0")/.."
-SRC=xnu-src/xnu-8796.121.2/bsd
+SRC=bsd
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 mkdir -p "$tmp/sys"

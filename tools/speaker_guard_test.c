@@ -4,7 +4,7 @@
  * are tried on the phone, for music-like noise, and for the tone once it stops (the cooling).
  *
  *   cc -O2 -DKERNEL -I<a directory with sys/mapple_audio.h and a sys/ioccom.h> tools/speaker_guard_test.c \
- *      xnu-src/xnu-8796.121.2/bsd/dev/speaker_guard.c -lm -o guard_test && ./guard_test
+ *      bsd/dev/speaker_guard.c -lm -o guard_test && ./guard_test
  * (tools/speaker-guard-test.sh does that.)
  */
 #include <math.h>

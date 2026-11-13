@@ -1,6 +1,6 @@
 /*
  * The speakers' guard: what the samples go through on their way to the phone's two amplifiers
- * (drivers/audio/hakios.sound.c's feeder), in place of the protection Android has in the audio DSP.
+ * (the backend's feeder: bsd/dev/mtk_audio.c), in place of the protection Android has in the audio DSP.
  *
  * Under Android the DSP runs Awinic's algorithm (SKTune, "aw882xx_rx_switch") with each
  * speaker's calibration: it keeps the cone's excursion and the voice coil's temperature in
@@ -26,8 +26,8 @@
  *   peaks      no sample above 3 dB under full scale at Android's level: a limiter that turns
  *              the level down at the sample that would go over (so none does) and lets it come
  *              back with a time constant of 43 ms
- *   monitor    a further reduction that the amplifiers' watch asks for (hakios.speaker.c:
- *              Android's table for a cold amplifier, and a low battery)
+ *   monitor    a further reduction that an amplifier's own watch asks for (HakiOS's Awinic smart
+ *              amplifiers had one; the MediaTek phones' analog amplifiers have none)
  *
  * Before all that, a gain (sound_gain, at most 12 dB): Darwin's own processing for the iPhone X's
  * speaker keeps even a full-scale tone at its top volume 12.6 to 14.3 dB under full scale, so
