@@ -609,9 +609,7 @@ wn_set_assoc(const struct apple80211req *req)
 			err = EINVAL;
 			goto done;
 		}
-		printf("WLAN: ASSOCIATE \"%.*s\" %02x:%02x:%02x:%02x:%02x:%02x %s\n", j.ssid_len, j.ssid, j.bssid[0],
-		    j.bssid[1], j.bssid[2], j.bssid[3], j.bssid[4], j.bssid[5], !j.has_pmk ? "open" :
-		    cipher == 10 ? "passphrase" : "PMK");
+		printf("WLAN: ASSOCIATE %s\n", !j.has_pmk ? "open" : cipher == 10 ? "passphrase" : "PMK");
 		err = mt6631_wifi_join(&j);
 done:
 		bzero(&j, sizeof(j));
@@ -750,7 +748,7 @@ mt6631_wlan_attach(void)
 	}
 	ifnet_set_lladdr(wn.ifp, mac, ETHER_ADDR_LEN);
 	bpfattach(wn.ifp, DLT_EN10MB, ETHER_HDR_LEN);
-	printf("WLAN: en0 %02x:%02x:%02x:%02x:%02x:%02x\n", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+	printf("WLAN: en0 attached\n");
 }
 
 /* USB link "wifi wlan": what wifid asked */

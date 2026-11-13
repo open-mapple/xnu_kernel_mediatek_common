@@ -1584,7 +1584,7 @@ wifi_cap(char *out, size_t len, size_t o)
 			    (const char *)d + 4, (const char *)d + 8);
 			break;
 		case 0x7:
-			say("cap: MAC %02x:%02x:%02x:%02x:%02x:%02x (efuse)\n", d[0], d[1], d[2], d[3], d[4], d[5]);
+			say("cap: MAC from efuse\n");
 			break;
 		case 0x8:
 			say("cap: phy: HT %u VHT %u 5 GHz %u max bandwidth %u (0=20 1=40 2=80), nss %u, LDPC %u\n", d[0], d[1],
@@ -1683,9 +1683,8 @@ wifi_init(char *out, size_t len, size_t o)
 	mt6631_wifi_mac(wl.mac);
 	memcpy(nv + 4, wl.mac, 6);
 	uint16_t cc = (uint16_t)(nv[10] << 8 | nv[11]);
-	say("init: NVRAM %s (version 0x%04x), MAC %02x:%02x:%02x:%02x:%02x:%02x%s, country %c%c\n", src, nv[0] | nv[1] << 8,
-	    wl.mac[0], wl.mac[1], wl.mac[2], wl.mac[3], wl.mac[4], wl.mac[5], factory ? " (factory MAC replaced by en0's)" : "",
-	    nv[10] ? nv[10] : '0', nv[11] ? nv[11] : '0');
+	say("init: NVRAM %s (version 0x%04x)%s, country %c%c\n", src, nv[0] | nv[1] << 8,
+	    factory ? ", factory MAC replaced by en0's" : "", nv[10] ? nv[10] : '0', nv[11] ? nv[11] : '0');
 
 	int err = 0;
 	err |= wifi_cmd(CID_DUMMY, true, NULL, 0, 0, NULL, 0, 0, out, len, &o);
@@ -2319,9 +2318,7 @@ sta_up(char *out, size_t len, size_t *po)
 	sj.result = 1;
 	vn.bits |= NOTE_ASSOC;
 	vn.assoc = 1;
-	say("join: CONNECTED to \"%.*s\" %02x:%02x:%02x:%02x:%02x:%02x ch %u aid %u%s\n", sj.ap.ssid_len, sj.ap.ssid,
-	    sj.ap.bssid[0], sj.ap.bssid[1], sj.ap.bssid[2], sj.ap.bssid[3], sj.ap.bssid[4], sj.ap.bssid[5], sj.ap.ch,
-	    sj.aid, sj.rsn ? ", WPA2 keys installed" : " (open)");
+	say("join: CONNECTED ch %u aid %u%s\n", sj.ap.ch, sj.aid, sj.rsn ? ", WPA2 keys installed" : " (open)");
 	*po = o;
 }
 
@@ -2425,9 +2422,8 @@ sta_join(const struct vwl_join *j, char *out, size_t len, size_t *po)
 			sj.rates[sj.nrates++] = r[2 + i];
 		}
 	}
-	say("join: \"%.*s\" %02x:%02x:%02x:%02x:%02x:%02x ch %u %d dBm, %s%s%s\n", e->ssid_len, e->ssid, e->bssid[0],
-	    e->bssid[1], e->bssid[2], e->bssid[3], e->bssid[4], e->bssid[5], e->ch, e->rssi, sj.rsn ? "WPA2-PSK" : "open",
-	    sj.ht ? ", HT" : "", sj.wmm ? ", WMM" : "");
+	say("join: ch %u %d dBm, %s%s%s\n", e->ch, e->rssi, sj.rsn ? "WPA2-PSK" : "open", sj.ht ? ", HT" : "",
+	    sj.wmm ? ", WMM" : "");
 
 	if (hw_ch_privilege(true) != 0) {
 		sta_fail(2, "no channel privilege", out, len, &o);

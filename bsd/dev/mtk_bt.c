@@ -174,8 +174,14 @@ skel_h4_length(const uint8_t *b, unsigned have)
 static void
 skel_dump(const char *direction, const uint8_t *bytes, unsigned length, uint32_t *counter)
 {
-	char text[3 * 32 + 1];
-	unsigned n = length < 32 ? length : 32;
+	/*
+	 * Headers only: the rest can carry device addresses and names (BD_ADDR, inquiry and advertising reports, connections).
+	 * Command Complete/Status keep opcode and status, which end before any parameter.
+	 */
+	char text[3 * 7 + 1];
+	unsigned n = length >= 2 && bytes[0] == 0x04 && (bytes[1] == 0x0e || bytes[1] == 0x0f) ? 7 : 4;
+
+	n = length < n ? length : n;
 
 	if ((*counter)++ >= SKEL_SAID_PACKETS) {
 		return;

@@ -140,10 +140,9 @@ btsk_sync_tx(__unused kern_nexus_provider_t nxprov, __unused kern_nexus_t nexus,
 					static unsigned slots;
 
 					if (++slots > 90 && slots < 200) {
-						LOG("TX slot %u, %u bytes at offset %u: %02x %02x %02x %02x %02x %02x %02x %02x", slots, length,
-						    offset, base[offset], length > 1 ? base[offset + 1] : 0, length > 2 ? base[offset + 2] : 0,
-						    length > 3 ? base[offset + 3] : 0, length > 4 ? base[offset + 4] : 0, length > 5 ? base[offset + 5] : 0,
-						    length > 6 ? base[offset + 6] : 0, length > 7 ? base[offset + 7] : 0);
+						/* the header only: a command's parameters can hold a remote device's address */
+						LOG("TX slot %u, %u bytes at offset %u: %02x %02x %02x %02x", slots, length, offset, base[offset],
+						    length > 1 ? base[offset + 1] : 0, length > 2 ? base[offset + 2] : 0, length > 3 ? base[offset + 3] : 0);
 					}
 					mtk_bt_send(base + offset, length);
 				}

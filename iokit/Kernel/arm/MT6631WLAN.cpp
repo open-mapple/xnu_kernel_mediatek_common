@@ -146,8 +146,7 @@ MT6631WLAN::start(IOService *provider)
 	registerService();
 	ifc->registerService();
 	gMappleWLANInterface = ifc;
-	IOLog("WLAN: IO80211Controller + en0 interface registered, MAC %02x:%02x:%02x:%02x:%02x:%02x\n", mac[0], mac[1],
-	    mac[2], mac[3], mac[4], mac[5]);
+	IOLog("WLAN: IO80211Controller + en0 interface registered\n");
 	return true;
 }
 
