@@ -248,7 +248,7 @@ static bool sia_i2c;            /* the SIA8109 answers on I2C (0x41 reads 0x09):
  */
 #define AW_ANDROID      1
 #define AW_UNLOCK       0x64            /* Android writes 0x2c here before it reads the ID and before its registers; */
-#define AW_UNLOCK_VALUE 0x2c            /* not read back, as Android doesn't */
+#define AW_UNLOCK_VALUE 0x2c            /* not read back, as Android doesn't (nor SYSCTRL 0: it reads 0x01 after it) */
 static const uint8_t aw_android[10] = { 0x9b, 0x07, 0x28, 0x05, 0x04, 0x09, 0x05, 0x52, 0xa8, 0x03 };
 
 /* SIA8109: Android's register values (sia8109_regs.c), the only ones written; 0x02 = 0xcc is its boost, 8.5 V. */
@@ -277,7 +277,8 @@ pa_write(uint8_t addr, uint8_t reg, uint8_t value)
 		return false;
 	}
 	if (mapple_i2c_xfer_bus(PA_BUS, addr, w, 2, NULL, 0) != 0 ||
-	    (!(addr == AW87319 && reg == AW_UNLOCK) && (!pa_read(addr, reg, &now) || now != value))) {
+	    (!(addr == AW87319 && (reg == AW_UNLOCK || (reg == 0x01 && value == 0))) &&
+	    (!pa_read(addr, reg, &now) || now != value))) {
 		printf("audio: amplifier: %#x reg %#x <- %#x FAILED (reads %#x)\n", addr, reg, value, now);
 		return false;
 	}
