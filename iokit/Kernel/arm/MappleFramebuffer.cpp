@@ -1397,7 +1397,7 @@ AppleCLCD::present(const uint8_t *rec, bool force, uint64_t jobs)
 #define RDMA_SIZE_CON_1         0x018
 #define RSZ_ENABLE              0x000   /* bit 0 */
 #define RSZ_CON_1               0x004   /* bit 0 horizontal, bit 1 vertical */
-#define RSZ_CON_2               0x008   /* Android's RGB888: power saving (bit 9) and RGB bit mode (bit 28) */
+#define RSZ_CON_2               0x008   /* bit 9 power saving: Android's RGB999 (its RGB888's bit 28 reads 0 on MT6781) */
 #define RSZ_INT_FLAG            0x00c   /* bit 4 size error */
 #define RSZ_IN_IMAGE            0x010
 #define RSZ_OUT_IMAGE           0x014
@@ -1743,7 +1743,7 @@ AppleCLCD::rszPrepare(void)
 	}
 	const struct mapple_rsz &c = fRsz;
 	if (why == NULL && (!rszWrite(D_RSZ0, RSZ_SHADOW_CTRL, 1, 1) || !rszWrite(D_RSZ0, RSZ_CON_1, ~0u, 0x3) ||
-	    !rszWrite(D_RSZ0, RSZ_CON_2, ~0u, (1u << 28) | (1u << 9)) ||
+	    !rszWrite(D_RSZ0, RSZ_CON_2, ~0u, 1u << 9) ||
 	    !rszWrite(D_RSZ0, RSZ_IN_IMAGE, ~0u, ((uint32_t)c.in_h << 16) | (uint32_t)c.in_w) ||
 	    !rszWrite(D_RSZ0, RSZ_OUT_IMAGE, ~0u, panel) || !rszWrite(D_RSZ0, RSZ_STEP_H, ~0u, c.step_x) ||
 	    !rszWrite(D_RSZ0, RSZ_STEP_V, ~0u, c.step_y) || !rszWrite(D_RSZ0, RSZ_H_INT, 0xffff, c.off_x >> 15) ||
