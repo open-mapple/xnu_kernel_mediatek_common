@@ -1168,12 +1168,11 @@ AppleCLCD::present(const uint8_t *rec, bool force, uint64_t jobs)
 	 * Scanout costs no copy, so a scanned-out frame skips the CPU duty limit; a frame that falls back to the copy
 	 * does not (with scanout "on" but every frame copied, copies used to run at every vsync and early present).
 	 */
-	fScanLive = fScanOn && scanout(rec);
-	if (fScanLive) {
-		IOLockUnlock(fScanLock);
-		fGpuTicks = 0;
-		return true;
-	}
+	/*
+	 * The GUI presents: the screen console goes quiet (mp_fb_noconsole). 0193: before the scanout return; it used
+	 * to be after it, so with every frame scanned out the console kept drawing kernel lines into LK's buffer, seen
+	 * whenever that buffer was on screen (panel wake, phone 0192).
+	 */
 	if (!fConsolePaused) {
 		int quiet = 0;
 		fConsolePaused = true;
@@ -1182,6 +1181,12 @@ AppleCLCD::present(const uint8_t *rec, bool force, uint64_t jobs)
 			 * writes the read-only-late cons_ops_index and panics. */
 			mapple_console_muted = 1;
 		}
+	}
+	fScanLive = fScanOn && scanout(rec);
+	if (fScanLive) {
+		IOLockUnlock(fScanLock);
+		fGpuTicks = 0;
+		return true;
 	}
 	uint64_t t0 = mach_absolute_time();
 
