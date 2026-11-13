@@ -92,6 +92,9 @@
  * display pipe's CCORR (0x1400b000, Xiaomi mtk_disp_ccorr.c: 3x3, 1.0 = 0x800 on MT6781, 13-bit signed, two per
  * register; CFG bit 0 relay / bit 1 engine). Identity = relay (bypass).
  *
+ * Resizer (boot-arg mp_fb_rsz, 1 = read only, 2 = on; link "disp rsz [on|off]"): the letterbox's scaling done by the
+ * display pipe's RSZ0 for frames that are scanned out (see its section).
+ *
  * The panel memory itself is published as an IOSurface and returned as the
  * default framebuffer surface. The kernel text console keeps drawing over
  * the GUI by default: boot-arg mp_fb_noconsole=1 stops drawing it from
@@ -261,8 +264,27 @@ public:
 
 	/* direct scanout (see the top) */
 	IOLock       *fScanLock;      /* scanout state: present() vs. the link command */
-	IOMemoryMap  *fDispMap[6];    /* OVL0, OVL0_2L, SMI larb0, larb1, DSI0 (0189), CCORR0 (0191) */
-	vm_offset_t   fDisp[6];
+	IOMemoryMap  *fDispMap[10];   /* OVL0, OVL0_2L, SMI larb0, larb1, DSI0 (0189), CCORR0 (0191); mp_fb_rsz: MMSYS, MUTEX, RDMA0, RSZ0 */
+	vm_offset_t   fDisp[10];
+	/* mp_fb_rsz (see the resizer section) */
+	uint32_t      fRszArg;
+	struct mapple_rsz fRsz;
+	bool          fRszWant;       /* "disp rsz on|off" */
+	bool          fRszReady;      /* rszPrepare done: clock on, RSZ0 configured, the pipe writes listed */
+	bool          fRszLive;       /* the pipe runs OVL0 -> RSZ0 -> RDMA0 now */
+	bool          fRszDumped;
+	const char   *fRszWhy;        /* why the resizer is off for good, NULL = not failed */
+	uint32_t      fRszBad;        /* the write that failed: block << 16 | offset */
+	uint32_t      fRszN;          /* pipe writes, in switch-on order */
+	uint8_t       fRszBlk[10];
+	uint16_t      fRszOff[10];
+	uint32_t      fRszMask[10], fRszOn[10], fRszSave[10];
+	uint64_t      fRszSwitches;
+	bool rszWrite(int blk, uint32_t off, uint32_t mask, uint32_t value);
+	bool rszPrepare(void);
+	void rszDump(char **out, char *end);
+	void rszLog(void);
+	bool rszPipe(bool on);
 	/* 0189 panel refresh (see the top) */
 	uint32_t      fPanelHz;       /* the panel's refresh now: 60 or 120 */
 	uint32_t      fHzMode;        /* 60, 120, 1 = auto */
@@ -311,6 +333,7 @@ public:
 		int           buf;            /* panel buffer 0/1, -1 = an IOSurface (scanout) */
 		MappleSurface *surface;        /* retained while the layer may read it */
 		uint32_t      swap;           /* the swap whose surface the layer reads (scanout), 0 = a panel buffer */
+		bool          rsz;            /* the whole surface, through the resizer (mp_fb_rsz) */
 	};
 	volatile uint32_t fShownSwap, fNextSwap;      /* fShown.swap / fNext.swap (valid), read without fScanLock */
 	Target        fShown, fNext;
@@ -444,8 +467,14 @@ AppleCLCD::start(IOService *provider)
 	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
 	uint32_t lb = 0;
 	PE_parse_boot_argn("mp_fb_letterbox", &lb, sizeof(lb));
+	PE_parse_boot_argn("mp_fb_rsz", &fRszArg, sizeof(fRszArg));
+	if (lb == 0 && fRszArg >= 2) {
+		lb = 1;                 /* frames the resizer cannot take are scaled on the CPU to the same picture */
+	}
 	if (lb != 0 && fLogicalW == MAPPLE_FB_LOGICAL_W) {
 		fLb = mapple_lb_rect((int32_t)fWidth, (int32_t)fHeight, (int32_t)fLogicalW, (int32_t)fLogicalH, lb);
+		fRsz = mapple_rsz_config((int32_t)fWidth, (int32_t)fHeight, (int32_t)fLogicalW, (int32_t)fLogicalH, fLb);
+		fRszWant = fRszArg >= 2;
 		void *m = IOMallocData((size_t)fLogicalW * 16 + (size_t)(fLb.w + fLb.h) * 4);
 		if (m == NULL) {
 			fLb.w = 0;
@@ -520,6 +549,9 @@ AppleCLCD::start(IOService *provider)
 	if (fHzMode != 60 && fHzMode != 120 && fHzMode != 1) {
 		fHzMode = 60;
 	}
+	if (fRszWant) {
+		fHzMode = 60;           /* mp_fb_rsz switches the pipe in the 60 Hz blanking (8 ms; 120 Hz has 70 us) */
+	}
 	fHzWant = fHzMode == 120 ? 120 : 0;     /* done at the first vsync tick with frame ends known */
 	fMaxNits = 500;
 	PE_parse_boot_argn_alias("mp_panel_nits", "vivapanelnits", &fMaxNits, sizeof(fMaxNits));
@@ -535,7 +567,7 @@ AppleCLCD::start(IOService *provider)
 	nanoseconds_to_absolutetime((uint64_t)MIN(MAX(us, 200u), 4000u) * 1000, &fLead);
 	nanoseconds_to_absolutetime(20 * 1000, &fSlack);
 	uint32_t scan = 0;
-	if (PE_parse_boot_argn_alias("mp_fb_scanout", "vivascanout", &scan, sizeof(scan)) && scan != 0) {
+	if ((PE_parse_boot_argn_alias("mp_fb_scanout", "vivascanout", &scan, sizeof(scan)) && scan != 0) || fRszWant) {
 		/* display-sized surfaces from now on contiguous; LK's layer is looked up at the first swap */
 		mapple_surface_scanout_w = fLogicalW;
 		mapple_surface_scanout_h = fLogicalH;
@@ -1095,6 +1127,10 @@ AppleCLCD::present(const uint8_t *rec, bool force, uint64_t jobs)
 		fFlipTried = true;              /* once: findLKLayer and the frame-end calibration (< 0.1 s) */
 		flipSetup(NULL, NULL);
 	}
+	if (fRszArg != 0 && !fRszDumped) {
+		fRszDumped = true;
+		rszLog();
+	}
 	/*
 	 * Scanout costs no copy, so a scanned-out frame skips the CPU duty limit; a frame that falls back to the copy
 	 * does not (with scanout "on" but every frame copied, copies used to run at every vsync and early present).
@@ -1321,6 +1357,60 @@ AppleCLCD::present(const uint8_t *rec, bool force, uint64_t jobs)
 #define PANEL_LEVEL_MAX         2047
 #define PANEL_VFP_60            2452
 #define PANEL_VFP_120           20
+/*
+ * mp_fb_rsz: MediaTek's DRM driver for MT6781 (realme kernel drivers/gpu/drm/mediatek: mtk_drm_ddp.c routing and mutex
+ * bits, mtk_disp_rsz.c, mtk_disp_ovl.c; drivers/clk/mediatek/clk-mt6781.c MMSYS gates; dts mt6781.dts).
+ */
+#define DISP_MMSYS_PA           0x14000000ull
+#define DISP_MUTEX_PA           0x14001000ull
+#define DISP_RDMA0_PA           0x14007000ull
+#define DISP_RSZ0_PA            0x14008000ull
+#define D_MMSYS                 6       /* fDisp[] */
+#define D_MUTEX                 7
+#define D_RDMA0                 8
+#define D_RSZ0                  9
+#define MMSYS_CG_CON0           0x100   /* 1 = clock gated */
+#define MMSYS_CG_SET0           0x104
+#define MMSYS_CG_CLR0           0x108
+#define CG_MUTEX0               (1u << 0)
+#define CG_OVL0                 (1u << 2)
+#define CG_RDMA0                (1u << 3)
+#define CG_OVL0_2L              (1u << 4)
+#define CG_RSZ0                 (1u << 7)
+#define CG_POSTMASK0            (1u << 14)
+#define MMSYS_OVL_CON           0xf04   /* bit 0 OVL0 blends to its output, bit 3 OVL0_2L into OVL0's background */
+#define MMSYS_OVL0_2L_MOUT_EN   0xf14
+#define MMSYS_OVL0_MOUT_EN      0xf18   /* bit 0 RDMA0, 1 RSZ0, 2 WDMA0 */
+#define MMSYS_RSZ0_MOUT_EN      0xf1c   /* bit 0 RDMA0 */
+#define MMSYS_RSZ0_SEL_IN       0xf24   /* 0 OVL0_2L, 1 OVL0 */
+#define MMSYS_RDMA0_SEL_IN      0xf28   /* 0 OVL0, 1 RSZ0, 2 OVL0_2L */
+#define MMSYS_DSI0_SEL_IN       0xf30
+#define MUTEX_EN(n)             (0x20 + 0x20 * (n))
+#define MUTEX_SOF(n)            (0x2c + 0x20 * (n))
+#define MUTEX_MOD(n)            (0x30 + 0x20 * (n))     /* bit 0 OVL0, 1 OVL0_2L, 2 RDMA0, 3 RSZ0 */
+#define OVL_DATAPATH_CON        0x024   /* bit 2: background from the previous OVL */
+#define OVL_ROI_BGCLR           0x028
+#define OVL_L_EN(n)             (1u << (n))
+#define RDMA_INT_STATUS         0x004   /* bit 4 FIFO underflow */
+#define RDMA_GLOBAL_CON         0x010
+#define RDMA_SIZE_CON_0         0x014
+#define RDMA_SIZE_CON_1         0x018
+#define RSZ_ENABLE              0x000   /* bit 0 */
+#define RSZ_CON_1               0x004   /* bit 0 horizontal, bit 1 vertical */
+#define RSZ_CON_2               0x008   /* Android's RGB888: power saving (bit 9) and RGB bit mode (bit 28) */
+#define RSZ_INT_FLAG            0x00c   /* bit 4 size error */
+#define RSZ_IN_IMAGE            0x010
+#define RSZ_OUT_IMAGE           0x014
+#define RSZ_STEP_H              0x018
+#define RSZ_STEP_V              0x01c
+#define RSZ_H_INT               0x020
+#define RSZ_H_SUB               0x024
+#define RSZ_V_INT               0x028
+#define RSZ_V_SUB               0x02c
+#define RSZ_DEBUG               0x048
+#define RSZ_SHADOW_CTRL         0x0f0   /* bit 0 bypass the shadow registers (Android does on MT6781) */
+#define RSZ_IN_W_MAX            1200    /* MT6781's tile length */
+#define RSZ_IN_H_MAX            4096
 
 
 static inline uint32_t
@@ -1367,6 +1457,9 @@ mapple_fb_panic_show(void)
 {
 	AppleCLCD *fb = gMappleFB;
 	if (fb != NULL && fb->fScanOvl >= 0) {
+		if (fb->fRszLive) {
+			fb->rszPipe(false);
+		}
 		vm_offset_t base = fb->fDisp[fb->fScanOvl];
 		disp_wr(base, fb->fScanPitchMsbReg, fb->fLkPitchMsb);
 		disp_wr(base, fb->fScanPitchReg, fb->fLkPitch);
@@ -1377,8 +1470,9 @@ mapple_fb_panic_show(void)
 bool
 AppleCLCD::dispMap(void)
 {
-	static const uint64_t pa[6] = { DISP_OVL0_PA, DISP_OVL0_2L_PA, SMI_LARB0_PA, SMI_LARB1_PA, DISP_DSI0_PA, DISP_CCORR0_PA };
-	for (int i = 0; i < 6; i++) {
+	static const uint64_t pa[10] = { DISP_OVL0_PA, DISP_OVL0_2L_PA, SMI_LARB0_PA, SMI_LARB1_PA, DISP_DSI0_PA, DISP_CCORR0_PA,
+		DISP_MMSYS_PA, DISP_MUTEX_PA, DISP_RDMA0_PA, DISP_RSZ0_PA };
+	for (int i = 0; i < (fRszArg != 0 ? 10 : 6); i++) {
 		if (fDispMap[i] != NULL) {
 			continue;
 		}
@@ -1386,7 +1480,10 @@ AppleCLCD::dispMap(void)
 		fDispMap[i] = md != NULL ? md->map(kIOMapInhibitCache) : NULL;
 		OSSafeReleaseNULL(md);
 		if (fDispMap[i] == NULL) {
-			return false;
+			if (i < 6) {
+				return false;
+			}
+			continue;               /* mp_fb_rsz's blocks: their users check fDisp[] */
 		}
 		fDisp[i] = (vm_offset_t)fDispMap[i]->getVirtualAddress();
 	}
@@ -1464,7 +1561,8 @@ AppleCLCD::scanout(const uint8_t *rec)
 	MappleSurface *s = layers == 1 ? mapple_surface_copy(id) : NULL;
 	const char *why = NULL;
 	uint64_t pa = 0;
-	if (fLb.w != 0) {
+	bool rsz = fLb.w != 0 && fRszWant && fRszWhy == NULL && fFlipReady && fPanelHz == 60;
+	if (fLb.w != 0 && !rsz) {
 		why = "letterbox: the picture is scaled";
 	} else if (layers != 1) {
 		why = "not exactly one layer";
@@ -1486,6 +1584,9 @@ AppleCLCD::scanout(const uint8_t *rec)
 	if (why == NULL && fScanOvl < 0 && !findLKLayer(NULL, NULL)) {
 		why = "LK's layer not found";
 	}
+	if (why == NULL && rsz && !fRszReady && !rszPrepare()) {
+		why = fRszWhy;
+	}
 	if (why != NULL) {
 		if (fScanWhy != why) {
 			IOLog("FB: scanout: copying (%s)\n", why);
@@ -1500,15 +1601,16 @@ AppleCLCD::scanout(const uint8_t *rec)
 	}
 	mapple_surface_before_device_read(s);    /* CPU-drawn pixels out of the caches */
 	Target t;
-	t.addr = (uint32_t)(pa + s->offset + (uint64_t)fOffY * s->bytesPerRow + (uint64_t)fOffX * 4);
+	t.rsz = rsz;
+	t.addr = (uint32_t)(pa + s->offset + (rsz ? 0 : (uint64_t)fOffY * s->bytesPerRow + (uint64_t)fOffX * 4));
 	t.pitchMsb = (fLkPitchMsb & ~0xfu) | ((s->bytesPerRow >> 16) & 0xf);
 	t.pitch = (fLkPitch & ~0xffffu) | (s->bytesPerRow & 0xffff);
 	t.buf = -1;
 	t.surface = s;                          /* keeps the memory alive while the OVL reads it */
 	t.swap = get32(rec, 0x50);
 	if (fShown.buf >= 0 || fScanWhy != NULL) {
-		IOLog("FB: scanout: %s reads surface %u at 0x%08x (pitch %u)%s\n", fScanLayer, s->id, t.addr,
-		    s->bytesPerRow, fFlipReady ? " from the next frame end" : "");
+		IOLog("FB: scanout: %s reads surface %u at 0x%08x (pitch %u)%s%s\n", fScanLayer, s->id, t.addr,
+		    s->bytesPerRow, fFlipReady ? " from the next frame end" : "", rsz ? ", through the resizer" : "");
 		fScanWhy = NULL;
 	}
 	show(t);
@@ -1526,6 +1628,264 @@ AppleCLCD::scanoutStop(void)
 	}
 }
 
+/*
+ * ---- mp_fb_rsz: the display pipe's resizer ----
+ * 1: read only, the routing, mutex, OVL0/OVL0_2L, RDMA0 and RSZ0 state and the clock gates logged at the first frame
+ * ("disp rsz" on the link). 2: the letterbox (MappleLetterbox.h) on RSZ0 for frames scanned out: OVL0 composes the
+ * whole surface at (lx, ly) of a bigger frame over its black background, MMSYS routes OVL0 -> RSZ0 -> RDMA0 instead of
+ * OVL0 -> RDMA0, RSZ0 (in mutex 0) scales the frame onto the panel. Frames that cannot be scanned out go through LK's
+ * path and the CPU letterbox: the same picture. The pipe changes only at a frame end (shadow registers bypassed on
+ * MT6781: writes take effect at once), from LK's values read beforehand and put back the same way.
+ * Android never routes RSZ0 this way: its MT6781 RSZ0 sits between OVL0_2L and OVL0 and only scales up.
+ */
+
+/* mp_fb_rsz writes nothing else: block, register, the bits that may change. */
+static const struct {
+	uint8_t  blk;
+	uint16_t off;
+	uint32_t mask;
+} mapple_rsz_regs[] = {
+	{ D_MMSYS, MMSYS_CG_SET0, CG_RSZ0 }, { D_MMSYS, MMSYS_CG_CLR0, CG_RSZ0 },
+	{ D_MMSYS, MMSYS_OVL0_MOUT_EN, 0x3 }, { D_MMSYS, MMSYS_RSZ0_MOUT_EN, 0x1 },
+	{ D_MMSYS, MMSYS_RSZ0_SEL_IN, 0x1 }, { D_MMSYS, MMSYS_RDMA0_SEL_IN, 0x3 },
+	{ D_MUTEX, MUTEX_MOD(0), 1u << 3 },
+	{ 0, OVL_ROI_SIZE, 0x1fff1fff }, { 1, OVL_ROI_SIZE, 0x1fff1fff },
+	{ 0, OVL_L_SRC_SIZE(0), 0x1fff1fff }, { 0, OVL_L_SRC_SIZE(1), 0x1fff1fff }, { 0, OVL_L_SRC_SIZE(2), 0x1fff1fff },
+	{ 0, OVL_L_SRC_SIZE(3), 0x1fff1fff }, { 1, OVL_L_SRC_SIZE(0), 0x1fff1fff }, { 1, OVL_L_SRC_SIZE(1), 0x1fff1fff },
+	{ 0, OVL_L_OFFSET(0), 0x1fff1fff }, { 0, OVL_L_OFFSET(1), 0x1fff1fff }, { 0, OVL_L_OFFSET(2), 0x1fff1fff },
+	{ 0, OVL_L_OFFSET(3), 0x1fff1fff }, { 1, OVL_L_OFFSET(0), 0x1fff1fff }, { 1, OVL_L_OFFSET(1), 0x1fff1fff },
+	{ D_RSZ0, RSZ_ENABLE, 0x1 }, { D_RSZ0, RSZ_SHADOW_CTRL, 0x1 },
+	{ D_RSZ0, RSZ_CON_1, ~0u }, { D_RSZ0, RSZ_CON_2, ~0u }, { D_RSZ0, RSZ_IN_IMAGE, ~0u }, { D_RSZ0, RSZ_OUT_IMAGE, ~0u },
+	{ D_RSZ0, RSZ_STEP_H, ~0u }, { D_RSZ0, RSZ_STEP_V, ~0u }, { D_RSZ0, RSZ_H_INT, 0xffff }, { D_RSZ0, RSZ_H_SUB, 0x1fffff },
+	{ D_RSZ0, RSZ_V_INT, 0xffff }, { D_RSZ0, RSZ_V_SUB, 0x1fffff },
+};
+
+/* The one way to write: whitelisted bits only, read-modify-write and read back; the gate SET/CLR pair as given. */
+bool
+AppleCLCD::rszWrite(int blk, uint32_t off, uint32_t mask, uint32_t value)
+{
+	size_t i, n = sizeof(mapple_rsz_regs) / sizeof(mapple_rsz_regs[0]);
+	for (i = 0; i < n && !(mapple_rsz_regs[i].blk == blk && mapple_rsz_regs[i].off == off); i++) {
+	}
+	fRszBad = ((uint32_t)blk << 16) | off;
+	if (i == n || mask == 0 || (mask & ~mapple_rsz_regs[i].mask) || (value & ~mask)) {
+		return false;
+	}
+	vm_offset_t b = fDisp[blk];
+	if (blk == D_MMSYS && (off == MMSYS_CG_SET0 || off == MMSYS_CG_CLR0)) {
+		disp_wr(b, off, value);
+		return true;
+	}
+	disp_wr(b, off, (disp_rd(b, off) & ~mask) | value);
+	return (disp_rd(b, off) & mask) == value;
+}
+
+/*
+ * fScanLock, once, at the first frame that could go through the resizer: LK's path checked (read only), RSZ0's clock
+ * on and RSZ0 configured (in no path yet, disabled), the pipe writes listed with LK's values. false: fRszWhy.
+ */
+bool
+AppleCLCD::rszPrepare(void)
+{
+	const char *why = NULL;
+	if (!dispMap() || fDisp[D_MMSYS] == 0 || fDisp[D_MUTEX] == 0 || fDisp[D_RDMA0] == 0 || fDisp[D_RSZ0] == 0) {
+		fRszWhy = "display registers not mappable";
+		IOLog("FB: rsz: off (%s): frames scaled on the CPU\n", fRszWhy);
+		return false;
+	}
+	vm_offset_t m = fDisp[D_MMSYS], x = fDisp[D_MUTEX], z = fDisp[D_RSZ0], o0 = fDisp[0], o1 = fDisp[1];
+	uint32_t panel = (fHeight << 16) | fWidth, a = fScanAddrReg - OVL_L_ADDR(0), n = a / 0x20;
+	uint32_t cg = disp_rd(m, MMSYS_CG_CON0);
+	bool two = !(cg & CG_OVL0_2L) && (disp_rd(o1, OVL_EN) & 1);        /* OVL0_2L under OVL0 */
+	if (cg & (CG_MUTEX0 | CG_OVL0 | CG_RDMA0)) {
+		why = "a display clock is gated";
+	} else if (fScanAddrReg < OVL_L_ADDR(0) || a % 0x20 != 0 || n >= (fScanOvl ? 2u : 4u)) {
+		why = "LK's layer is an extended layer";
+	} else if (!(disp_rd(o0, OVL_EN) & 1) || disp_rd(o0, OVL_ROI_SIZE) != panel) {
+		why = "OVL0 off or not panel-sized";
+	} else if ((disp_rd(m, MMSYS_OVL0_MOUT_EN) & 7) != 1 || disp_rd(m, MMSYS_RDMA0_SEL_IN) != 0 ||
+	    disp_rd(m, MMSYS_RSZ0_MOUT_EN) != 0) {
+		why = "the path is not OVL0 -> RDMA0";
+	} else if (!(disp_rd(x, MUTEX_EN(0)) & 1) || (disp_rd(x, MUTEX_MOD(0)) & 0xf) != (two ? 0x7u : 0x5u)) {
+		why = "LK's path is not mutex 0's";
+	} else if (two && (!(disp_rd(m, MMSYS_OVL_CON) & (1u << 3)) || !(disp_rd(o0, OVL_DATAPATH_CON) & (1u << 2)) ||
+	    disp_rd(o1, OVL_ROI_SIZE) != panel)) {
+		why = "OVL0_2L is on but not OVL0's panel-sized background";
+	} else if (fScanOvl == 1 && !two) {
+		why = "LK's layer is on an OVL outside the path";
+	} else if ((disp_rd(fDisp[two ? 1 : 0], OVL_ROI_BGCLR) & 0xffffff) != 0) {
+		why = "the OVL background is not black";
+	} else if (fRsz.in_w > RSZ_IN_W_MAX || fRsz.in_h > RSZ_IN_H_MAX || fRsz.lx + (int32_t)fLogicalW > fRsz.in_w ||
+	    fRsz.ly + (int32_t)fLogicalH > fRsz.in_h) {
+		why = "the frame does not fit RSZ0";
+	}
+	for (int k = 0; why == NULL && k < 2; k++) {
+		uint32_t on = disp_rd(fDisp[k], OVL_SRC_CON) & (k ? 0x3u : 0xfu);
+		if (k == fScanOvl) {
+			on &= ~OVL_L_EN(n);
+		}
+		if ((k == 0 || two) && (on != 0 || (disp_rd(fDisp[k], OVL_DATAPATH_EXT_CON) & 7) != 0)) {
+			why = "other OVL layers are on (boot with mp_fb_onelayer=1)";
+		}
+	}
+	bool opened = false;
+	if (why == NULL && (cg & CG_RSZ0)) {
+		opened = rszWrite(D_MMSYS, MMSYS_CG_CLR0, CG_RSZ0, CG_RSZ0) && !(disp_rd(m, MMSYS_CG_CON0) & CG_RSZ0);
+		if (!opened) {
+			why = "RSZ0's clock did not start";
+		}
+	}
+	if (why == NULL && (disp_rd(z, RSZ_ENABLE) & 1)) {
+		why = "RSZ0 is in use";
+	}
+	const struct mapple_rsz &c = fRsz;
+	if (why == NULL && (!rszWrite(D_RSZ0, RSZ_SHADOW_CTRL, 1, 1) || !rszWrite(D_RSZ0, RSZ_CON_1, ~0u, 0x3) ||
+	    !rszWrite(D_RSZ0, RSZ_CON_2, ~0u, (1u << 28) | (1u << 9)) ||
+	    !rszWrite(D_RSZ0, RSZ_IN_IMAGE, ~0u, ((uint32_t)c.in_h << 16) | (uint32_t)c.in_w) ||
+	    !rszWrite(D_RSZ0, RSZ_OUT_IMAGE, ~0u, panel) || !rszWrite(D_RSZ0, RSZ_STEP_H, ~0u, c.step_x) ||
+	    !rszWrite(D_RSZ0, RSZ_STEP_V, ~0u, c.step_y) || !rszWrite(D_RSZ0, RSZ_H_INT, 0xffff, c.off_x >> 15) ||
+	    !rszWrite(D_RSZ0, RSZ_H_SUB, 0x1fffff, c.off_x & 0x7fff) || !rszWrite(D_RSZ0, RSZ_V_INT, 0xffff, c.off_y >> 15) ||
+	    !rszWrite(D_RSZ0, RSZ_V_SUB, 0x1fffff, c.off_y & 0x7fff))) {
+		why = "RSZ0 did not take its configuration";
+	}
+	if (why != NULL) {
+		if (opened) {
+			rszWrite(D_MMSYS, MMSYS_CG_SET0, CG_RSZ0, CG_RSZ0);
+		}
+		fRszWhy = why;
+		IOLog("FB: rsz: off (%s): frames scaled on the CPU\n", why);
+		return false;
+	}
+	const struct {
+		uint8_t  blk;
+		uint16_t off;
+		uint32_t mask, on;
+	} pipe[] = {
+		{ D_RSZ0, RSZ_ENABLE, 0x1, 0x1 },
+		{ 0, OVL_ROI_SIZE, 0x1fff1fff, ((uint32_t)c.in_h << 16) | (uint32_t)c.in_w },
+		{ 1, OVL_ROI_SIZE, 0x1fff1fff, ((uint32_t)c.in_h << 16) | (uint32_t)c.in_w },
+		{ (uint8_t)fScanOvl, (uint16_t)OVL_L_SRC_SIZE(n), 0x1fff1fff, (fLogicalH << 16) | fLogicalW },
+		{ (uint8_t)fScanOvl, (uint16_t)OVL_L_OFFSET(n), 0x1fff1fff, ((uint32_t)c.ly << 16) | (uint32_t)c.lx },
+		{ D_MUTEX, MUTEX_MOD(0), 1u << 3, 1u << 3 },
+		{ D_MMSYS, MMSYS_RSZ0_SEL_IN, 0x1, 0x1 },       /* from OVL0 */
+		{ D_MMSYS, MMSYS_RSZ0_MOUT_EN, 0x1, 0x1 },      /* to RDMA0 */
+		{ D_MMSYS, MMSYS_RDMA0_SEL_IN, 0x3, 0x1 },      /* from RSZ0 */
+		{ D_MMSYS, MMSYS_OVL0_MOUT_EN, 0x3, 0x2 },      /* to RSZ0 */
+	};
+	fRszN = 0;
+	for (size_t i = 0; i < sizeof(pipe) / sizeof(pipe[0]); i++) {
+		if (pipe[i].off == OVL_ROI_SIZE && pipe[i].blk == 1 && !two) {
+			continue;
+		}
+		fRszBlk[fRszN] = pipe[i].blk;
+		fRszOff[fRszN] = pipe[i].off;
+		fRszMask[fRszN] = pipe[i].mask;
+		fRszOn[fRszN] = pipe[i].on;
+		fRszSave[fRszN] = disp_rd(fDisp[pipe[i].blk], pipe[i].off) & pipe[i].mask;
+		fRszN++;
+	}
+	fRszReady = true;
+	IOLog("FB: rsz: ready: %s frame %dx%d, %s at %d,%d, steps %u/%u, offsets %u/%u -> picture %dx%d at %d,%d\n",
+	    two ? "OVL0_2L+OVL0" : "OVL0", c.in_w, c.in_h, fScanLayer, c.lx, c.ly, c.step_x, c.step_y, c.off_x, c.off_y,
+	    fLb.w, fLb.h, fLb.x, fLb.y);
+	return true;
+}
+
+/*
+ * At a frame end with interrupts off, or in a panic: the pipe through RSZ0 (on, in the listed order) or LK's values back
+ * (in reverse). A switch on that fails part-way is undone at once. No logging (panic).
+ */
+bool
+AppleCLCD::rszPipe(bool on)
+{
+	bool ok = on && fRszReady;
+	for (uint32_t i = 0; ok && i < fRszN; i++) {
+		ok = rszWrite(fRszBlk[i], fRszOff[i], fRszMask[i], fRszOn[i]);
+	}
+	if (ok) {
+		fRszLive = true;
+		fRszSwitches++;
+		return true;
+	}
+	uint32_t bad = fRszBad;
+	bool back = true;
+	for (uint32_t i = fRszN; i-- > 0;) {
+		back = rszWrite(fRszBlk[i], fRszOff[i], fRszMask[i], fRszSave[i]) && back;
+	}
+	fRszLive = false;
+	if (on) {
+		fRszBad = bad;
+		return false;
+	}
+	return back;
+}
+
+/* Read only. Registers of a gated block are never read. */
+void
+AppleCLCD::rszDump(char **out, char *end)
+{
+	if (!dispMap() || fDisp[D_MMSYS] == 0 || fDisp[D_MUTEX] == 0 || fDisp[D_RDMA0] == 0 || fDisp[D_RSZ0] == 0) {
+		disp_say(out, end, "rsz: display registers not mappable\n");
+		return;
+	}
+	vm_offset_t m = fDisp[D_MMSYS], x = fDisp[D_MUTEX], r = fDisp[D_RDMA0], z = fDisp[D_RSZ0];
+	uint32_t cg = disp_rd(m, MMSYS_CG_CON0);
+	disp_say(out, end, "rsz: MMSYS CG_CON0 0x%08x (gated: RSZ0 %u, POSTMASK0 %u), OVL_CON 0x%x, mout OVL0_2L 0x%x OVL0 0x%x "
+	    "RSZ0 0x%x, sel RSZ0 0x%x RDMA0 0x%x DSI0 0x%x\n", cg, (cg & CG_RSZ0) >> 7, (cg & CG_POSTMASK0) >> 14,
+	    disp_rd(m, MMSYS_OVL_CON), disp_rd(m, MMSYS_OVL0_2L_MOUT_EN), disp_rd(m, MMSYS_OVL0_MOUT_EN),
+	    disp_rd(m, MMSYS_RSZ0_MOUT_EN), disp_rd(m, MMSYS_RSZ0_SEL_IN), disp_rd(m, MMSYS_RDMA0_SEL_IN),
+	    disp_rd(m, MMSYS_DSI0_SEL_IN));
+	for (int n = 0; n < 4 && !(cg & CG_MUTEX0); n++) {
+		disp_say(out, end, "rsz: mutex%d en 0x%x sof 0x%x mod 0x%x\n", n, disp_rd(x, MUTEX_EN(n)), disp_rd(x, MUTEX_SOF(n)),
+		    disp_rd(x, MUTEX_MOD(n)));
+	}
+	for (int o = 0; o < 2; o++) {
+		vm_offset_t b = fDisp[o];
+		if (cg & (o ? CG_OVL0_2L : CG_OVL0)) {
+			disp_say(out, end, "rsz: %s clock gated\n", o ? "OVL0_2L" : "OVL0");
+			continue;
+		}
+		disp_say(out, end, "rsz: %s en 0x%x roi 0x%08x datapath 0x%x bgclr 0x%08x src_con 0x%x ext 0x%x\n",
+		    o ? "OVL0_2L" : "OVL0", disp_rd(b, OVL_EN), disp_rd(b, OVL_ROI_SIZE), disp_rd(b, OVL_DATAPATH_CON),
+		    disp_rd(b, OVL_ROI_BGCLR), disp_rd(b, OVL_SRC_CON), disp_rd(b, OVL_DATAPATH_EXT_CON));
+	}
+	if (!(cg & CG_RDMA0)) {
+		disp_say(out, end, "rsz: RDMA0 global 0x%x size 0x%x 0x%x int_status 0x%x\n", disp_rd(r, RDMA_GLOBAL_CON),
+		    disp_rd(r, RDMA_SIZE_CON_0), disp_rd(r, RDMA_SIZE_CON_1), disp_rd(r, RDMA_INT_STATUS));
+	}
+	if (!(cg & CG_RSZ0)) {
+		disp_say(out, end, "rsz: RSZ0 en 0x%x con 0x%x 0x%x int 0x%x in 0x%08x out 0x%08x step 0x%x 0x%x h %u.%u v %u.%u "
+		    "debug 0x%x shadow 0x%x\n", disp_rd(z, RSZ_ENABLE), disp_rd(z, RSZ_CON_1), disp_rd(z, RSZ_CON_2),
+		    disp_rd(z, RSZ_INT_FLAG), disp_rd(z, RSZ_IN_IMAGE), disp_rd(z, RSZ_OUT_IMAGE), disp_rd(z, RSZ_STEP_H),
+		    disp_rd(z, RSZ_STEP_V), disp_rd(z, RSZ_H_INT), disp_rd(z, RSZ_H_SUB), disp_rd(z, RSZ_V_INT),
+		    disp_rd(z, RSZ_V_SUB), disp_rd(z, RSZ_DEBUG), disp_rd(z, RSZ_SHADOW_CTRL));
+	}
+	if (fLb.w != 0) {
+		disp_say(out, end, "rsz: plan: frame %dx%d, display at %d,%d, steps %u/%u, offsets %u/%u (1/32768) -> picture "
+		    "%dx%d at %d,%d\n", fRsz.in_w, fRsz.in_h, fRsz.lx, fRsz.ly, fRsz.step_x, fRsz.step_y, fRsz.off_x, fRsz.off_y,
+		    fLb.w, fLb.h, fLb.x, fLb.y);
+	}
+	disp_say(out, end, "rsz: mp_fb_rsz=%u, %s%s%s%s, %llu switches to the resizer\n", fRszArg,
+	    fRszLive ? "in the pipe" : fRszReady ? "ready" : "not prepared", fRszWant ? "" : " (disp rsz off)",
+	    fRszWhy ? ", off: " : "", fRszWhy ? fRszWhy : "", fRszSwitches);
+}
+
+void
+AppleCLCD::rszLog(void)
+{
+	static char buf[3072];
+	char *p = buf, *line = buf;
+	buf[0] = 0;
+	rszDump(&p, buf + sizeof(buf));
+	for (char *q = buf; *q != 0; q++) {
+		if (*q == '\n') {
+			*q = 0;
+			IOLog("FB: %s\n", line);
+			line = q + 1;
+		}
+	}
+}
+
 /* ---- K0d: layer switches at the panel's frame end ---- */
 
 AppleCLCD::Target
@@ -1538,6 +1898,7 @@ AppleCLCD::bufTarget(int buf)
 	t.buf = buf;
 	t.surface = NULL;
 	t.swap = 0;
+	t.rsz = false;
 	return t;
 }
 
@@ -1546,6 +1907,14 @@ AppleCLCD::layerWrite(const Target &t)
 {
 	if (fScanOvl < 0) {
 		return;                 /* LK's layer unknown: only its own buffer is ever shown */
+	}
+	bool rsz = t.rsz && fRszWhy == NULL;
+	if (rsz != fRszLive) {
+		IODelay(150);           /* RSZ0 and RDMA0 still hold the frame's last lines after the OVL's end (~3.4 us a line) */
+	}
+	if (rsz != fRszLive && !rszPipe(rsz)) {
+		fRszWhy = rsz ? "a pipe register did not take its value: back to LK's path" : "LK's path not restored";
+		IOLog("FB: rsz: %s (block %u offset 0x%x)\n", fRszWhy, fRszBad >> 16, fRszBad & 0xffff);
 	}
 	vm_offset_t base = fDisp[fScanOvl];
 	disp_wr(base, fScanPitchMsbReg, t.pitchMsb);
@@ -1557,7 +1926,13 @@ AppleCLCD::layerWrite(const Target &t)
 void
 AppleCLCD::layerApply(const Target &t)
 {
-	layerWrite(t);
+	bool applied = false;
+	if ((t.rsz && fRszWhy == NULL) != fRszLive && fVblankOvl >= 0 && fPeriod != 0) {
+		vblankPoll(2 * fPeriod, &t, &applied);          /* the pipe changes at a frame end only */
+	}
+	if (!applied) {
+		layerWrite(t);
+	}
 	MappleSurface *old = fShown.surface;
 	fShown = t;
 	fShownSwap = t.swap;
@@ -1822,6 +2197,9 @@ AppleCLCD::hzPolicy(void)
 		return;                 /* switches wait for the frame end to be known (first swap) */
 	}
 	fHzWant = 0;
+	if (want == 120 && (fRszWant || fRszLive)) {
+		return;
+	}
 	if (want == fPanelHz || (fPowerOff && want == 120)) {
 		return;
 	}
@@ -2387,6 +2765,10 @@ AppleCLCD::vblankTick(void)
 			fFlipReady = false;
 			fFlipWhy = "frame ends stopped";
 			IOLog("FB: double buffer off: no frame end in 8 tries\n");
+			if (fRszLive) {
+				fRszWhy = "frame ends stopped with the resizer in the pipe: back to LK's path";
+				IOLog("FB: rsz: %s\n", fRszWhy);
+			}
 			layerApply(fNext);
 			fNextValid = false;
 			fNextSwap = 0;
@@ -2566,6 +2948,19 @@ AppleCLCD::dispCommand(const char *args, char *out, size_t len)
 		}
 		disp_say(&p, end, "panel brightness level %u of %u (%u nits max), %llu sent; color matrices %llu calls, %llu applied\n",
 		    fBlLevel, PANEL_LEVEL_MAX, fMaxNits, fBlSent, fMatrixCalls, fMatrixApplied);
+	} else if (strncmp(args, "rsz", 3) == 0) {
+		if (fRszArg == 0) {
+			disp_say(&p, end, "rsz: boot with mp_fb_rsz=1 (read only) or 2 (the resizer)\n");
+		} else {
+			if (strncmp(args + 3, " off", 4) == 0) {
+				fRszWant = false;       /* the next frame goes through LK's path and the CPU letterbox */
+				fDirty = true;
+			} else if (strncmp(args + 3, " on", 3) == 0 && fRszArg >= 2 && fLb.w != 0) {
+				fRszWant = true;
+				fDirty = true;
+			}
+			rszDump(&p, end);
+		}
 	} else if (strncmp(args, "kv", 2) == 0) {
 		/* KA1 (gpu/docs/RICHIESTE-KERNEL.md): stable key=value lines for Viva Manager */
 		IOLockLock(fLock);
@@ -2652,6 +3047,11 @@ AppleCLCD::dispCommand(const char *args, char *out, size_t len)
 		    fOneOff[0], fOneOff[1]);
 		disp_say(&p, end, "panel refresh (0189): %u Hz, mode %s, %llu switches, %llu failures\n", fPanelHz,
 		    fHzMode == 1 ? "auto" : fHzMode == 120 ? "120" : "60", fHzSwitches, fHzFailures);
+		if (fRszArg != 0) {
+			disp_say(&p, end, "resizer (mp_fb_rsz=%u, disp rsz [on|off]): %s%s%s%s, %llu switches to it\n", fRszArg,
+			    fRszLive ? "in the pipe" : fRszReady ? "ready" : "not prepared", fRszWant ? "" : " (off)",
+			    fRszWhy ? ", off: " : "", fRszWhy ? fRszWhy : "", fRszSwitches);
+		}
 		disp_say(&p, end, "usage: disp [regs|scanout on|scanout off|flip on|flip off|early on|early off|onelayer on|onelayer off|surfpitch 0|1|2|"
 		    "lat reset|hz 60|120|auto]\n");
 	}

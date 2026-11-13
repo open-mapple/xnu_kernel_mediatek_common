@@ -2,8 +2,8 @@
  * Boot-arg mp_fb_letterbox: the presented display (1125x2436, the iPhone X) scaled at its own aspect onto the panel,
  * bottom-aligned and centred, under a black strip that holds the camera hole. 0 (default) = the centred crop, 1 = a
  * strip down to the hole's bottom, N > 1 = a strip of N rows. The strip is never shallower than the true aspect
- * leaves at the panel's full width (73 rows on 1080x2412). MappleFramebuffer.cpp draws the picture,
- * MappleHID.cpp maps touches onto it; tools/letterbox_test.c checks the arithmetic.
+ * leaves at the panel's full width (73 rows on 1080x2412). MappleFramebuffer.cpp draws the picture (mp_fb_rsz=2: on
+ * the display pipe's resizer, below), MappleHID.cpp maps touches onto it; tools/letterbox_test.c checks the arithmetic.
  */
 #ifndef _MAPPLE_LETTERBOX_H_
 #define _MAPPLE_LETTERBOX_H_
@@ -85,6 +85,47 @@ static inline uint32_t
 mapple_lb_pack(uint64_t v)
 {
 	return (uint32_t)(v & 0x00ff00ffu) | (uint32_t)((v >> 32) & 0x00ff00ffu) << 8;
+}
+
+/*
+ * Boot-arg mp_fb_rsz=2: the display pipe's resizer (DISP_RSZ0, between OVL0 and RDMA0) scales a frame the OVL composes
+ * (the presented display at lx, ly over black) onto the whole panel, so the picture lands on mapple_lb_rect's. The
+ * input position of output pixel k is off + k * step, in 1/32768 of an input pixel between pixel centres (MediaTek's
+ * mtk_rsz_calc_tile_params); it matches mapple_lb_src at the picture's first pixel.
+ */
+#define MAPPLE_RSZ_UNIT         32768
+
+struct mapple_rsz {
+	int32_t in_w, in_h;             /* the OVL's frame */
+	int32_t lx, ly;                 /* the display in it */
+	uint32_t step_x, step_y, off_x, off_y;
+};
+
+/* One axis: the picture's n pixels at `at` of `out` show l logical ones. */
+static inline uint32_t
+mapple_rsz_axis(int32_t at, int32_t n, int32_t l, int32_t out, int32_t *pos, int32_t *in, uint32_t *off)
+{
+	int64_t u = MAPPLE_RSZ_UNIT;
+	int64_t step = ((int64_t)l * u * 2 + n) / (2 * n);
+	int64_t c0 = (int64_t)l * u / (2 * n) - u / 2;
+	int64_t need = (int64_t)at * step - c0;
+	int64_t p = need <= 0 ? 0 : (need + u - 1) / u;
+	int64_t o = p * u + c0 - (int64_t)at * step;
+
+	*pos = (int32_t)p;
+	*off = (uint32_t)o;
+	*in = (int32_t)((o + (int64_t)(out - 1) * step + u - 1) / u + 1);
+	return (uint32_t)step;
+}
+
+static inline struct mapple_rsz
+mapple_rsz_config(int32_t pw, int32_t ph, int32_t lw, int32_t lh, struct mapple_lb r)
+{
+	struct mapple_rsz c;
+
+	c.step_x = mapple_rsz_axis(r.x, r.w, lw, pw, &c.lx, &c.in_w, &c.off_x);
+	c.step_y = mapple_rsz_axis(r.y, r.h, lh, ph, &c.ly, &c.in_h, &c.off_y);
+	return c;
 }
 
 #endif /* _MAPPLE_LETTERBOX_H_ */

@@ -97,6 +97,38 @@ main(void)
 			}
 		}
 	}
+	/*
+	 * mp_fb_rsz=2: the resizer's frame, steps and offsets. Within MT6781's DISP_RSZ limits (input at most 1200 wide,
+	 * 4096 high); the display fits the frame; every picture pixel samples where the CPU letterbox (and so the touch
+	 * mapping) puts it, to 1/20 pixel; the pixels beside the picture sample outside the display (black); the last
+	 * output pixel lands in the frame's last input pixel, as Android's own steps do.
+	 */
+	r = mapple_lb_rect(PW, PH, LW, LH, 1);
+	struct mapple_rsz c = mapple_rsz_config(PW, PH, LW, LH, r);
+	printf("rsz: frame %dx%d, display at %d,%d, step %u/%u, offset %u/%u (1/32768)\n", c.in_w, c.in_h, c.lx, c.ly,
+	    c.step_x, c.step_y, c.off_x, c.off_y);
+	assert(c.in_w <= 1200 && c.in_h <= 4096 && c.in_w > PW && c.in_h > PH);
+	assert(c.lx + LW <= c.in_w && c.ly + LH <= c.in_h);
+	int64_t worst = 0;
+	for (int axis = 0; axis < 2; axis++) {
+		int32_t at = axis ? r.y : r.x, n = axis ? r.h : r.w, l = axis ? LH : LW, out = axis ? PH : PW;
+		int32_t pos = axis ? c.ly : c.lx, in = axis ? c.in_h : c.in_w;
+		int64_t step = axis ? c.step_y : c.step_x, off = axis ? c.off_y : c.off_x;
+		for (int32_t i = 0; i < n; i++) {
+			int64_t hw = (off + (int64_t)(at + i) * step - (int64_t)pos * MAPPLE_RSZ_UNIT) * 2;     /* 16.16 */
+			int64_t d = llabs(hw - (int64_t)mapple_lb_src(i, n, l));
+			worst = d > worst ? d : worst;
+		}
+		assert((off + (int64_t)(at - 1) * step) * 2 < ((int64_t)pos << 16) - 0x8000);
+		assert((off + (int64_t)(at + n) * step) * 2 > ((int64_t)(pos + l - 1) << 16) + 0x8000);
+		int64_t last = off + (int64_t)(out - 1) * step;
+		assert(last > (int64_t)(in - 2) * MAPPLE_RSZ_UNIT && last <= (int64_t)(in - 1) * MAPPLE_RSZ_UNIT);
+		assert(off < (1u << 21));
+	}
+	printf("rsz: picture %dx%d at %d,%d, sampling within %.4f px of the CPU letterbox\n", r.w, r.h, r.x, r.y,
+	    worst / 65536.0);
+	assert(worst * 20 <= 65536);
+
 	assert(mapple_lb_pack(mapple_lb_spread(0xff000000u)) == 0xff000000u);
 	assert(mapple_lb_pack(mapple_lb_mix(mapple_lb_spread(0xffffffffu), mapple_lb_spread(0xffffffffu), 128)) ==
 	    0xffffffffu);

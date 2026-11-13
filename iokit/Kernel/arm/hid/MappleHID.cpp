@@ -414,8 +414,12 @@ MappleHIDTouch::start(IOService *provider)
 	fLogicalH = native ? 2400 : 2436;
 	fOffX = (fLogicalW - 1080) / 2;
 	fOffY = (fLogicalH - 2400) / 2;
-	uint32_t lb = 0;
+	uint32_t lb = 0, rsz = 0;
 	PE_parse_boot_argn("mp_fb_letterbox", &lb, sizeof(lb));
+	PE_parse_boot_argn("mp_fb_rsz", &rsz, sizeof(rsz));
+	if (lb == 0 && rsz >= 2) {
+		lb = 1;                 /* the resizer shows the letterbox's picture */
+	}
 	if (!native && lb != 0) {
 		PE_Video video;
 		PE_current_console(&video);
