@@ -92,8 +92,9 @@
  * display pipe's CCORR (0x1400b000, Xiaomi mtk_disp_ccorr.c: 3x3, 1.0 = 0x800 on MT6781, 13-bit signed, two per
  * register; CFG bit 0 relay / bit 1 engine). Identity = relay (bypass).
  *
- * Resizer (boot-arg mp_fb_rsz, 1 = read only, 2 = on; link "disp rsz [on|off]"): the letterbox's scaling done by the
- * display pipe's RSZ0 for frames that are scanned out (see its section).
+ * Resizer (device.conf's resize through the device tree, or boot-arg mp_fb_rsz: 1 = read only, 2 = on; link
+ * "disp rsz [on|off]"): the letterbox's scaling done by the display pipe's RSZ0 for frames that are scanned out (see
+ * its section).
  *
  * The panel memory itself is published as an IOSurface and returned as the
  * default framebuffer surface. The kernel text console keeps drawing over
@@ -467,7 +468,7 @@ AppleCLCD::start(IOService *provider)
 	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
 	uint32_t lb = 0;
 	PE_parse_boot_argn("mp_fb_letterbox", &lb, sizeof(lb));
-	PE_parse_boot_argn("mp_fb_rsz", &fRszArg, sizeof(fRszArg));
+	fRszArg = mapple_rsz_mode();
 	if (lb == 0 && fRszArg >= 2) {
 		lb = 1;                 /* frames the resizer cannot take are scaled on the CPU to the same picture */
 	}
@@ -517,7 +518,7 @@ AppleCLCD::start(IOService *provider)
 		OSSafeReleaseNULL(fEarlyTimer);
 	}
 	fEarly = early != 0 && fEarlyTimer != NULL;
-	int one = 0;
+	int one = fRszArg >= 2;         /* the resizer needs it */
 	PE_parse_boot_argn_alias("mp_fb_onelayer", "sweetfb_onelayer", &one, sizeof(one));
 	fOneLayer = one != 0;
 	uint32_t hz = 10;

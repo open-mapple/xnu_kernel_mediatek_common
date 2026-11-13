@@ -128,4 +128,31 @@ mapple_rsz_config(int32_t pw, int32_t ph, int32_t lw, int32_t lh, struct mapple_
 	return c;
 }
 
+#ifdef KERNEL
+#include <pexpert/pexpert.h>
+#include <pexpert/device_tree.h>
+
+/*
+ * The resizer's mode for MappleFramebuffer and MappleHID: boot-arg mp_fb_rsz if given; else 2 when the device tree's
+ * /chosen has "mapple-resize" (mkadt --resize, device.conf's resize), 0 on a safe boot or without it.
+ */
+static inline uint32_t
+mapple_rsz_mode(void)
+{
+	uint32_t v = 0, record = 1;
+	DTEntry e;
+	void const *p = NULL;
+	unsigned int sz = 0;
+	if (PE_parse_boot_argn("mp_fb_rsz", &v, sizeof(v))) {
+		return v;
+	}
+	(void)PE_parse_boot_argn("mp_bootrec", &record, sizeof(record));
+	if (record != 0 && SecureDTLookupEntry(NULL, "/chosen", &e) == kSuccess &&
+	    SecureDTGetProperty(e, "mapple-resize", &p, &sz) == kSuccess && sz >= 4 && *(const uint32_t *)p != 0) {
+		return 2;
+	}
+	return 0;
+}
+#endif
+
 #endif /* _MAPPLE_LETTERBOX_H_ */
