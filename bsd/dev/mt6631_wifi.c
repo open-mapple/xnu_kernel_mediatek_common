@@ -40,7 +40,8 @@
  *   wifi init      step 5: basic config, NVRAM (WIFI_FW_DIR/WIFI from nvdata, else the vendor default + a random
  *                  locally administered MAC), domain info, DBDC off, RX filter, BSS 0 activated
  *                  (MT6781-WIFI-CMDS.md §2-§3).
- *   wifi scan [2g] [SSID]  SCAN_REQ_V2, beacons/probe responses into a table until SCAN_DONE, listed by RSSI.
+ *   wifi scan [names] [2g] [SSID]  SCAN_REQ_V2, beacons/probe responses into a table until SCAN_DONE, listed by RSSI
+ *                  (RSSI and channel; "names" adds SSID, BSSID and security).
  *   wifi off       CONN CPU back in reset, MTCMOS off, rails and pinmux as before "wifi on".
  *
  * PMIC writes go through MTKPwrap::writeRegulator (VCN18/VCN33/VCN28 enable/mode bits, VCN33 = 3.3 V only).
@@ -3392,6 +3393,14 @@ wifi_scan(const char *args, char *out, size_t len, size_t o)
 	while (*args == ' ') {
 		args++;
 	}
+	/* "names": each network's SSID, BSSID and security too; by default only RSSI and channel (they are other people's) */
+	bool names = strncmp(args, "names", 5) == 0;
+	if (names) {
+		args += 5;
+		while (*args == ' ') {
+			args++;
+		}
+	}
 	bool only2g = strncmp(args, "2g", 2) == 0;
 	if (only2g) {
 		args += 2;
@@ -3424,6 +3433,10 @@ wifi_scan(const char *args, char *out, size_t len, size_t o)
 	say("scan: %u networks\n", m);
 	for (uint32_t i = 0; i < m; i++) {
 		const struct wl_bss *e = &wl.bss[order[i]];
+		if (!names) {
+			say("%4d dBm ch %3u\n", e->rssi, e->ch);
+			continue;
+		}
 		say("%4d dBm ch %3u %02x:%02x:%02x:%02x:%02x:%02x %-9s %.*s\n", e->rssi, e->ch, e->bssid[0], e->bssid[1],
 		    e->bssid[2], e->bssid[3], e->bssid[4], e->bssid[5], bss_security(e), e->ssid_len, e->ssid);
 	}
