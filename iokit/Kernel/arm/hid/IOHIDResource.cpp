@@ -23,6 +23,7 @@
 
 #include "IOHIDResource.h"
 #include <IOKit/IOLib.h>
+#include <pexpert/pexpert.h>
 
 #define super IOService
 
@@ -31,6 +32,11 @@ OSDefineMetaClassAndStructors( IOHIDResource, IOService )
 
 bool IOHIDResource::start(IOService *provider)
 {    
+    uint32_t enable = 0;
+
+    if ( !PE_parse_boot_argn("mp_hidres", &enable, sizeof(enable)) || !enable )
+        return false;
+
     if ( !super::start(provider) )
         return false;
         
@@ -39,6 +45,7 @@ bool IOHIDResource::start(IOService *provider)
         return false;
 
     registerService(kIOServiceAsynchronous);
+    IOLog("HID: IOHIDResource registered (mp_hidres)\n");
 
 	return true;
 }
@@ -46,6 +53,7 @@ bool IOHIDResource::start(IOService *provider)
 void IOHIDResource::free()
 {
     OSSafeReleaseNULL(_workLoop);
+    super::free();
 }
 
 IOWorkLoop * IOHIDResource::getWorkLoop() const
