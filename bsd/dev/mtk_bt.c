@@ -27,6 +27,7 @@
 #include <sys/kpi_mbuf.h>
 #include <sys/proc.h>
 #include <sys/sys_domain.h>
+#include <sys/sysctl.h>
 #include <sys/systm.h>
 #include <sys/termios.h>
 #include <sys/ttycom.h>
@@ -233,9 +234,77 @@ mtk_bt_send(const uint8_t *bytes, unsigned length)
  *    (data on 0xfce9 left the next command unsent).
  *  - Write_Default_Erroneous_Data_Reporting (0x0c5b), also "Unknown HCI Command", is answered as done.
  *  - Read_Local_Supported_Commands: the controller leaves the LE commands of octets 25-28 and LE Host Support of octet 24 clear although it
- *    answers them; bluetoothd looks in the mask before it sends one and gives up ("HCI initialization failed"). The bits are OR-ed in.
+ *    answers them; bluetoothd looks in the mask before it sends one and gives up ("HCI initialization failed"). The bits are OR-ed in. So
+ *    are Read/Write Default Erroneous Data Reporting (octet 18, bits 2-3): bluetoothd of iOS 16.7 refuses 0x0c5b itself without them.
  */
 static uint8_t skel_vsc_sub;            /* the first parameter of the last 0xfce2 command sent: its kind */
+
+/*
+ * sysctl kern.mapple_bt_quirks: more rules of these kinds without a rebuild, one bluetoothd log at a time. "mask:OCTET:BITS" ORs BITS (hex)
+ * into octet OCTET (decimal) of Read_Local_Supported_Commands; "done:OPCODE" (hex) answers that command as done, with no data, when the
+ * controller does not know it. Space-separated, up to 8 of each; writing the list replaces it.
+ */
+static char skel_extra_text[160];
+static struct { uint8_t octet, bits; } skel_extra_mask[8];
+static uint16_t skel_extra_done[8];
+static unsigned skel_extra_masks, skel_extra_dones;
+
+static void
+skel_extra_parse(const char *text)
+{
+	unsigned masks = 0, dones = 0;
+
+	skel_extra_masks = skel_extra_dones = 0;
+	for (const char *word = text, *end; *word != 0; word = end) {
+		while (*word == ' ') {
+			word++;
+		}
+		for (end = word; *end != 0 && *end != ' '; end++) {
+		}
+		if (strncmp(word, "mask:", 5) == 0 && masks < 8) {
+			char *bits;
+			unsigned long octet = strtoul(word + 5, &bits, 10);
+
+			if (*bits == ':' && octet < 64) {
+				skel_extra_mask[masks].octet = (uint8_t)octet;
+				skel_extra_mask[masks++].bits = (uint8_t)strtoul(bits + 1, NULL, 16);
+			}
+		} else if (strncmp(word, "done:", 5) == 0 && dones < 8) {
+			skel_extra_done[dones++] = (uint16_t)strtoul(word + 5, NULL, 16);
+		}
+	}
+	strlcpy(skel_extra_text, text, sizeof(skel_extra_text));
+	skel_extra_masks = masks;
+	skel_extra_dones = dones;
+}
+
+static int
+skel_extra_sysctl(struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
+{
+	char text[sizeof(skel_extra_text)];
+	int error;
+
+	strlcpy(text, skel_extra_text, sizeof(text));
+	error = sysctl_handle_string(oidp, text, sizeof(text), req);
+	if (error != 0 || req->newptr == USER_ADDR_NULL) {
+		return error;
+	}
+	skel_extra_parse(text);
+	say("quirks now \"%s\": %u mask, %u done", skel_extra_text, skel_extra_masks, skel_extra_dones);
+	return 0;
+}
+SYSCTL_PROC(_kern, OID_AUTO, mapple_bt_quirks, CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED, NULL, 0, skel_extra_sysctl, "A", "");
+
+static bool
+skel_extra_is_done(uint16_t opcode)
+{
+	for (unsigned i = 0; i < skel_extra_dones; i++) {
+		if (skel_extra_done[i] == opcode) {
+			return true;
+		}
+	}
+	return false;
+}
 
 static unsigned
 skel_quirks(uint8_t *packet, unsigned length)
@@ -243,7 +312,7 @@ skel_quirks(uint8_t *packet, unsigned length)
 	static const uint8_t le_commands[4] = { 0xf7, 0xff, 0xff, 0x7f };
 
 	if (length == 7 && packet[0] == 0x04 && packet[1] == 0x0f && packet[2] == 0x04 && packet[3] == 0x01 && packet[4] == 0x01 &&
-	    (packet[6] >> 2) == 0x3f) {
+	    ((packet[6] >> 2) == 0x3f || skel_extra_is_done((uint16_t)(packet[5] | packet[6] << 8)))) {
 		const bool antenna = packet[5] == 0xe2 && packet[6] == 0xfc && (skel_vsc_sub == 0x15 || skel_vsc_sub == 0x36);
 		const bool cal = packet[5] == 0x1b && packet[6] == 0xfd;
 		const bool data = antenna || cal || (packet[5] == 0x48 && packet[6] == 0xfd);
@@ -269,11 +338,19 @@ skel_quirks(uint8_t *packet, unsigned length)
 		packet[6] = 0x00;
 		return 7;
 	}
+	if (length >= 7 && packet[0] == 0x04 && packet[1] == 0x0e && packet[6] == 0x01 &&
+	    ((packet[4] == 0x5b && packet[5] == 0x0c) || skel_extra_is_done((uint16_t)(packet[4] | packet[5] << 8)))) {
+		packet[6] = 0x00;                       /* Command Complete with "Unknown HCI Command": the same, answered as done */
+	}
 	if (length >= 7 + 64 && packet[0] == 0x04 && packet[1] == 0x0e && packet[2] == 0x44 && packet[4] == 0x02 && packet[5] == 0x10 && packet[6] == 0x00) {
 		for (unsigned i = 0; i < 4; i++) {
 			packet[7 + 25 + i] |= le_commands[i];
 		}
 		packet[7 + 24] |= 0x60;
+		packet[7 + 18] |= 0x0c;
+		for (unsigned i = 0; i < skel_extra_masks; i++) {
+			packet[7 + skel_extra_mask[i].octet] |= skel_extra_mask[i].bits;
+		}
 	}
 	return length;
 }
