@@ -405,14 +405,17 @@ static struct {
 	uint32_t oldM23, oldM24, oldDrv;
 } vw;
 
-/* True once WIFI_FW_DIR's MCU patch opens (the root is mounted): Bluetooth's boot waits for it. */
+/*
+ * True once WIFI_FW_DIR's MCU patch opens: Bluetooth's boot waits for it. Never before the root is mounted (rootvnode): a lookup
+ * that early takes a lock the VFS has not made yet (panic in lck_rw_lock_shared under namei).
+ */
 bool
 mt6631_wifi_firmware_present(void)
 {
 	vfs_context_t ctx = vfs_context_kernel();
 	vnode_t vp = NULLVP;
 
-	if (vnode_open(WIFI_FW_DIR "soc2_2_ram_mcu_2_1_hdr.bin", FREAD, 0, 0, &vp, ctx) != 0) {
+	if (rootvnode == NULLVP || vnode_open(WIFI_FW_DIR "soc2_2_ram_mcu_2_1_hdr.bin", FREAD, 0, 0, &vp, ctx) != 0) {
 		return false;
 	}
 	vnode_close(vp, FREAD, ctx);

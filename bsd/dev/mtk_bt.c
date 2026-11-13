@@ -7,8 +7,8 @@
  * firmware started, how the Bluetooth function is switched on, and how a packet gets to the controller and back -- is a table of operations,
  * struct mtkbt_platform, that a port fills in. Nothing here knows a register.
  *
- * It does nothing until the USB link asks for it or Wi-Fi's radio comes up ("bt on", "bt up": mtk_bt_link and mtk_bt_wmt_up
- * below, gated by the boot-arg mp_bt_steps) AND the platform is complete: every operation that is still missing is said and
+ * It does nothing until the USB link asks for it or the boot does ("bt on", "bt up": mtk_bt_link and mtk_bt_boot below,
+ * gated by the boot-arg mp_bt_steps) AND the platform is complete: every operation that is still missing is said and
  * nothing is made.
  *
  * The MT6781's platform is the Wi-Fi driver's STP over BTIF (bsd/dev/mt6631_wifi.c, mt6631_bt_*): CONNSYS comes up with "wifi on" and
@@ -61,8 +61,8 @@ struct mtkbt_platform {
 	const char      *name;                  /* "mt6768 / x6826b / mt6631": what the log calls it */
 	/*
 	 * The combo chip up to the point where it takes function commands: rails, clocks, reset, the firmware patch, its start-up script (WMT on
-	 * a CONNSYS SoC: redwood_connsys.c's steps 1 to 11). The same chip is Wi-Fi's: if the Wi-Fi driver has already done it, wait for it
-	 * here and return 0.
+	 * a CONNSYS SoC: redwood_connsys.c's steps 1 to 11). The same chip is Wi-Fi's: the platform shares it (on the MT6781 the Wi-Fi driver
+	 * counts its users and powers it down after the last).
 	 */
 	int     (*power_on)(void);
 	/*
@@ -89,6 +89,8 @@ struct mtkbt_platform {
 	 * bluetoothd says "No bluetooth on this device." and stops.
 	 */
 	int     (*wifi_address)(uint8_t out[6]);
+	/* optional: true once power_on can work (its firmware files are readable): the boot waits for it */
+	bool    (*ready)(void);
 };
 
 #if defined(ARM64_BOARD_CONFIG_MT6781)
@@ -99,6 +101,7 @@ extern int mt6631_bt_send(const uint8_t *h4, unsigned length);
 extern int mt6631_bt_receive(uint8_t *h4, unsigned room, unsigned wait_ms);
 extern void mt6631_bt_wake(void);
 extern void mt6631_wifi_mac(uint8_t mac[6]);
+extern bool mt6631_wifi_firmware_present(void);
 
 static int
 mt6781_wifi_address(uint8_t out[6])
@@ -116,6 +119,7 @@ static const struct mtkbt_platform mtkbt_platform = {
 	.receive = mt6631_bt_receive,
 	.wake = mt6631_bt_wake,
 	.wifi_address = mt6781_wifi_address,
+	.ready = mt6631_wifi_firmware_present,
 };
 #else
 static const struct mtkbt_platform mtkbt_platform = {
@@ -982,19 +986,31 @@ out:
 	thread_terminate(current_thread());
 }
 
-/* Wi-Fi's radio is up (WMT, and the BT RAM patch "wifi on" loads): once a boot, "bt up" as if the link asked (mp_bt_steps). */
-void
-mtk_bt_wmt_up(void)
+/* "bt up" once, at boot, when the platform is ready: Bluetooth comes up by itself, Wi-Fi or not (mp_bt_steps >= 2; gives up after 120 s) */
+static void
+skel_boot_thread(__unused void *arg, __unused wait_result_t w)
 {
-	static bool done;
+	const struct mtkbt_platform *p = &mtkbt_platform;
 	char out[128];
 
-	if (done) {
-		return;
+	for (unsigned waited = 0; waited < 120 && p->ready != NULL && !p->ready(); waited++) {
+		delay_for_interval(1000, NSEC_PER_MSEC);
 	}
-	done = true;
 	mtk_bt_link("up", out, sizeof(out));
-	printf("BT: Wi-Fi is up: %s", out);
+	printf("BT: at boot: %s", out);
+	thread_terminate(current_thread());
+}
+
+void
+mtk_bt_boot(void)
+{
+	int steps = 0;
+	thread_t thread;
+
+	PE_parse_boot_argn("mp_bt_steps", &steps, sizeof(steps));
+	if (steps >= 2 && kernel_thread_start(skel_boot_thread, NULL, &thread) == KERN_SUCCESS) {
+		thread_deallocate(thread);
+	}
 }
 
 /*

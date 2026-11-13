@@ -96,6 +96,8 @@ mt6631_wifi_dma_alloc(uint32_t size, uint64_t *pa)
 #define MT6631_WIFI_EMI_SIZE      0x500000        /* EMI_SIZE and DMA_SIZE in bsd/dev/mt6631_wifi.c */
 #define MT6631_WIFI_DMA_SIZE      0x48000
 
+extern "C" void mtk_bt_boot(void);                       /* bsd/dev/mtk_bt.c: Bluetooth at boot (mp_bt_steps) */
+
 extern "C" void
 mt6631_wifi_reserve(void)
 {
@@ -108,6 +110,7 @@ mt6631_wifi_reserve(void)
 	void *e = mt6631_wifi_emi_alloc(MT6631_WIFI_EMI_SIZE, &emi);
 	void *d = mt6631_wifi_dma_alloc(MT6631_WIFI_DMA_SIZE, &dma);
 	IOLog("WIFI: reserved EMI %s 0x%llx, DMA %s 0x%llx\n", e ? "at" : "FAILED", emi, d ? "at" : "FAILED", dma);
+	mtk_bt_boot();
 }
 
 /* The DMA memory mapped write-combined (normal uncached), for the ring descriptors (mt6631_wifi.c desc()). */
