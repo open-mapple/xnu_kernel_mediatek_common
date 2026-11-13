@@ -244,9 +244,11 @@ static bool sia_i2c;            /* the SIA8109 answers on I2C (0x41 reads 0x09):
 
 /*
  * AW87319: registers 0x01-0x09 as Android sets them for the speaker (its aw87319_spk.bin: the ID, then 0x01-0x09), the
- * only values written, in this order, SYSCTRL (0x01) last; switched off by SYSCTRL without EN_SW (bit 2).
+ * only values written, in this order, SYSCTRL (0x01) last; switched off as Android does: SYSCTRL 0, then the pin low.
  */
 #define AW_ANDROID      1
+#define AW_UNLOCK       0x64            /* Android writes 0x2c here before it reads the ID and before its registers; */
+#define AW_UNLOCK_VALUE 0x2c            /* not read back, as Android doesn't */
 static const uint8_t aw_android[10] = { 0x9b, 0x07, 0x28, 0x05, 0x04, 0x09, 0x05, 0x52, 0xa8, 0x03 };
 
 /* SIA8109: Android's register values (sia8109_regs.c), the only ones written; 0x02 = 0xcc is its boost, 8.5 V. */
@@ -265,8 +267,8 @@ pa_write(uint8_t addr, uint8_t reg, uint8_t value)
 	bool allowed = false;
 
 	if (addr == AW87319) {
-		allowed = AW_ANDROID && reg >= 0x01 && reg <= 0x09 &&
-		    (value == aw_android[reg] || (reg == 0x01 && value == (aw_android[0x01] & ~0x04)));
+		allowed = AW_ANDROID && ((reg == AW_UNLOCK && value == AW_UNLOCK_VALUE) || (reg >= 0x01 && reg <= 0x09 &&
+		    (value == aw_android[reg] || (reg == 0x01 && (value == (aw_android[0x01] & ~0x04) || value == 0)))));
 	} else if (addr == SIA8109) {
 		allowed = reg < sizeof(sia_regs) && value == sia_regs[reg];
 	}
@@ -274,7 +276,8 @@ pa_write(uint8_t addr, uint8_t reg, uint8_t value)
 		printf("audio: amplifier: refused write %#x reg %#x <- %#x\n", addr, reg, value);
 		return false;
 	}
-	if (mapple_i2c_xfer_bus(PA_BUS, addr, w, 2, NULL, 0) != 0 || !pa_read(addr, reg, &now) || now != value) {
+	if (mapple_i2c_xfer_bus(PA_BUS, addr, w, 2, NULL, 0) != 0 ||
+	    (!(addr == AW87319 && reg == AW_UNLOCK) && (!pa_read(addr, reg, &now) || now != value))) {
 		printf("audio: amplifier: %#x reg %#x <- %#x FAILED (reads %#x)\n", addr, reg, value, now);
 		return false;
 	}
@@ -327,14 +330,14 @@ sia_mode(unsigned mode)
 	return false;
 }
 
-/* The AW87319's ID as Android reads it: up to 5 tries, 2 ms apart; each value logged when one is not 0x9b. */
+/* The AW87319's ID as Android reads it: 0x64 <- 0x2c, then 0x00, up to 5 tries 2 ms apart; values logged on a miss. */
 static bool
 aw_id(uint8_t *last)
 {
 	char seen[5 * 5 + 1] = "";
 
 	for (int i = 0; i < 5; i++) {
-		bool ok = pa_read(AW87319, 0x00, last);
+		bool ok = pa_write(AW87319, AW_UNLOCK, AW_UNLOCK_VALUE) && pa_read(AW87319, 0x00, last);
 
 		if (ok && *last == 0x9b) {
 			if (i > 0) {
@@ -365,6 +368,7 @@ pa_detect(void)
 	for (int i = 0; i < 40 && !pin(0); i++) {
 		ms(250);
 	}
+	ms(2);
 	if (!pin(1)) {
 		printf("audio: amplifier: pin %u cannot be driven (the device tree's output-pins)\n", PA_PIN);
 		return false;
@@ -406,7 +410,7 @@ static void
 pa_off(void)
 {
 	if (pa_kind == PA_AW87319) {
-		(void)pa_write(AW87319, 0x01, aw_android[0x01] & ~0x04);
+		(void)pa_write(AW87319, 0x01, 0);
 	}
 	if (pin(0)) {
 		pa_on = false;
@@ -602,16 +606,16 @@ audio_thread(__unused void *arg, __unused wait_result_t w)
 	speaker_guard_configure(true, gain);
 	afe = mt6781_afe_up();
 	codec = afe && codec_up();
-	if (codec && steps >= 2) {
+	if (codec && steps >= 3 && !pa_detect()) {
+		printf("audio: amplifier not confirmed: no line-out, no tone\n");
+	} else if (codec && steps >= 2) {
 		lineout = lineout_up(mtk_audio_lol_code(below_base));
 		lol_now = mtk_audio_lol_code(below_base);
 		dl1 = lineout && mt6781_afe_dl1_start(&dl, &dl_bytes);
 		dl_write = 0;
 	}
-	if (dl1 && steps >= 3 && pa_detect()) {
-		if (steps == 3) {
-			(void)pa_start();
-		}
+	if (dl1 && steps == 3) {
+		(void)pa_start();
 	}
 	status();
 	nanoseconds_to_absolutetime(NSEC_PER_SEC, &second);
