@@ -18,9 +18,9 @@
  * mp_audio_below (default 160 = 20 dB, at most 90 dB) how far under Android's level the speaker stays (Darwin's volume
  * is under that); mp_audio_gain (default 0, at most 12 dB) the guard's gain; mp_audio_secs (default 5) for steps 1-3.
  *
- * Boot-arg mp_vib_steps (default 0): 0 status; 1 one 100 ms buzz at Android's VIBR voltage; 2 /dev/mapple-haptic runs
- * the motor while iOS's haptic waveform is loud enough: at least 30 ms (Android's vib_timer), at most 1 s at a time,
- * then 1 s off. Refused while VIBR_VOSEL is not Android's (a voltage write: its first run is a run of its own).
+ * Boot-arg mp_vib_steps (default 2; 0 on a safe boot): 0 status; 1 one 100 ms buzz at Android's VIBR voltage;
+ * 2 /dev/mapple-haptic runs the motor while iOS's haptic waveform is loud enough: at least 30 ms (Android's vib_timer),
+ * at most 1 s at a time, then 1 s off. Only Android's full-strength VIBR code (VIBR_VOSEL, MTKPwrap's whitelist).
  */
 #if defined(ARM64_BOARD_CONFIG_MT6781)
 #include <stdbool.h>
@@ -781,6 +781,7 @@ mtk_audio_start(void)
 
 	(void)PE_parse_boot_argn("mp_bootrec", &record, sizeof(record));
 	steps = record == 0 ? 0 : 4;
+	vib_steps = record == 0 ? 0 : 2;
 	(void)PE_parse_boot_argn("mp_audio_steps", &steps, sizeof(steps));
 	(void)PE_parse_boot_argn("mp_audio_below", &below_base, sizeof(below_base));
 	(void)PE_parse_boot_argn("mp_audio_gain", &gain, sizeof(gain));
