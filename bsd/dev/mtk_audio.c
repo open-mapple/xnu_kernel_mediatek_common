@@ -422,6 +422,8 @@ pa_off(void)
 	speaker_guard_attenuation(SPEAKER_GUARD_SILENT);
 }
 
+static void pa_wait(uint32_t n);
+
 /* On, after the line-out (Android: the amplifier last, off first). */
 static bool
 pa_start(void)
@@ -432,18 +434,18 @@ pa_start(void)
 		uint8_t id = 0;
 
 		ok = pin(0);
-		ms(2);
+		pa_wait(2);
 		ok = ok && pin(1);
-		ms(2);
+		pa_wait(2);
 		ok = ok && aw_id(&id) && pa_write(AW87319, 0x01, aw_android[0x01] & ~0x04);
 		for (uint8_t r = 0x02; ok && r <= 0x09; r++) {
 			ok = pa_write(AW87319, r, aw_android[r]);
 		}
 		ok = ok && pa_write(AW87319, 0x01, aw_android[0x01]);
-		ms(40);
+		pa_wait(40);
 	} else if (pa_kind == PA_SIA8109) {
 		ok = sia_mode(SIA_MODE);
-		ms(45);
+		pa_wait(45);
 		for (uint8_t r = 0; ok && sia_i2c && r < sizeof(sia_regs); r++) {
 			ok = pa_write(SIA8109, r, sia_regs[r]);
 		}
@@ -468,7 +470,8 @@ static int16_t ring[2 * RING_FRAMES];
 static uint32_t ring_head, ring_tail;   /* frames; head: the sink's, tail: the feeder's */
 static volatile uint32_t *dl;
 static uint32_t dl_bytes, dl_write, underruns;
-static uint64_t last_sound;
+static uint64_t last_sound, last_feed, gap_max;
+static bool fed_tone, primed;   /* what the amplifier's waits feed; DL1's write position set from its own once */
 
 /* /dev/mapple-audio's sink (the writer's thread, must not wait): into the ring, what fits. */
 static uint32_t
@@ -534,7 +537,17 @@ feed(bool tone)
 	uint64_t factor;
 	int32_t digital;
 
-	if (queued > AHEAD + 4096) {    /* the hardware has passed what was written */
+	uint64_t now = mach_absolute_time();
+
+	if (last_feed != 0 && now - last_feed > gap_max) {
+		gap_max = now - last_feed;
+	}
+	last_feed = now;
+	if (!primed) {
+		dl_write = (pos + 1024) % dl_bytes;
+		queued = 1024;
+		primed = true;
+	} else if (queued > AHEAD + 4096) {    /* the hardware has passed what was written */
 		underruns++;
 		dl_write = (pos + 1024) % dl_bytes;
 		queued = 1024;
@@ -586,9 +599,26 @@ report(const char *when)
 	struct speaker_guard_report r;
 	char a[8], b[8];
 
+	uint64_t gap_ns;
+
 	speaker_guard_take_report(&r);
-	printf("audio: %s: DL1 at %u, %u underruns; guard: peak in %u out %u, gain %s dB (least %s), %u frames limited\n", when,
-	    mt6781_afe_dl1_position(), underruns, r.peak_in, r.peak_out, db(r.gain, a), db(r.least_gain, b), r.limited_frames);
+	absolutetime_to_nanoseconds(gap_max, &gap_ns);
+	gap_max = 0;
+	printf("audio: %s: DL1 at %u, %u underruns, longest refill gap %llu ms; guard: peak in %u out %u, gain %s dB (least %s), "
+	    "%u frames limited\n", when, mt6781_afe_dl1_position(), underruns, gap_ns / NSEC_PER_MSEC, r.peak_in, r.peak_out,
+	    db(r.gain, a), db(r.least_gain, b), r.limited_frames);
+}
+
+/* The amplifier's waits, DL1 kept topped up meanwhile: a start takes longer than the 43 ms queued ahead. */
+static void
+pa_wait(uint32_t n)
+{
+	for (uint32_t t = 0; t < n; t += 5) {
+		if (dl != NULL) {
+			feed(fed_tone);
+		}
+		ms(n - t < 5 ? n - t : 5);
+	}
 }
 
 /* ---- the steps ---- */
@@ -614,8 +644,10 @@ audio_thread(__unused void *arg, __unused wait_result_t w)
 		lol_now = mtk_audio_lol_code(below_base);
 		dl1 = lineout && mt6781_afe_dl1_start(&dl, &dl_bytes);
 		dl_write = 0;
+		fed_tone = steps == 3;
 	}
 	if (dl1 && steps == 3) {
+		speaker_guard_attenuation((lol_now - LOL_ANDROID) * 8);
 		(void)pa_start();
 	}
 	status();
