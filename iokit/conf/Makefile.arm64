@@ -23,6 +23,23 @@ IOHibernateRestoreKernel.o_CFLAGS_ADD += -fno-stack-protector -fno-stack-check
 IOHibernateIO.cpo_INCFLAGS += -I$(SRCROOT)/osfmk
 IOHibernateRestoreKernel.o_INCFLAGS += -I$(SRCROOT)/osfmk
 
+# IOHIDFamily-1915.140.3's sources build as Apple wrote them
+HID_IMPORTED_CXXWARNFLAGS = -Wno-zero-as-null-pointer-constant -Wno-documentation -Wno-implicit-int-conversion \
+	-Wno-cast-align -Wno-missing-field-initializers
+IOHIDResource.cpo_CXXWARNFLAGS_ADD += $(HID_IMPORTED_CXXWARNFLAGS)
+IOHIDResourceUserClient.cpo_CXXWARNFLAGS_ADD += $(HID_IMPORTED_CXXWARNFLAGS)
+IOHIDUserDevice.cpo_CXXWARNFLAGS_ADD += $(HID_IMPORTED_CXXWARNFLAGS)
+IOHIDDevice.cpo_CXXWARNFLAGS_ADD += $(HID_IMPORTED_CXXWARNFLAGS)
+IOHIDInterface.cpo_CXXWARNFLAGS_ADD += $(HID_IMPORTED_CXXWARNFLAGS)
+IOHIDElementPrivate.cpo_CXXWARNFLAGS_ADD += $(HID_IMPORTED_CXXWARNFLAGS)
+IOHIDElementContainer.cpo_CXXWARNFLAGS_ADD += $(HID_IMPORTED_CXXWARNFLAGS)
+IOHIDDeviceElementContainer.cpo_CXXWARNFLAGS_ADD += $(HID_IMPORTED_CXXWARNFLAGS)
+IOHIDEventQueue.cpo_CXXWARNFLAGS_ADD += $(HID_IMPORTED_CXXWARNFLAGS)
+IOHIDEventSource.cpo_CXXWARNFLAGS_ADD += $(HID_IMPORTED_CXXWARNFLAGS)
+IOHIDFamilyPrivate.cpo_CXXWARNFLAGS_ADD += $(HID_IMPORTED_CXXWARNFLAGS)
+HIDCountDescriptorItems.o_CWARNFLAGS_ADD += -Wno-cast-align
+HIDOpenCloseDescriptor.o_CWARNFLAGS_ADD += -Wno-declaration-after-statement
+
 ######################################################################
 #END    Machine dependent Makefile fragment for arm
 ######################################################################
