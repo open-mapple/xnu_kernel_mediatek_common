@@ -202,6 +202,9 @@ mt6631_wlan_power(bool on)
 void
 mt6631_wlan_scan_done(int status)
 {
+	if (wn.mtx == NULL) {
+		return;         /* no WLAN layer (mp_wlan=0): a link scan, its results are read from the link */
+	}
 	lck_mtx_lock(wn.mtx);
 	wn.scanIdx = 0;
 	lck_mtx_unlock(wn.mtx);
