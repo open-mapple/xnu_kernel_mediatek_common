@@ -23,6 +23,7 @@ static IOMemoryDescriptor *gMappleWiFiEMI;
 static IOMemoryMap *gMappleWiFiEMIMap;
 
 extern "C" bool mapple_pa_in_hole(uint64_t pa);      /* osfmk/arm64/arm_vm_init.c */
+extern "C" void flush_dcache(vm_offset_t addr, unsigned length, boolean_t phys);
 
 extern "C" void *
 mt6631_wifi_emi_alloc(uint32_t size, uint64_t *pa)
@@ -45,7 +46,7 @@ mt6631_wifi_emi_alloc(uint32_t size, uint64_t *pa)
 		for (uint32_t i = 0; i < size / 8; i++) {
 			w[i] = 0;
 		}
-		gMappleWiFiEMI->performOperation(kIOMemoryIncoherentIOFlush, 0, size);
+		flush_dcache((vm_offset_t)w, size, FALSE);
 	}
 	if (gMappleWiFiEMIMap != NULL) {
 		if (gMappleWiFiEMI->getLength() < size) {
@@ -135,7 +136,10 @@ mt6631_wifi_dma_flush(uint32_t offset, uint32_t len)
 extern "C" void
 mt6631_wifi_emi_flush(uint32_t offset, uint32_t len)
 {
-	if (gMappleWiFiEMI != NULL) {
+	if (gMappleWiFiEMIMap != NULL) {
+		/* the fixed window is outside the physmap: by its kernel mapping, not by physical address */
+		flush_dcache((vm_offset_t)gMappleWiFiEMIMap->getVirtualAddress() + offset, len, FALSE);
+	} else if (gMappleWiFiEMI != NULL) {
 		gMappleWiFiEMI->performOperation(kIOMemoryIncoherentIOFlush, offset, len);
 	}
 }
