@@ -1180,6 +1180,22 @@ AppleCLCD::present(const uint8_t *rec, bool force, uint64_t jobs)
 			/* Not PE_initialize_console(kPEDisableScreen): its console switch
 			 * writes the read-only-late cons_ops_index and panics. */
 			mapple_console_muted = 1;
+			/*
+			 * 0196: LK's buffers to black. They kept the boot's kernel lines, and whenever the OVL went back to
+			 * buffer 0 (a copied frame, swaps retired while the panel slept) those lines showed at wake (phone,
+			 * 0195). 64-bit stores, not bzero: its DC ZVA faults on a non-cacheable mapping. A panic still draws.
+			 */
+			for (int b = 0; b < 2; b++) {
+				if (fBufKVA[b] == 0 || (b == 1 && fBufPA[1] == fBufPA[0])) {
+					continue;
+				}
+				for (uint32_t y = 0; y < fHeight; y++) {
+					volatile uint64_t *row = (volatile uint64_t *)(fBufKVA[b] + (uint64_t)y * fRowBytes);
+					for (uint32_t x = 0; x < fWidth / 2; x++) {
+						row[x] = 0;
+					}
+				}
+			}
 		}
 	}
 	fScanLive = fScanOn && scanout(rec);
