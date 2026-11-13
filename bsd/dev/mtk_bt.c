@@ -356,6 +356,23 @@ skel_quirks(uint8_t *packet, unsigned length)
 }
 
 /*
+ * A command the controller must not see: LE Read Periodic Advertiser List Size (0x204a). After one periodic or extended advertising command the
+ * MT6631 refuses the legacy scan and advertising commands with Command Disallowed (LE Set Scan Parameters, 0x0c), and bluetoothd restarts
+ * ("Could not start LE scan", 712); it uses neither extended advertising nor scanning. Answered here, a list of none. True when answered.
+ */
+static bool
+skel_local(const uint8_t *packet, unsigned length)
+{
+	static const uint8_t list_size[8] = { 0x04, 0x0e, 0x05, 0x01, 0x4a, 0x20, 0x00, 0x00 };
+
+	if (length == 4 && packet[0] == 0x01 && packet[1] == 0x4a && packet[2] == 0x20 && packet[3] == 0x00) {
+		mtk_btsk_deliver(list_size, sizeof(list_size));
+		return true;
+	}
+	return false;
+}
+
+/*
  * ---- the kernel control ----
  * bluetoothd's transport (H4BC, the only one of its table that matches here) looks up com.apple.uart.sk.bluetooth on a PF_SYSTEM socket,
  * connects a SOCK_STREAM, and asks it (getsockopt 0x40105412, 16 bytes) for the UUID of the Skywalk channel its packets go through.
@@ -819,6 +836,10 @@ skel_bridge(void)
 			}
 			skel_dump("out", skel_packet, n, &skel_said_out);
 			skel_vsc_out(skel_packet, n);
+			if (skel_local(skel_packet, n)) {
+				say("%#06x answered here, not sent", (unsigned)(skel_packet[1] | skel_packet[2] << 8));
+				continue;
+			}
 			if (p->wake != NULL) {
 				p->wake();
 			}
