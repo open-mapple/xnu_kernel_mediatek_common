@@ -257,6 +257,7 @@ extern int mapple_i2c_xfer_bus(uint32_t bus, uint8_t addr, const uint8_t *wbuf, 
 extern void bq27z561_link(const char *args, char *out, size_t outLen);   /* iokit/Kernel/arm/BQ27Z561Battery.cpp */
 extern void mt6631_wifi_link(const char *args, char *out, size_t outLen);      /* bsd/dev/mt6631_wifi.c */
 extern void mtk_bt_link(const char *args, char *out, size_t outLen);           /* bsd/dev/mtk_bt.c */
+extern void mtk_torch_link(const char *args, char *out, size_t outLen);        /* bsd/dev/mtk_torch.c */
 extern void mapple_gpu_link(const char *args, char *out, size_t outLen);       /* iokit/Kernel/arm/MappleGPU.cpp */
 extern void mt6781_cpufreq_link(const char *args, char *out, size_t outLen);   /* osfmk/arm64/mt6781_cpufreq.c */
 extern void mapple_disp_link(const char *args, char *out, size_t outLen);      /* iokit/Kernel/arm/MappleFramebuffer.cpp */
@@ -1564,6 +1565,7 @@ vl_mappled_out(uint8_t *out, uint32_t max)
  *   i2c8w BUS DEV REG B..  write bytes (max 7) to 8-bit register REG of device DEV on I2C bus BUS
  *   bat [poll|lpm on|off]  battery (BQ27Z561Battery.cpp): gauge, charger registers, Low Power Mode
  *   wifi [status|detect|on|wmt|fw|cap|off]  CONNSYS (mt6631_wifi.c): state (read only), A-die detection, power on with RAM patches / off
+ *   torch [status|on|off]  the flash LED (mtk_torch.c, mp_torch_steps=1 for on): Android's 50 mA, 30 s at most
  *   bt [status|on|up]  Bluetooth (mtk_bt.c, after wifi wmt): state (read only), function on + HCI probe, bridge to bluetoothd
  *   gpu [ARGS]        Mali driver (MappleGPU.cpp): status, mfg, on, off, regs, freq, selftest [fault], probe, publish
  *   cpu [ARGS]        CPU DVFS (mt6781_cpufreq.c): status, gov on|off, set|max ll|big|cci MHz, fast on|off, reset
@@ -1724,6 +1726,10 @@ vl_command(void)
 		static char wifi_reply[4000];
 		mt6631_wifi_link(rest, wifi_reply, sizeof(wifi_reply));
 		vl_reply("%s", wifi_reply);
+	} else if (IS("torch")) {
+		static char torch_reply[256];
+		mtk_torch_link(rest, torch_reply, sizeof(torch_reply));
+		vl_reply("%s", torch_reply);
 	} else if (IS("bt")) {
 		static char bt_reply[256];
 		mtk_bt_link(rest, bt_reply, sizeof(bt_reply));
@@ -1788,7 +1794,7 @@ vl_command(void)
 			delay(5000);
 		}
 	} else if (IS("help")) {
-		vl_reply("ping | stat | peek PA [WORDS] | poke PA VALUE | pmic ADDR [N] | i2c DEV REG N | i2cw DEV REG B.. | i2c8[w] BUS DEV REG N|B.. | bat [poll|lpm on|off] | wifi [status|detect|on|wmt|fw|cap|off] | bt [status|on|up] | cpu [status|gov on|off|set|max ll|big|cci MHz|fast on|off] | gpu [status|mfg|on|off|regs|freq [MHz]|selftest [fault]|probe|publish] | disp [regs|scanout on|off] | push SIZE MODE FNV PATH | pull PATH | run ARGS.. | mappled ps|kill ID|tests | rewind [BYTES] | console [on|off] | panic [TEXT] | reboot\n");
+		vl_reply("ping | stat | peek PA [WORDS] | poke PA VALUE | pmic ADDR [N] | i2c DEV REG N | i2cw DEV REG B.. | i2c8[w] BUS DEV REG N|B.. | bat [poll|lpm on|off] | wifi [status|detect|on|wmt|fw|cap|off] | bt [status|on|up] | torch [status|on|off] | cpu [status|gov on|off|set|max ll|big|cci MHz|fast on|off] | gpu [status|mfg|on|off|regs|freq [MHz]|selftest [fault]|probe|publish] | disp [regs|scanout on|off] | push SIZE MODE FNV PATH | pull PATH | run ARGS.. | mappled ps|kill ID|tests | rewind [BYTES] | console [on|off] | panic [TEXT] | reboot\n");
 	} else {
 		vl_reply("unknown command: %s (try help)\n", c);
 	}

@@ -38,6 +38,7 @@
 
 extern kern_return_t thread_terminate(thread_t thread);
 void mtk_audio_start(void);                                                            /* MTKPwrap::start */
+extern void mtk_torch_start(void);                                                     /* bsd/dev/mtk_torch.c */
 extern int mtk_pwrap_read(uint32_t addr, uint32_t *value);                             /* MTKPwrap.cpp */
 extern int mtk_pwrap_write_audio(uint32_t addr, uint32_t mask, uint32_t value);
 extern int mapple_gpio_set(uint32_t pin, int high);                                    /* MTKIO.cpp */
@@ -957,5 +958,6 @@ mtk_audio_start(void)
 	if (vib_steps >= 1 && kernel_thread_start(vib_thread, NULL, &t) == KERN_SUCCESS) {
 		thread_deallocate(t);
 	}
+	mtk_torch_start();
 }
 #endif /* ARM64_BOARD_CONFIG_MT6781 */
