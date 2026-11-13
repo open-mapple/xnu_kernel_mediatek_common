@@ -1498,6 +1498,7 @@ bool
 AppleCLCD::findLKLayer(char **out, char *end)
 {
 	uint64_t lo = fPhys, hi = fPhys + 3ull * fRowBytes * fHeight;
+	bool exact = false;     /* a layer on the boot framebuffer itself beats one on another of LK's buffers */
 	if (!dispMap()) {
 		disp_say(out, end, "display registers not mappable\n");
 		return false;
@@ -1509,7 +1510,8 @@ AppleCLCD::findLKLayer(char **out, char *end)
 		}
 		for (int n = 0; n < (o ? 2 : 4); n++) {
 			uint32_t addr = disp_rd(b, OVL_L_ADDR(n));
-			if ((disp_rd(b, OVL_SRC_CON) & (1u << n)) && addr >= lo && addr < hi) {
+			if ((disp_rd(b, OVL_SRC_CON) & (1u << n)) && addr >= lo && addr < hi && (addr == lo || !exact)) {
+				exact = addr == lo;
 				fScanOvl = o;
 				fScanAddrReg = OVL_L_ADDR(n);
 				fScanPitchReg = OVL_L_PITCH(n);
@@ -1519,7 +1521,8 @@ AppleCLCD::findLKLayer(char **out, char *end)
 		}
 		for (int k = 0; o == 0 && k < 3; k++) {
 			uint32_t addr = disp_rd(b, OVL_EL_ADDR(k));
-			if ((disp_rd(b, OVL_DATAPATH_EXT_CON) & (1u << k)) && addr >= lo && addr < hi) {
+			if ((disp_rd(b, OVL_DATAPATH_EXT_CON) & (1u << k)) && addr >= lo && addr < hi && (addr == lo || !exact)) {
+				exact = addr == lo;
 				fScanOvl = o;
 				fScanAddrReg = OVL_EL_ADDR(k);
 				fScanPitchReg = OVL_EL_PITCH(k);
@@ -2545,7 +2548,7 @@ AppleCLCD::flipSetup(char **out, char *end)
 }
 
 /*
- * fScanLock. Other enabled OVL layers that read the buffer LK's layer shows, switched off (on) or back on (off), and
+ * fScanLock. Other enabled OVL layers that read any of LK's buffers, switched off (on) or back on (off), and
  * LK's layer given the pitch the buffers are written with (fRowBytes, the boot framebuffer's). On the realme 8i
  * mtkloader's OVL0 L1 (pitch 4320 = fRowBytes) sits above LK's OVL0_2L L0 (pitch 4352) on buffer 0: with double
  * buffering only every other frame is visible, the half-written one as well, and L0 shows through it sheared.
@@ -2553,7 +2556,7 @@ AppleCLCD::flipSetup(char **out, char *end)
 void
 AppleCLCD::oneLayer(bool on, char **out, char *end)
 {
-	uint64_t lo = fPhys, hi = fPhys + (uint64_t)fRowBytes * fHeight;
+	uint64_t lo = fPhys, hi = fPhys + 3ull * fRowBytes * fHeight;     /* LK's buffers, as findLKLayer */
 	if (on && fOneLkPitch == 0 && (fLkPitch & 0xffff) != fRowBytes) {
 		fOneLkPitch = fLkPitch;
 		fLkPitch = (fLkPitch & ~0xffffu) | fRowBytes;
