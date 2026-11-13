@@ -66,6 +66,8 @@
 #include "mt6631_wpa.h"
 #include "mt6631_wlan.h"
 
+extern void mtk_bt_wmt_up(void);                /* bsd/dev/mtk_bt.c */
+
 extern int mtk_pwrap_read(uint32_t addr, uint32_t *value);                                  /* MTKPwrap.cpp */
 extern int mtk_pwrap_write_regulator(uint32_t addr, uint32_t mask, uint32_t value);
 extern void *mt6631_wifi_emi_alloc(uint32_t size, uint64_t *pa);                                /* MT6631WiFi.cpp */
@@ -1071,6 +1073,35 @@ desc(uint32_t off, uint32_t i)
 	return (uint32_t *)(void *)(wd.uva + off + 16 * i);
 }
 
+extern void flush_dcache(vm_offset_t addr, unsigned length, boolean_t phys);
+
+/*
+ * Boot-arg mp_wifi_rx (default 3): bit 0, a descriptor's status word is read only after its line is cleaned and
+ * invalidated through the cacheable mapping (the same pages are also mapped cacheable, by wd.va and the physmap, and a
+ * non-cacheable read may be served from a line a prefetch left there), with barriers after the DMA index is read and
+ * between a done bit and its buffer; bit 1, each resync skip is logged with the whole ring.
+ */
+static int
+rx_mode(void)
+{
+	static int mode = -1;
+	if (mode < 0) {
+		int m = 3;
+		PE_parse_boot_argn("mp_wifi_rx", &m, sizeof(m));
+		mode = m;
+	}
+	return mode;
+}
+
+static uint32_t
+desc_d1(uint32_t off, uint32_t i)
+{
+	if (rx_mode() & 1) {
+		flush_dcache((vm_offset_t)(wd.va + off + 16 * i), 16, FALSE);
+	}
+	return desc(off, i)[1];
+}
+
 static void
 wfdma_setup(void)
 {
@@ -1139,8 +1170,12 @@ wfdma_rx(uint32_t r, uint8_t *out, uint32_t max, uint32_t us)
 	uint32_t i = wd.rxIdx[r], *d = desc(OFF_RX(r), i);
 	for (uint32_t t = 0; t <= us; t += 50) {
 		mt6631_wifi_dma_flush(OFF_RX(r) + 16 * i, 16);
-		if (d[1] & DESC_DMADONE) {
-			uint32_t n = (d[1] >> 16) & 0x3fff, boff = OFF_RXBUF(r) + BUF_SZ * i;
+		uint32_t d1 = desc_d1(OFF_RX(r), i);
+		if (d1 & DESC_DMADONE) {
+			uint32_t n = (d1 >> 16) & 0x3fff, boff = OFF_RXBUF(r) + BUF_SZ * i;
+			if (rx_mode() & 1) {
+				__builtin_arm_dmb(0xf);         /* the done bit before the buffer */
+			}
 			mt6631_wifi_dma_flush(boff, BUF_SZ);
 			memcpy(out, wd.va + boff, MIN(n, max));
 			d[1] = (uint32_t)RX_BUF_LEN << 16;
@@ -1158,9 +1193,27 @@ wfdma_rx(uint32_t r, uint8_t *out, uint32_t max, uint32_t us)
 	 * and move on (counted in "wifi ring").
 	 */
 	uint32_t didx = rd(WF_RX_RING(r) + 12) & 0xfff;
-	if (didx != i && (desc(OFF_RX(r), (i + 1) % RING_N)[1] & DESC_DMADONE)) {
+	if (rx_mode() & 1) {
+		__builtin_arm_dmb(0xf);                 /* the DMA index before the descriptors */
+	}
+	if (didx != i && (desc_d1(OFF_RX(r), (i + 1) % RING_N) & DESC_DMADONE)) {
 		wd.rxSkipped[r]++;
 		wd.rxSkipD1[r] = d[1];
+		if ((rx_mode() & 2) && wd.rxSkipped[r] <= 16) {
+			/* the ring's done bits as read, then after invalidating every line: D done, . empty */
+			char seen[RING_N + 1], fresh[RING_N + 1];
+			for (uint32_t k = 0; k < RING_N; k++) {
+				seen[k] = (desc(OFF_RX(r), k)[1] & DESC_DMADONE) ? 'D' : '.';
+			}
+			flush_dcache((vm_offset_t)(wd.va + OFF_RX(r)), 16 * RING_N, FALSE);
+			for (uint32_t k = 0; k < RING_N; k++) {
+				fresh[k] = (desc(OFF_RX(r), k)[1] & DESC_DMADONE) ? 'D' : '.';
+			}
+			seen[RING_N] = fresh[RING_N] = 0;
+			printf("WIFI: rx%u skip %u at %u: didx %u cidx %u, taken %u, d1 %08x next %08x; read %s, fresh %s\n", r,
+			    wd.rxSkipped[r], i, didx, rd(WF_RX_RING(r) + 8) & 0xfff, wd.rxGot[r], d[1],
+			    desc(OFF_RX(r), (i + 1) % RING_N)[1], seen, fresh);
+		}
 		d[1] = (uint32_t)RX_BUF_LEN << 16;
 		wr(WF_RX_RING(r) + 8, i);
 		wd.rxIdx[r] = (i + 1) % RING_N;
@@ -3275,6 +3328,9 @@ vw_worker(__unused void *arg, __unused wait_result_t wr)
 		vw_unlock();
 		if (log[0]) {
 			printf("WIFI: %s", log);
+		}
+		if (up) {
+			mtk_bt_wmt_up();
 		}
 		struct timespec ts = { 0, (busy ? 1 : link ? 2 : 20) * NSEC_PER_MSEC };
 		lck_mtx_lock(&vs_mtx);
