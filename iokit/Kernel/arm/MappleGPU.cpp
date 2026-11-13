@@ -961,6 +961,9 @@ MappleGPUAccelerator::start(IOService *provider)
 	flag = 1;
 	PE_parse_boot_argn("mp_gpu_footprint", &flag, sizeof(flag));
 	fFootprint = flag != 0;
+	flag = JOB_TIMEOUT_MS;
+	PE_parse_boot_argn("mp_gpu_jobms", &flag, sizeof(flag));
+	fJobTimeoutMs = flag < 1000 ? 1000 : flag > 30000 ? 30000 : flag;
 	int64_t mib = GPU_MEMORY_LIMIT >> 20;
 	PE_parse_boot_argn_alias("mp_gpu_memtotal", "vivagpumemtotal", &mib, sizeof(mib));
 	fMemLimit = mib << 20;
@@ -3251,6 +3254,30 @@ MappleGPUAccelerator::clocksDump(char **out, char *end)
 	    mono / NSEC_PER_MSEC, cont / NSEC_PER_MSEC, ((int64_t)cont - (int64_t)mono) / (int64_t)NSEC_PER_MSEC);
 }
 
+/*
+ * A job past its time: what the hardware says, to tell a fault (JS_STATUS 0x40 and up, a GPU or AS fault status)
+ * from a job still running (JS_STATUS 0x08 ACTIVE, no fault) that is only slow.
+ */
+void
+MappleGPUAccelerator::logStuckJob(uint32_t slot, const char *when)
+{
+	MappleGPUJob *job = fRunning[slot];
+	uint32_t js = JS_BASE(slot);
+	int as = job != NULL && job->vm != NULL ? job->vm->asSlot : -1;
+
+	IOLog("GPU: slot %u %s (%s[%d]): JS_STATUS 0x%02x head 0x%08x%08x tail 0x%08x%08x; GPU_STATUS 0x%x IRQ_RAWSTAT 0x%x "
+	    "FAULT_STATUS 0x%x at 0x%08x%08x; JOB_INT_RAWSTAT 0x%x\n", slot, when, job != NULL && job->vm != NULL ? job->vm->proc : "?",
+	    job != NULL && job->vm != NULL ? job->vm->pid : -1, rd(js + JS_STATUS), rd(js + JS_HEAD_HI),
+	    rd(js + JS_HEAD_LO), rd(js + JS_TAIL_LO + 4), rd(js + JS_TAIL_LO), rd(GPU_STATUS), rd(GPU_IRQ_RAWSTAT),
+	    rd(GPU_FAULT_STATUS), rd(GPU_FAULT_ADDRESS_HI), rd(GPU_FAULT_ADDRESS_LO), rd(JOB_INT_RAWSTAT));
+	if (as >= 0) {
+		uint32_t a = AS_BASE((uint32_t)as);
+
+		IOLog("GPU: slot %u %s: AS %d FAULTSTATUS 0x%x at 0x%08x%08x, STATUS 0x%x\n", slot, when, as,
+		    rd(a + AS_FAULTSTATUS), rd(a + AS_FAULTADDRESS_HI), rd(a + AS_FAULTADDRESS_LO), rd(a + AS_STATUS));
+	}
+}
+
 void
 MappleGPUAccelerator::jobTimer(OSObject *owner, IOTimerEventSource *src __unused)
 {
@@ -3278,6 +3305,7 @@ MappleGPUAccelerator::jobTimer(OSObject *owner, IOTimerEventSource *src __unused
 		}
 		busy = true;
 		if (self->fStopDeadline[slot] != 0 && now >= self->fStopDeadline[slot]) {
+			self->logStuckJob(slot, "after its hard stop");
 			self->resetGPU("a job ignored its hard stop");
 			if (self->fPowered && (self->fRunning[0] || self->fRunning[1])) {
 				self->fTimerArmed = true;
@@ -3285,12 +3313,13 @@ MappleGPUAccelerator::jobTimer(OSObject *owner, IOTimerEventSource *src __unused
 			}
 			return;
 		}
-		uint64_t limit = (slot == 0 && self->fWatchFragment) ? JOB_TIMEOUT_AFTER_FAULT_MS : JOB_TIMEOUT_MS;
+		uint64_t limit = (slot == 0 && self->fWatchFragment) ? JOB_TIMEOUT_AFTER_FAULT_MS : self->fJobTimeoutMs;
 		if (self->fStopDeadline[slot] == 0 && now - job->startMs > limit) {
 			self->fTimeouts++;
 			IOLog("GPU: job on slot %u timed out after %llu ms (chain 0x%llx head 0x%08x%08x), hard stop\n",
 			    slot, now - job->startMs, job->jc, self->rd(JS_BASE(slot) + JS_HEAD_HI),
 			    self->rd(JS_BASE(slot) + JS_HEAD_LO));
+			self->logStuckJob(slot, "at its timeout");
 			self->wr(JS_BASE(slot) + JS_COMMAND, JS_CMD_HARD_STOP);
 			self->fStopDeadline[slot] = now + JOB_STOP_GRACE_MS;
 		}

@@ -343,6 +343,7 @@ private:
 	void completeJob(uint32_t slot, IOReturn error, uint32_t status, uint64_t at = 0);
 	void failAll(IOReturn error);
 	void resetGPU(const char *why);
+	void logStuckJob(uint32_t slot, const char *when);
 	static void gpuInterrupt(OSObject *owner, IOInterruptEventSource *src, int count);
 	static void mmuInterrupt(OSObject *owner, IOInterruptEventSource *src, int count);
 	static void jobInterrupt(OSObject *owner, IOInterruptEventSource *src, int count);
@@ -436,6 +437,7 @@ private:
 public:
 	int cacheMode(void) const { return fCacheMode; }
 	bool        fFootprint;         /* mp_gpu_footprint: GPU memory in its process's phys_footprint (1 default) */
+	uint64_t    fJobTimeoutMs;      /* mp_gpu_jobms: a job's time before its hard stop (3000 default) */
 	MappleGPUVM *firstVM(void) const { return fVMs; }  /* gated */
 	/* A BO gets a CPU mapping (user mmap): from now on it is maintained around jobs. Gated. */
 	void boMapped(MappleGPUBO *bo);
