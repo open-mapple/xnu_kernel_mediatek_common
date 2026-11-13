@@ -3127,6 +3127,23 @@ vw_unlock(void)
 	}
 }
 
+/*
+ * Boot-arg mp_wifi_steps: how far the link and the WLAN layer may go (default 0: status only). 1 detect (the A-die
+ * probe, Android's at every boot, restored after), 2 on/off (rails incl. VCN33's voltage, MTCMOS, RAM patches),
+ * 3 wmt/fw/cap, 4 init/up/scan (and power from Settings), 5 join/leave/sta/ring (and joins from Settings).
+ */
+static int
+wifi_steps(void)
+{
+	static int steps = -1;
+	if (steps < 0) {
+		int s = 0;
+		PE_parse_boot_argn("mp_wifi_steps", &s, sizeof(s));
+		steps = s;
+	}
+	return steps;
+}
+
 static uint8_t tx_buf[2048];
 
 /* One iteration: requests, then RX, the TX queue and the timers. Returns true when there is more to do soon. */
@@ -3145,7 +3162,13 @@ sta_step(char *out, size_t len, size_t *po)
 
 	if (req & (REQ_POWER | REQ_POWER_EVENT)) {
 		bool changed = false;
-		if (want && !wl.init) {
+		static bool said;
+		if (want && !wl.init && wifi_steps() < 4) {
+			if (!said) {
+				said = true;
+				say("power: the radio stays off (mp_wifi_steps=%d, needs 4)\n", wifi_steps());
+			}
+		} else if (want && !wl.init) {
 			o = wifi_up(out, len, o);
 			say("power: radio %s\n", wl.init ? "UP" : "FAILED to come up");
 			if (!wl.init && vw.on) {
@@ -3276,23 +3299,6 @@ vw_kick_locked(uint32_t req)
 		}
 	}
 	wakeup(&vw_chan);
-}
-
-/*
- * Boot-arg mp_wifi_steps: how far the link and the WLAN layer may go (default 0: status only). 1 detect (the A-die
- * probe, Android's at every boot, restored after), 2 on/off (rails incl. VCN33's voltage, MTCMOS, RAM patches),
- * 3 wmt/fw/cap, 4 init/up/scan (and power from Settings), 5 join/leave/sta/ring (and joins from Settings).
- */
-static int
-wifi_steps(void)
-{
-	static int steps = -1;
-	if (steps < 0) {
-		int s = 0;
-		PE_parse_boot_argn("mp_wifi_steps", &s, sizeof(s));
-		steps = s;
-	}
-	return steps;
 }
 
 /* ---- API for mt6631_wlan.c ---- */
