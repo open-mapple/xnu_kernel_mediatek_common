@@ -27,6 +27,7 @@ iokit/Kernel/arm/MapplePowerSource.cpp                                optional i
 iokit/Kernel/arm/BQ27Z561Battery.cpp                                 optional iokitcpp
 iokit/Kernel/arm/MT6631WiFi.cpp                                    optional iokitcpp
 iokit/Kernel/arm/MT6631WLAN.cpp                                    optional iokitcpp
+iokit/Kernel/arm/MappleBluetooth.cpp                               optional iokitcpp
 iokit/Kernel/arm/MTKScaler.cpp                                  optional iokitcpp
 iokit/Kernel/arm/MTKMDP.cpp                                     optional iokitcpp
 iokit/Kernel/arm/MTKJPEGHW.cpp                                  optional iokitcpp

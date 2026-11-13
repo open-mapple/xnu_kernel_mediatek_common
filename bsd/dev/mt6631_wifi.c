@@ -656,12 +656,16 @@ fail:
 #define INFRA_CG0_STA           0x10001090
 #define INFRA_CG0_BTIF          (1u << 31)
 #define STP_TYPE_WMT            4
+#define STP_TYPE_BT             0
 
 static struct {
 	bool    full;
 	uint8_t txseq, txack, rxseq;
 	uint16_t crc[256];
 } st;
+
+static LCK_GRP_DECLARE(btif_lck_grp, "mt6631_btif");
+static LCK_MTX_DECLARE(btif_mtx, &btif_lck_grp);       /* BTIF and st: "wifi wmt" and Bluetooth (bsd/dev/mtk_bt.c) */
 
 static void
 crc_init(void)
@@ -709,7 +713,16 @@ btif_get(uint32_t us)
 	return -1;
 }
 
-/* hal_btif_hw_init in PIO, plus the AP -> CONNSYS wake pulse (hal_btif_raise_wak_sig). */
+/* the AP -> CONNSYS wake pulse (hal_btif_raise_wak_sig) */
+static void
+btif_wake(void)
+{
+	rmw(BTIF_WAK, 1, 0);
+	delay(160);
+	rmw(BTIF_WAK, 1, 1);
+}
+
+/* hal_btif_hw_init in PIO, plus the wake pulse. */
 static void
 btif_init(void)
 {
@@ -725,9 +738,7 @@ btif_init(void)
 	wr(BTIF_TRI_LVL, 8 | (1u << 4));                /* TX 8, RX 1, loopback off */
 	wr(BTIF_DMA_EN, 1u << 2);                       /* PIO both ways, auto reset */
 	wr(BTIF_IER, 0);                                /* polled */
-	rmw(BTIF_WAK, 1, 0);
-	delay(160);
-	rmw(BTIF_WAK, 1, 1);
+	btif_wake();
 	st.full = false;
 	st.txseq = 0;
 	st.txack = 7;
@@ -743,13 +754,13 @@ stp_ack(void)
 	return btif_put(h, 4);
 }
 
-/* One WMT packet in the current STP mode (stp_core.c mtk_wcn_stp_send_data, mand / full). */
+/* One packet on STP channel `type` in the current mode (stp_core.c mtk_wcn_stp_send_data, mand / full). */
 static bool
-stp_send(const uint8_t *p, uint32_t n)
+stp_send(uint8_t type, const uint8_t *p, uint32_t n)
 {
 	uint8_t h[4], c[2] = { 0, 0 };
 	h[0] = (uint8_t)(0x80 | (st.txseq << 3) | (st.full ? st.txack : 0));
-	h[1] = (uint8_t)((STP_TYPE_WMT << 4) | ((n >> 8) & 0xf));
+	h[1] = (uint8_t)((type << 4) | ((n >> 8) & 0xf));
 	h[2] = (uint8_t)n;
 	h[3] = st.full ? (uint8_t)(h[0] + h[1] + h[2]) : 0;
 	if (st.full) {
@@ -809,7 +820,7 @@ wmt_cmd(const char *what, const uint8_t *cmd, uint32_t clen, const uint8_t *want
 	size_t o = *po;
 	uint8_t type = 0;
 	int n = -1;
-	if (!stp_send(cmd, clen)) {
+	if (!stp_send(STP_TYPE_WMT, cmd, clen)) {
 		say("wmt: %s: BTIF did not take it (LSR 0x%02x)\n", what, rd(BTIF_LSR) & 0xff);
 		*po = o;
 		return -1;
@@ -837,7 +848,7 @@ wmt_cmd(const char *what, const uint8_t *cmd, uint32_t clen, const uint8_t *want
 }
 
 static size_t
-wifi_wmt(char *out, size_t len, size_t o)
+wmt_up(char *out, size_t len, size_t o)
 {
 	if (!vw.on || rd(CONN_MCU_COM_REG0) != CONN_IDLE_MAGIC) {
 		say("wmt: CONNSYS not on with the MCU idle (wifi on first)\n");
@@ -894,6 +905,120 @@ wifi_wmt(char *out, size_t len, size_t o)
 	vw.wmt = c >= 0;
 	say("wmt: %s; VCN28 off. Next: wifi fw\n", c >= 0 ? "done" : "calibration FAILED");
 	return o;
+}
+
+static size_t
+wifi_wmt(char *out, size_t len, size_t o)
+{
+	lck_mtx_lock(&btif_mtx);
+	o = wmt_up(out, len, o);
+	lck_mtx_unlock(&btif_mtx);
+	return o;
+}
+
+/*
+ * Bluetooth: bsd/dev/mtk_bt.c's platform, after "wifi wmt" (BTIF up, STP in full mode, the BT RAM patch loaded by "wifi on").
+ * Its function on is WMT_FUNC_CTRL (wmt_core_func_ctrl_cmd, type 0 BT); then HCI packets, H4 type byte first, are the payload
+ * of STP frames on channel 0 (BT_TASK_INDX, stp_exp.h).
+ */
+int
+mt6631_bt_power_on(void)
+{
+	lck_mtx_lock(&btif_mtx);
+	bool up = vw.wmt;
+	lck_mtx_unlock(&btif_mtx);
+	if (!up) {
+		printf("BT: no WMT yet (wifi on, wifi wmt)\n");
+	}
+	return up ? 0 : ENXIO;
+}
+
+static int
+bt_func(uint8_t on)
+{
+	const uint8_t cmd[] = { 0x01, 0x06, 0x02, 0x00, 0x00, on };
+	static const uint8_t done[] = { 0x02, 0x06, 0x01, 0x00, 0x00 };
+	uint8_t ev[64], type = 0;
+	int n = -1;
+
+	lck_mtx_lock(&btif_mtx);
+	if (vw.wmt && stp_send(STP_TYPE_WMT, cmd, sizeof(cmd))) {
+		for (int k = 0; k < 12; k++) {         /* the firmware's own events (02 16 ..) may come first */
+			n = stp_recv(ev, sizeof(ev), 2000, &type);
+			if (n < 0 || (type == STP_TYPE_WMT && n >= 2 && ev[0] == 0x02 && ev[1] == 0x06)) {
+				break;
+			}
+			printf("BT: func %s: channel %u, %d bytes (%02x %02x ..) before the answer\n", on ? "on" : "off", type, n,
+			    n > 0 ? ev[0] : 0, n > 1 ? ev[1] : 0);
+		}
+	}
+	lck_mtx_unlock(&btif_mtx);
+	bool ok = n >= (int)sizeof(done) && memcmp(ev, done, sizeof(done)) == 0;
+	printf("BT: WMT_FUNC_CTRL %s: %s (%d bytes:", on ? "on" : "off", ok ? "done" : "FAILED", n);
+	for (int i = 0; i < n && i < 8; i++) {
+		printf(" %02x", ev[i]);
+	}
+	printf(")\n");
+	return ok ? 0 : EIO;
+}
+
+int
+mt6631_bt_function_on(void)
+{
+	return bt_func(1);
+}
+
+void
+mt6631_bt_function_off(void)
+{
+	(void)bt_func(0);
+}
+
+int
+mt6631_bt_send(const uint8_t *h4, unsigned length)
+{
+	if (length == 0 || length > 0xfff) {
+		return EMSGSIZE;
+	}
+	lck_mtx_lock(&btif_mtx);
+	bool ok = vw.wmt && stp_send(STP_TYPE_BT, h4, length);
+	lck_mtx_unlock(&btif_mtx);
+	return ok ? 0 : EIO;
+}
+
+/* One STP frame of channel 0: its payload's length, 0 if none came, <0 for an error. Other channels' frames are dropped. */
+int
+mt6631_bt_receive(uint8_t *h4, unsigned room, unsigned wait_ms)
+{
+	static uint32_t said;
+	uint8_t type = 0;
+	int n;
+
+	lck_mtx_lock(&btif_mtx);
+	n = vw.wmt ? stp_recv(h4, room, wait_ms, &type) : -ENXIO;
+	lck_mtx_unlock(&btif_mtx);
+	if (n == -1 || n == -3) {
+		return 0;                       /* nothing, or acknowledgements only */
+	}
+	if (n == -2) {
+		return -EIO;                    /* a frame cut off */
+	}
+	if (n >= 0 && type != STP_TYPE_BT) {
+		if (said++ < 16) {
+			printf("BT: a frame on STP channel %u, %d bytes (%02x %02x ..): not Bluetooth's, dropped\n", type, n,
+			    n > 0 ? h4[0] : 0, n > 1 ? h4[1] : 0);
+		}
+		return 0;
+	}
+	return n;
+}
+
+void
+mt6631_bt_wake(void)
+{
+	lck_mtx_lock(&btif_mtx);
+	btif_wake();
+	lck_mtx_unlock(&btif_mtx);
 }
 
 /* ---- step 3: WiFi RAM code over WFDMA ---- */

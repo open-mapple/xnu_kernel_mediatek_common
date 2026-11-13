@@ -1,23 +1,17 @@
 /*
- * Bluetooth on a MediaTek phone: the skeleton. It is the part of redwood_connsys.c's Bluetooth (the Infinix Hot 20's working driver, MT6768 with
+ * Bluetooth on a MediaTek phone: the skeleton. It is the part of HakiOS's redwood_connsys.c Bluetooth (the Infinix Hot 20's working driver, MT6768 with
  * an MT6631 in CONNSYS; docs/bluetooth-x6826b.md) that does not depend on the phone: what iOS 16.5's bluetoothd needs from a kernel to take a
- * controller as its own -- the kernel control com.apple.uart.sk.bluetooth and the Skywalk kernel pipe behind it (redwood_btsk.c), the nodes it
- * opens, the service "bluetooth" in the registry (iokit/Kernel/RedwoodBluetooth.cpp), H4 framing of what it writes, and the answers of a
+ * controller as its own -- the kernel control com.apple.uart.sk.bluetooth and the Skywalk kernel pipe behind it (mtk_btsk.c), the nodes it
+ * opens, the service "bluetooth" in the registry (iokit/Kernel/arm/MappleBluetooth.cpp), H4 framing of what it writes, and the answers of a
  * MediaTek controller that Apple's stack does not take as they are. What is different on every phone -- how the combo chip is powered and its
  * firmware started, how the Bluetooth function is switched on, and how a packet gets to the controller and back -- is a table of operations,
  * struct mtkbt_platform, that a port fills in. Nothing here knows a register.
  *
- * It does nothing until it is told to (boot-arg mtkbt_skel=1) AND the platform is complete: every operation that is still missing is said
- * (redwood_host_keep_add) and nothing is made. There are no defaults for what only the phone can tell.
+ * It does nothing until the USB link asks for it ("bt on", "bt up": mtk_bt_link below, gated by the boot-arg mp_bt_steps) AND the
+ * platform is complete: every operation that is still missing is said and nothing is made.
  *
- * Not in bsd/conf/files, and not to be built together with the Bluetooth of redwood_connsys.c (both register the same kernel control and both
- * define redwood_connsys_bt_send, the name redwood_btsk.c calls). To try it: add
- *     bsd/dev/redwood_mtkbt_skel.c    standard
- * to bsd/conf/files (redwood_btsk.c and RedwoodBluetooth.cpp stay as they are), call redwood_mtkbt_skel_init() where redwood_connsys_init() is
- * called (redwood_input.c), and put your platform in mtkbt_platform below. docs/bluetooth-mtk-porting.md has the order to find things out in
- * and the user-space half, which is the same on every phone.
- *
- * Compiles with the kernel's own flags; has not run on a phone: there is no port for it to run on yet.
+ * The MT6781's platform is the Wi-Fi driver's STP over BTIF (bsd/dev/mt6631_wifi.c, mt6631_bt_*): CONNSYS comes up with "wifi on" and
+ * "wifi wmt", and Bluetooth's packets then go on STP's channel 0 beside WMT's.
  */
 #include <kern/clock.h>
 #include <kern/locks.h>
@@ -38,19 +32,18 @@
 #include <sys/uio.h>
 #include <uuid/uuid.h>
 
-extern void redwood_host_keep_add(const char *format, ...) __printflike(1, 2);
 extern kern_return_t kernel_thread_start_priority(thread_continue_t continuation, void *parameter, integer_t priority, thread_t *new_thread);
 extern kern_return_t thread_terminate(thread_t thread);
 
-extern bool RedwoodBluetoothNode(void);                         /* iokit/Kernel/RedwoodBluetooth.cpp: the service "bluetooth" */
-extern void RedwoodBluetoothAddress(const uint8_t *wifi);       /* its local-mac-address: the Wi-Fi address, one up */
-extern void redwood_btsk_init(void);                            /* redwood_btsk.c: the Skywalk kernel pipe bluetoothd's packets go through */
-extern bool redwood_btsk_uuid(uuid_t out);
-extern void redwood_btsk_deliver(const uint8_t *bytes, unsigned length);
-void redwood_connsys_bt_send(const uint8_t *bytes, unsigned length);    /* called by redwood_btsk.c with what bluetoothd wrote */
-void redwood_mtkbt_skel_init(void);
+extern bool MappleBluetoothNode(void);                         /* iokit/Kernel/arm/MappleBluetooth.cpp: the service "bluetooth" */
+extern void MappleBluetoothAddress(const uint8_t *wifi);       /* its local-mac-address: the Wi-Fi address, one up */
+extern void mtk_btsk_init(void);                            /* mtk_btsk.c: the Skywalk kernel pipe bluetoothd's packets go through */
+extern bool mtk_btsk_uuid(uuid_t out);
+extern void mtk_btsk_deliver(const uint8_t *bytes, unsigned length);
+void mtk_bt_send(const uint8_t *bytes, unsigned length);    /* called by mtk_btsk.c with what bluetoothd wrote */
+void mtk_bt_link(const char *args, char *out, size_t len);
 
-#define say(...) redwood_host_keep_add("mtkbt-skel: " __VA_ARGS__)
+#define say(fmt, ...) printf("BT: " fmt "\n", ##__VA_ARGS__)
 
 #define SKEL_TXQ                8192u           /* what bluetoothd has written and the controller has not been given yet */
 #define SKEL_FRAME              4096u           /* one packet from the controller */
@@ -59,7 +52,7 @@ void redwood_mtkbt_skel_init(void);
 
 /*
  * The operations of one phone. All but the two marked optional are required (the skeleton checks). Each returns 0 or an errno unless it says
- * otherwise, and says (redwood_host_keep_add) what it is about to do BEFORE a step that could hang a bus: the last line of a log that ends
+ * otherwise, and says (printf) what it is about to do BEFORE a step that could hang a bus: the last line of a log that ends
  * is the step that hung. All of them are called from one thread, the skeleton's, and never two at once.
  */
 struct mtkbt_platform {
@@ -90,20 +83,43 @@ struct mtkbt_platform {
 	void    (*wake)(void);
 	/*
 	 * optional: the Wi-Fi radio's address, six bytes, for the registry's local-mac-address (the Bluetooth one is made of it, last byte + 1).
-	 * Leave it NULL when the Wi-Fi driver calls RedwoodBluetoothAddress() itself, as redwood_net.c does. Without an address from either,
+	 * Leave it NULL when the Wi-Fi driver calls MappleBluetoothAddress() itself. Without an address from either,
 	 * bluetoothd says "No bluetooth on this device." and stops.
 	 */
 	int     (*wifi_address)(uint8_t out[6]);
 };
 
-/*
- * ---- THE PORT: fill this in ----
- * Nothing is assumed. For the Infinix Hot 20 each of these is a part of redwood_connsys.c: connsys_sw_init and the steps before it (power_on),
- * connsys_bt_start's WMT_FUNC_CTRL (function_on), connsys_stp_send and connsys_stp_receive on channel 0 (send, receive), connsys_btif_wake (wake).
- */
+#if defined(ARM64_BOARD_CONFIG_MT6781)
+extern int mt6631_bt_power_on(void);                   /* bsd/dev/mt6631_wifi.c */
+extern int mt6631_bt_function_on(void);
+extern void mt6631_bt_function_off(void);
+extern int mt6631_bt_send(const uint8_t *h4, unsigned length);
+extern int mt6631_bt_receive(uint8_t *h4, unsigned room, unsigned wait_ms);
+extern void mt6631_bt_wake(void);
+extern void mt6631_wifi_mac(uint8_t mac[6]);
+
+static int
+mt6781_wifi_address(uint8_t out[6])
+{
+	mt6631_wifi_mac(out);
+	return 0;
+}
+
+static const struct mtkbt_platform mtkbt_platform = {
+	.name = "mt6781 / spaced / mt6631",
+	.power_on = mt6631_bt_power_on,
+	.function_on = mt6631_bt_function_on,
+	.function_off = mt6631_bt_function_off,
+	.send = mt6631_bt_send,
+	.receive = mt6631_bt_receive,
+	.wake = mt6631_bt_wake,
+	.wifi_address = mt6781_wifi_address,
+};
+#else
 static const struct mtkbt_platform mtkbt_platform = {
 	.name = NULL,
 };
+#endif
 
 /* ---- the platform check ---- */
 static bool
@@ -172,7 +188,7 @@ skel_dump(const char *direction, const uint8_t *bytes, unsigned length, uint32_t
 }
 
 /* ---- what bluetoothd writes: one queue, drained a whole packet at a time by the bridge ---- */
-static LCK_GRP_DECLARE(skel_lck_grp, "redwood-mtkbt-skel");
+static LCK_GRP_DECLARE(skel_lck_grp, "mtk-bt");
 static LCK_MTX_DECLARE(skel_lock, &skel_lck_grp);
 static uint8_t skel_txq[SKEL_TXQ];
 static unsigned skel_txq_count;
@@ -190,9 +206,9 @@ skel_queue_locked(const uint8_t *bytes, size_t length)
 	return true;
 }
 
-/* H4 bytes the Skywalk channel's user wrote (redwood_btsk.c's sync_tx) */
+/* H4 bytes the Skywalk channel's user wrote (mtk_btsk.c's sync_tx) */
 void
-redwood_connsys_bt_send(const uint8_t *bytes, unsigned length)
+mtk_bt_send(const uint8_t *bytes, unsigned length)
 {
 	lck_mtx_lock(&skel_lock);
 	(void)skel_queue_locked(bytes, length);
@@ -307,7 +323,7 @@ static errno_t
 skel_ctl_getopt(__unused kern_ctl_ref ref, __unused u_int32_t unit, __unused void *unitinfo, int opt, void *data, size_t *len)
 {
 	uuid_t uuid;
-	bool have = (unsigned)opt == 0x40105412u && data != NULL && *len >= sizeof(uuid_t) && redwood_btsk_uuid(uuid);
+	bool have = (unsigned)opt == 0x40105412u && data != NULL && *len >= sizeof(uuid_t) && mtk_btsk_uuid(uuid);
 
 	say("control: getsockopt %#x, room for %zu bytes: %s", (unsigned)opt, *len, have ? "the channel's UUID" : "nothing");
 	if (have) {
@@ -458,6 +474,8 @@ skel_nodes(void)
 static uint8_t skel_frame[SKEL_FRAME];
 static uint8_t skel_packet[SKEL_TXQ];
 static uint32_t skel_said_in, skel_said_out;
+static int skel_state;                  /* 0 idle, 1 the thread runs, 2 the bridge runs (skel_lock) */
+static unsigned skel_good;              /* the last probe's HCI commands answered */
 
 /*
  * One packet from the controller, checked: its length is the one its own header says. Anything else is not published (the stack above would
@@ -594,7 +612,7 @@ skel_bridge(void)
 		if (length > 0) {
 			length = (int)skel_quirks(skel_frame, (unsigned)length);
 			skel_dump("in ", skel_frame, (unsigned)length, &skel_said_in);
-			redwood_btsk_deliver(skel_frame, (unsigned)length);
+			mtk_btsk_deliver(skel_frame, (unsigned)length);
 		} else if (length < 0) {
 			if (errors++ < 8) {
 				say("receive failed (%d)", length);
@@ -605,7 +623,7 @@ skel_bridge(void)
 }
 
 static void
-skel_thread(__unused void *arg, __unused wait_result_t w)
+skel_thread(void *arg, __unused wait_result_t w)
 {
 	static const struct {
 		const char *what;
@@ -640,10 +658,15 @@ skel_thread(__unused void *arg, __unused wait_result_t w)
 	for (unsigned i = 0; i < sizeof(probe) / sizeof(probe[0]); i++) {
 		good += skel_hci(probe[i].what, probe[i].opcode);
 	}
+	skel_good = good;
 	say("%u of %u HCI commands answered as a controller answers", good, (unsigned)(sizeof(probe) / sizeof(probe[0])));
 	if (good != sizeof(probe) / sizeof(probe[0])) {
 		say("not a controller iOS can be given: Bluetooth's function off");
 		p->function_off();
+		goto out;
+	}
+	if ((uintptr_t)arg < 2) {
+		say("%s: the function stays on; bt up for the rest", p->name);
 		goto out;
 	}
 	if (p->wifi_address != NULL) {
@@ -659,14 +682,14 @@ skel_thread(__unused void *arg, __unused wait_result_t w)
 			say("wifi_address gave no address of a station (%d, %02x:%02x:%02x:%02x:%02x:%02x): none is published", error,
 			    wifi[0], wifi[1], wifi[2], wifi[3], wifi[4], wifi[5]);
 		} else {
-			RedwoodBluetoothAddress(wifi);
+			MappleBluetoothAddress(wifi);
 		}
 	}
 	/* iOS looks for the controller in the registry ("bluetooth"): without it BluetoothManager's attach fails with 9 and Settings' switch stays grey */
 	{
 		bool node = false;
 
-		for (unsigned tries = 0; tries < 40 && !(node = RedwoodBluetoothNode()); tries++) {
+		for (unsigned tries = 0; tries < 40 && !(node = MappleBluetoothNode()); tries++) {
 			delay_for_interval(250, NSEC_PER_MSEC);
 		}
 		if (!node) {
@@ -677,23 +700,60 @@ skel_thread(__unused void *arg, __unused wait_result_t w)
 		p->function_off();
 		goto out;
 	}
-	redwood_btsk_init();
+	mtk_btsk_init();
 	say("%s: the bridge runs", p->name);
+	lck_mtx_lock(&skel_lock);
+	skel_state = 2;
+	lck_mtx_unlock(&skel_lock);
 	skel_bridge();
 out:
+	lck_mtx_lock(&skel_lock);
+	skel_state = 0;
+	lck_mtx_unlock(&skel_lock);
 	thread_terminate(current_thread());
 }
 
+/*
+ * USB link "bt [status|on|up]". Boot-arg mp_bt_steps: how far it may go (default 0: status only). 1 on: Bluetooth's function on and the
+ * six HCI commands, nothing shown to iOS. 2 up: then the registry's service, the nodes, the kernel control, the Skywalk pipe and the bridge,
+ * which runs until the next boot.
+ */
 void
-redwood_mtkbt_skel_init(void)
+mtk_bt_link(const char *args, char *out, size_t len)
 {
-	uint32_t level = 0;
+	static int steps = -1;
+	uintptr_t level;
+	int state;
 	thread_t thread;
 
-	if (!PE_parse_boot_argn("mtkbt_skel", &level, sizeof(level)) || level < 1) {
-		return;
+	while (*args == ' ') {
+		args++;
 	}
-	if (kernel_thread_start_priority(skel_thread, NULL, 81 /* BASEPRI_KERNEL */, &thread) == KERN_SUCCESS) {
+	if (steps < 0) {
+		steps = 0;
+		PE_parse_boot_argn("mp_bt_steps", &steps, sizeof(steps));
+	}
+	level = strncmp(args, "on", 2) == 0 ? 1 : strncmp(args, "up", 2) == 0 ? 2 : 0;
+	lck_mtx_lock(&skel_lock);
+	state = skel_state;
+	if (level != 0 && (int)level <= steps && state == 0) {
+		skel_state = 1;
+	}
+	lck_mtx_unlock(&skel_lock);
+	if (level == 0) {
+		snprintf(out, len, "bt: %s, mp_bt_steps=%d; last probe %u of 6; packets out %u, in %u\n",
+		    state == 0 ? "idle" : state == 1 ? "starting" : "the bridge runs", steps, skel_good, skel_said_out, skel_said_in);
+	} else if ((int)level > steps) {
+		snprintf(out, len, "bt %s needs mp_bt_steps=%lu (now %d)\n", level == 1 ? "on" : "up", (unsigned long)level, steps);
+	} else if (state != 0) {
+		snprintf(out, len, "bt: already running (bt status)\n");
+	} else if (kernel_thread_start_priority(skel_thread, (void *)level, 81 /* BASEPRI_KERNEL */, &thread) != KERN_SUCCESS) {
+		lck_mtx_lock(&skel_lock);
+		skel_state = 0;
+		lck_mtx_unlock(&skel_lock);
+		snprintf(out, len, "bt: no thread\n");
+	} else {
 		thread_deallocate(thread);
+		snprintf(out, len, "bt %s: started; its lines are on the console\n", level == 1 ? "on" : "up");
 	}
 }

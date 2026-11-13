@@ -1,13 +1,13 @@
 /*
  * The Skywalk channel iOS's bluetoothd reaches the Bluetooth controller by. Its HCI transport is "H4BC": a PF_SYSTEM socket
- * on the kernel control com.apple.uart.sk.bluetooth (bsd/dev/redwood_connsys.c), on which it sets a channel specification
+ * on the kernel control com.apple.uart.sk.bluetooth (bsd/dev/mtk_bt.c), on which it sets a channel specification
  * (IOAOSSKYSETCHANNELSPEC) and asks for a channel's UUID (IOAOSSKYGETCHANNELUUID), and then os_channel_create()s the channel,
  * syncs its rings and waits for them on a kqueue. On a phone the other end is Apple's IOSkywalkFamily, a kernel pipe
  * (NEXUS_TYPE_KERNEL_PIPE) whose "driver" is the Bluetooth UART's; here the other end is the MediaTek controller behind
  * CONNSYS, and this is its provider, made by bsd/skywalk/nexus/kpipe/nx_kpipe_loopback.c's pattern:
- *   user TX ring  -> sync_tx -> the H4 bytes of each packet go to the controller (redwood_connsys_bt_send)
- *   controller    -> redwood_btsk_deliver -> a queue -> sync_rx puts them in the user's RX ring, one H4 packet a slot
- * Everything the user does to the channel is said (redwood_host_keep_add), the first few times.
+ *   user TX ring  -> sync_tx -> the H4 bytes of each packet go to the controller (mtk_bt_send)
+ *   controller    -> mtk_btsk_deliver -> a queue -> sync_rx puts them in the user's RX ring, one H4 packet a slot
+ * Everything the user does to the channel is said on the console, the first few times.
  */
 #include <kern/locks.h>
 #include <kern/kalloc.h>
@@ -16,10 +16,9 @@
 #include <sys/random.h>
 #include <skywalk/os_skywalk_private.h>
 
-extern void redwood_host_keep_add(const char *format, ...) __printflike(1, 2);
-extern void redwood_connsys_bt_send(const uint8_t *bytes, unsigned length);
+extern void mtk_bt_send(const uint8_t *bytes, unsigned length);
 
-static LCK_GRP_DECLARE(btsk_lck_grp, "redwood-btsk");
+static LCK_GRP_DECLARE(btsk_lck_grp, "mtk-btsk");
 static LCK_MTX_DECLARE(btsk_lock, &btsk_lck_grp);
 
 #define BTSK_RXQ        16384u
@@ -34,7 +33,8 @@ static kern_channel_ring_t btsk_txring, btsk_rxring;
 static kern_pbufpool_t btsk_tx_pp, btsk_rx_pp;
 static uint32_t btsk_said;
 
-#define SAY(...) do { if (btsk_said < 200) { btsk_said++; redwood_host_keep_add(__VA_ARGS__); } } while (0)
+#define LOG(fmt, ...) printf("BT: channel: " fmt "\n", ##__VA_ARGS__)
+#define SAY(...) do { if (btsk_said < 200) { btsk_said++; LOG(__VA_ARGS__); } } while (0)
 
 static errno_t
 btsk_dom_init(__unused kern_nexus_domain_provider_t domprov)
@@ -54,27 +54,27 @@ btsk_pre_connect(__unused kern_nexus_provider_t nxprov, proc_t p, kern_nexus_t n
 	errno_t error = kern_nexus_get_pbufpool(nexus, &btsk_tx_pp, &btsk_rx_pp);
 
 	*ch_ctx = channel;
-	SAY("connsys: bt channel: pre_connect by pid %d, port %u: pbufpools %p %p (%d)", proc_pid(p), port, btsk_tx_pp, btsk_rx_pp, error);
+	SAY("pre_connect by pid %d, port %u: pbufpools %p %p (%d)", proc_pid(p), port, btsk_tx_pp, btsk_rx_pp, error);
 	return 0;
 }
 
 static errno_t
 btsk_connected(__unused kern_nexus_provider_t nxprov, __unused kern_nexus_t nexus, __unused kern_channel_t channel)
 {
-	SAY("connsys: bt channel: connected");
+	SAY("connected");
 	return 0;
 }
 
 static void
 btsk_pre_disconnect(__unused kern_nexus_provider_t nxprov, __unused kern_nexus_t nexus, __unused kern_channel_t channel)
 {
-	SAY("connsys: bt channel: pre_disconnect");
+	SAY("pre_disconnect");
 }
 
 static void
 btsk_disconnected(__unused kern_nexus_provider_t nxprov, __unused kern_nexus_t nexus, __unused kern_channel_t channel)
 {
-	SAY("connsys: bt channel: disconnected");
+	SAY("disconnected");
 }
 
 static errno_t
@@ -89,7 +89,7 @@ btsk_ring_init(__unused kern_nexus_provider_t nxprov, __unused kern_nexus_t nexu
 	}
 	lck_mtx_unlock(&btsk_lock);
 	*ring_ctx = ring;
-	SAY("connsys: bt channel: %s ring made", is_tx_ring ? "TX" : "RX");
+	SAY("%s ring made", is_tx_ring ? "TX" : "RX");
 	return 0;
 }
 
@@ -140,12 +140,12 @@ btsk_sync_tx(__unused kern_nexus_provider_t nxprov, __unused kern_nexus_t nexus,
 					static unsigned slots;
 
 					if (++slots > 90 && slots < 200) {
-						redwood_host_keep_add("connsys: bt channel: TX slot %u, %u bytes at offset %u: %02x %02x %02x %02x %02x %02x %02x %02x", slots, length,
+						LOG("TX slot %u, %u bytes at offset %u: %02x %02x %02x %02x %02x %02x %02x %02x", slots, length,
 						    offset, base[offset], length > 1 ? base[offset + 1] : 0, length > 2 ? base[offset + 2] : 0,
 						    length > 3 ? base[offset + 3] : 0, length > 4 ? base[offset + 4] : 0, length > 5 ? base[offset + 5] : 0,
 						    length > 6 ? base[offset + 6] : 0, length > 7 ? base[offset + 7] : 0);
 					}
-					redwood_connsys_bt_send(base + offset, length);
+					mtk_bt_send(base + offset, length);
 				}
 			}
 			(void)kern_channel_slot_detach_packet(ring, slot, ph);
@@ -179,7 +179,7 @@ btsk_sync_rx(__unused kern_nexus_provider_t nxprov, __unused kern_nexus_t nexus,
 		unsigned room, n = btsk_rxq_count;
 
 		if (kern_pbufpool_alloc_nosleep(btsk_rx_pp, 1, &ph) != 0 || ph == 0) {
-			SAY("connsys: bt channel: no packet for an RX slot");
+			SAY("no packet for an RX slot");
 			break;
 		}
 		buf = kern_packet_get_next_buflet(ph, NULL);
@@ -216,7 +216,7 @@ btsk_sync_rx(__unused kern_nexus_provider_t nxprov, __unused kern_nexus_t nexus,
 
 /* what the controller sent; wakes the user's ring */
 void
-redwood_btsk_deliver(const uint8_t *bytes, unsigned length)
+mtk_btsk_deliver(const uint8_t *bytes, unsigned length)
 {
 	kern_channel_ring_t ring;
 
@@ -238,7 +238,7 @@ redwood_btsk_deliver(const uint8_t *bytes, unsigned length)
 
 /* the channel's UUID, for bluetoothd's getsockopt; false until the nexus is made */
 bool
-redwood_btsk_uuid(uuid_t out)
+mtk_btsk_uuid(uuid_t out)
 {
 	if (!btsk_ready) {
 		return false;
@@ -248,7 +248,7 @@ redwood_btsk_uuid(uuid_t out)
 }
 
 void
-redwood_btsk_init(void)
+mtk_btsk_init(void)
 {
 	nexus_attr_t nxa = NULL;
 	errno_t error;
@@ -281,18 +281,18 @@ redwood_btsk_init(void)
 	};
 
 	read_random(&btsk_nx_ctx, sizeof(btsk_nx_ctx));
-	error = kern_nexus_register_domain_provider(NEXUS_TYPE_KERNEL_PIPE, (const uint8_t *)"redwood_bt", &dom_init, sizeof(dom_init),
+	error = kern_nexus_register_domain_provider(NEXUS_TYPE_KERNEL_PIPE, (const uint8_t *)"mapple_bt", &dom_init, sizeof(dom_init),
 	    &btsk_dom_uuid);
 	if (error != 0) {
-		redwood_host_keep_add("connsys: bt channel: domain provider: %d", error);
+		LOG("domain provider: %d", error);
 		return;
 	}
 	if ((error = kern_nexus_controller_create(&btsk_ncd)) != 0) {
-		redwood_host_keep_add("connsys: bt channel: controller: %d", error);
+		LOG("controller: %d", error);
 		return;
 	}
 	if ((error = kern_nexus_attr_create(&nxa)) != 0) {
-		redwood_host_keep_add("connsys: bt channel: attr: %d", error);
+		LOG("attr: %d", error);
 		return;
 	}
 	(void)kern_nexus_attr_set(nxa, NEXUS_ATTR_ANONYMOUS, 1);
@@ -301,16 +301,16 @@ redwood_btsk_init(void)
 	(void)kern_nexus_attr_set(nxa, NEXUS_ATTR_TX_SLOTS, 64);
 	(void)kern_nexus_attr_set(nxa, NEXUS_ATTR_RX_SLOTS, 64);
 	(void)kern_nexus_attr_set(nxa, NEXUS_ATTR_SLOT_BUF_SIZE, 2048);
-	error = kern_nexus_controller_register_provider(btsk_ncd, btsk_dom_uuid, (const uint8_t *)"com.apple.nexus.redwood_bt", &prov_init,
+	error = kern_nexus_controller_register_provider(btsk_ncd, btsk_dom_uuid, (const uint8_t *)"com.apple.nexus.mapple_bt", &prov_init,
 	    sizeof(prov_init), nxa, &btsk_prov_uuid);
 	kern_nexus_attr_destroy(nxa);
 	if (error != 0) {
-		redwood_host_keep_add("connsys: bt channel: provider: %d", error);
+		LOG("provider: %d", error);
 		return;
 	}
 	error = kern_nexus_controller_alloc_provider_instance(btsk_ncd, btsk_prov_uuid, (const void *)btsk_nx_ctx, NULL, &btsk_nx_uuid, &nx_init);
 	if (error != 0) {
-		redwood_host_keep_add("connsys: bt channel: instance: %d", error);
+		LOG("instance: %d", error);
 		return;
 	}
 	lck_mtx_lock(&btsk_lock);
@@ -320,6 +320,6 @@ redwood_btsk_init(void)
 		uuid_string_t text;
 
 		uuid_unparse_upper(btsk_nx_uuid, text);
-		redwood_host_keep_add("connsys: bt channel: the Skywalk kernel pipe %s is up", text);
+		LOG("the Skywalk kernel pipe %s is up", text);
 	}
 }
