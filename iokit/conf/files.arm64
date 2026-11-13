@@ -51,6 +51,7 @@ iokit/Kernel/arm/hid/IOHIDDeviceElementContainer.cpp             optional iokitc
 iokit/Kernel/arm/hid/IOHIDEventQueue.cpp                         optional iokitcpp
 iokit/Kernel/arm/hid/IOHIDEventSource.cpp                        optional iokitcpp
 iokit/Kernel/arm/hid/IOHIDFamilyPrivate.cpp                      optional iokitcpp
+iokit/Kernel/arm/hid/MappleHIDKeyboard.cpp                       optional iokitcpp
 iokit/Kernel/arm/hid/HIDCheckReport.c                            optional iokitcpp
 iokit/Kernel/arm/hid/HIDCountDescriptorItems.c                   optional iokitcpp
 iokit/Kernel/arm/hid/HIDGetButtonCaps.c                          optional iokitcpp

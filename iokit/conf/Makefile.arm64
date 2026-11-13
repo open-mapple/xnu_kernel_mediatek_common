@@ -37,6 +37,7 @@ IOHIDDeviceElementContainer.cpo_CXXWARNFLAGS_ADD += $(HID_IMPORTED_CXXWARNFLAGS)
 IOHIDEventQueue.cpo_CXXWARNFLAGS_ADD += $(HID_IMPORTED_CXXWARNFLAGS)
 IOHIDEventSource.cpo_CXXWARNFLAGS_ADD += $(HID_IMPORTED_CXXWARNFLAGS)
 IOHIDFamilyPrivate.cpo_CXXWARNFLAGS_ADD += $(HID_IMPORTED_CXXWARNFLAGS)
+MappleHIDKeyboard.cpo_CXXWARNFLAGS_ADD += -Wno-zero-as-null-pointer-constant -Wno-documentation
 HIDCountDescriptorItems.o_CWARNFLAGS_ADD += -Wno-cast-align
 HIDOpenCloseDescriptor.o_CWARNFLAGS_ADD += -Wno-declaration-after-statement
 
