@@ -77,6 +77,7 @@ void speaker_guard_monitor(uint32_t below);                     /* a further red
 void speaker_guard_process(int16_t *frames, uint32_t count);    /* stereo frames, in place */
 void speaker_guard_take_report(struct speaker_guard_report *report);   /* what happened since the last call */
 int speaker_guard_decibels(uint64_t ratio);                     /* 10 log10 of a Q30 ratio, in tenths of a dB */
+uint64_t speaker_guard_amplitude(uint32_t below);               /* below eighths of a dB, as a Q30 factor of amplitude */
 #endif
 
 #endif /* _SYS_MAPPLE_AUDIO_H_ */

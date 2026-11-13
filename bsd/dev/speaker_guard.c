@@ -132,6 +132,13 @@ headroom(uint64_t power, uint64_t limit)
 	return (limit << 30) / power;
 }
 
+/* n eighths of a dB under, as a factor of amplitude (Q30): for a volume applied to the samples before the guard */
+uint64_t
+speaker_guard_amplitude(uint32_t n)
+{
+	return amplitude(n);
+}
+
 void
 speaker_guard_configure(bool hpf, uint32_t gain)
 {

@@ -114,6 +114,8 @@ bsd/dev/mt6631_wlan.c			standard
 bsd/dev/mtk_bt.c			standard
 bsd/dev/mtk_btsk.c			standard
 bsd/dev/mapple_audio.c			standard
+bsd/dev/mtk_audio.c			standard
+bsd/dev/speaker_guard.c			standard
 bsd/dev/mapple_sysctl.c			standard
 bsd/dev/mem.c				standard
 bsd/dev/munge.c 			optional config_requires_u32_munging
