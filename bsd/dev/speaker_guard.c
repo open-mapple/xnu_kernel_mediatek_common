@@ -174,7 +174,10 @@ block(int16_t *frames, uint32_t count)
 			r->peak_in = level;
 		}
 		if (guard.hpf) {
-			y = (hpf_b0 * x + hpf_b1 * guard.x1[c] + hpf_b2 * guard.x2[c] - hpf_a1 * guard.y1[c] - hpf_a2 * guard.y2[c]) >> 30;
+			/* rounded towards zero: flooring holds a constant down to -5.8 samples for ever once the input stops */
+			int64_t sum30 = hpf_b0 * x + hpf_b1 * guard.x1[c] + hpf_b2 * guard.x2[c] - hpf_a1 * guard.y1[c] - hpf_a2 * guard.y2[c];
+
+			y = sum30 >= 0 ? sum30 >> 30 : -(-sum30 >> 30);
 			guard.x2[c] = guard.x1[c];
 			guard.x1[c] = x;
 			guard.y2[c] = guard.y1[c];

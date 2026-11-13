@@ -17,7 +17,8 @@
 #define RATE    48000
 #define BLOCK   960
 
-static double phase, pink_scale = 1;
+static double phase, pink_scale = 1, last_out;
+static int failures;
 static uint64_t noise = 88172645463325252ull;
 
 static double
@@ -98,6 +99,15 @@ run(const char *what, uint32_t attenuation, int kind, double level, double hz, i
 			}
 		}
 		speaker_guard_take_report(&r);
+		last_out = decibels(sum / (2.0 * RATE) * at_speaker);
+		/* the limits at the speaker (0.5 dB for the averages' smoothing): peaks 3 dB and any second 6 dB under; silence is
+		   silent once the high-pass filter's ringing has died away (its first second) */
+		if ((!silent && (20 * log10(peak > 0 ? peak : 1e-9) - attenuation / 8.0 > -3.0 + 0.05 || last_out > -6.0 + 0.5)) ||
+		    (kind == 0 && s > 0 && peak != 0)) {
+			printf("FAILED at %d s: out %.2f dB, peak %.2f dB at the speaker\n", s + 1, last_out,
+			    20 * log10(peak > 0 ? peak : 1e-9) - attenuation / 8.0);
+			failures++;
+		}
 		if ((s + 1) % every == 0 || s == 0) {
 			/* at the speaker: relative to a full-scale square wave at Android's level */
 			printf("%4d s: in %6.1f dB, out %6.1f dB (peak %6.1f dB) at the speaker; guard %5.1f dB (%u rms, %u fast, %u slow "
@@ -129,6 +139,11 @@ main(void)
 	run("a full-scale 1 kHz sine", 160, 1, 1.0, 1000, 10, 5);
 	run("a full-scale 1 kHz sine", 80, 1, 1.0, 1000, 10, 5);
 	run("a full-scale 1 kHz sine", 0, 1, 1.0, 1000, 120, 10);
+	if (last_out > -11.0) {
+		/* the 60 s average's limit is 12 dB under; after two minutes the level is most of the way down to it */
+		printf("FAILED: two minutes of a full-scale tone end %.2f dB at the speaker\n", last_out);
+		failures++;
+	}
 	run("silence, the speakers cooling", SPEAKER_GUARD_SILENT, 0, 0, 0, 120, 20);
 	run("the same sine again", 0, 1, 1.0, 1000, 5, 1);
 	run("silence", SPEAKER_GUARD_SILENT, 0, 0, 0, 300, 300);
@@ -144,5 +159,6 @@ main(void)
 	run("pink noise at -24 dB RMS (loud music as Darwin leaves it) with 12 dB of gain", 0, 2, pow(10, -24 / 20.0), 0, 60, 20);
 	run("silence", SPEAKER_GUARD_SILENT, 0, 0, 0, 600, 600);
 	run("the same with the amplifiers 90 dB under (sound_below=720)", 720, 2, pow(10, -24 / 20.0), 0, 10, 5);
-	return 0;
+	printf("%s\n", failures ? "speaker_guard_test: FAILED" : "speaker_guard_test: ok");
+	return failures != 0;
 }
