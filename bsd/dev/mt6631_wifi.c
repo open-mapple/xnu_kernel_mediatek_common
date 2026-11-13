@@ -67,7 +67,6 @@
 #include "mt6631_wpa.h"
 #include "mt6631_wlan.h"
 
-extern void mtk_bt_wmt_up(void);                /* bsd/dev/mtk_bt.c */
 
 extern int mtk_pwrap_read(uint32_t addr, uint32_t *value);                                  /* MTKPwrap.cpp */
 extern int mtk_pwrap_write_regulator(uint32_t addr, uint32_t mask, uint32_t value);
@@ -406,6 +405,20 @@ static struct {
 	uint32_t oldM23, oldM24, oldDrv;
 } vw;
 
+/* True once WIFI_FW_DIR's MCU patch opens (the root is mounted): Bluetooth's boot waits for it. */
+bool
+mt6631_wifi_firmware_present(void)
+{
+	vfs_context_t ctx = vfs_context_kernel();
+	vnode_t vp = NULLVP;
+
+	if (vnode_open(WIFI_FW_DIR "soc2_2_ram_mcu_2_1_hdr.bin", FREAD, 0, 0, &vp, ctx) != 0) {
+		return false;
+	}
+	vnode_close(vp, FREAD, ctx);
+	return true;
+}
+
 /* Read WIFI_FW_DIR/name into the EMI window at its header's offset (header dropped); its date at +dateOff. */
 static int
 load_patch(const char *name, uint32_t wantOff, uint32_t dateOff, char *out, size_t len, size_t *po)
@@ -484,6 +497,17 @@ pinmux_restore(void)
 }
 
 static void wl_reset(void);      /* station state, defined with it */
+
+/*
+ * CONNSYS is Wi-Fi's and Bluetooth's: powered up to WMT (wifi_on, wifi_wmt) for its first user and down (wifi_off) after its last.
+ * Wi-Fi turned off while Bluetooth holds it leaves the radio idle (no scan, no link, the firmware running). The link's own
+ * "wifi on"/"wifi off" do not count. vw_mtx held.
+ */
+#define CONN_WIFI               (1u << 0)
+#define CONN_BT                 (1u << 1)
+static uint32_t conn_users;
+static bool conn_get(uint32_t user, char *out, size_t len, size_t *po);
+static void conn_put(uint32_t user, char *out, size_t len, size_t *po);
 
 static LCK_GRP_DECLARE(btif_lck_grp, "mt6631_btif");
 static LCK_MTX_DECLARE(btif_mtx, &btif_lck_grp);       /* BTIF and st: "wifi wmt" and Bluetooth (bsd/dev/mtk_bt.c) */
@@ -928,16 +952,13 @@ wifi_wmt(char *out, size_t len, size_t o)
  * Its function on is WMT_FUNC_CTRL (wmt_core_func_ctrl_cmd, type 0 BT); then HCI packets, H4 type byte first, are the payload
  * of STP frames on channel 0 (BT_TASK_INDX, stp_exp.h).
  */
+static bool bt_conn(bool hold);
+
+/* CONNSYS up to WMT for Bluetooth, whether or not Wi-Fi is on */
 int
 mt6631_bt_power_on(void)
 {
-	lck_mtx_lock(&btif_mtx);
-	bool up = vw.wmt;
-	lck_mtx_unlock(&btif_mtx);
-	if (!up) {
-		printf("BT: no WMT yet (wifi on, wifi wmt)\n");
-	}
-	return up ? 0 : ENXIO;
+	return bt_conn(true) ? 0 : ENXIO;
 }
 
 static int
@@ -975,10 +996,12 @@ mt6631_bt_function_on(void)
 	return bt_func(1);
 }
 
+/* only where Bluetooth gives up: its hold on CONNSYS goes with it */
 void
 mt6631_bt_function_off(void)
 {
 	(void)bt_func(0);
+	(void)bt_conn(false);
 }
 
 int
@@ -3119,17 +3142,8 @@ hw_key(bool pairwise, uint8_t keyid, const uint8_t *key, uint32_t klen, const ui
 static size_t
 wifi_up(char *out, size_t len, size_t o)
 {
-	if (!vw.on) {
-		o = wifi_on(out, len, o);
-		if (!vw.on || rd(CONN_MCU_COM_REG0) != CONN_IDLE_MAGIC) {
-			return o;
-		}
-	}
-	if (!vw.wmt) {
-		o = wifi_wmt(out, len, o);
-		if (!vw.wmt) {
-			return o;
-		}
+	if (!conn_get(CONN_WIFI, out, len, &o)) {
+		return o;
 	}
 	if ((rd(WF_READY) & 0x6) != 0x6) {
 		o = wifi_fw(out, len, o);
@@ -3141,6 +3155,35 @@ wifi_up(char *out, size_t len, size_t o)
 		o = wifi_init(out, len, o);
 	}
 	return o;
+}
+
+static bool
+conn_get(uint32_t user, char *out, size_t len, size_t *po)
+{
+	size_t o = *po;
+
+	if (!vw.on) {
+		o = wifi_on(out, len, o);
+	}
+	if (vw.on && !vw.wmt && rd(CONN_MCU_COM_REG0) == CONN_IDLE_MAGIC) {
+		o = wifi_wmt(out, len, o);
+	}
+	if (vw.on && vw.wmt) {
+		conn_users |= user;
+	} else if (vw.on && conn_users == 0) {
+		o = wifi_off(out, len, o);              /* half up and nobody else on it */
+	}
+	*po = o;
+	return (conn_users & user) != 0;
+}
+
+static void
+conn_put(uint32_t user, char *out, size_t len, size_t *po)
+{
+	conn_users &= ~user;
+	if (conn_users == 0 && vw.on) {
+		*po = wifi_off(out, len, *po);
+	}
 }
 
 /* Status for the ioctls (vw_mtx held). */
@@ -3206,6 +3249,29 @@ vw_unlock(void)
 	}
 }
 
+/* Bluetooth's hold on CONNSYS (conn_get/conn_put), from its own thread */
+static bool
+bt_conn(bool hold)
+{
+	static char log[4096];
+	size_t o = 0;
+	bool held;
+
+	log[0] = 0;
+	lck_mtx_lock(&vw_mtx);
+	if (hold) {
+		held = conn_get(CONN_BT, log, sizeof(log), &o);
+	} else {
+		conn_put(CONN_BT, log, sizeof(log), &o);
+		held = false;
+	}
+	vw_unlock();
+	if (log[0]) {
+		printf("WIFI: %s", log);
+	}
+	return held;
+}
+
 /*
  * Boot-arg mp_wifi_steps: how far the link and the WLAN layer may go (default 0: status only). 1 detect (the A-die
  * probe, Android's at every boot, restored after), 2 on/off (rails incl. VCN33's voltage, MTCMOS, RAM patches),
@@ -3250,14 +3316,18 @@ sta_step(char *out, size_t len, size_t *po)
 		} else if (want && !wl.init) {
 			o = wifi_up(out, len, o);
 			say("power: radio %s\n", wl.init ? "UP" : "FAILED to come up");
-			if (!wl.init && vw.on) {
-				o = wifi_off(out, len, o);      /* the next request tries again from scratch */
+			if (!wl.init) {
+				conn_put(CONN_WIFI, out, len, &o);      /* the next request tries again from scratch */
 			}
 			changed = wl.init;
-		} else if (!want && vw.on) {
+		} else if (want && !(conn_users & CONN_WIFI)) {
+			conn_users |= CONN_WIFI;
+			say("power: radio UP (it stayed up for Bluetooth)\n");
+			changed = true;
+		} else if (!want && (conn_users & CONN_WIFI)) {
 			sta_leave(out, len, &o);
-			o = wifi_off(out, len, o);
-			say("power: radio off\n");
+			conn_put(CONN_WIFI, out, len, &o);
+			say("power: radio %s\n", vw.on ? "idle (Bluetooth keeps CONNSYS on)" : "off");
 			changed = true;
 		}
 		if (changed || (req & REQ_POWER_EVENT)) {
@@ -3354,9 +3424,6 @@ vw_worker(__unused void *arg, __unused wait_result_t wr)
 		vw_unlock();
 		if (log[0]) {
 			printf("WIFI: %s", log);
-		}
-		if (up) {
-			mtk_bt_wmt_up();
 		}
 		struct timespec ts = { 0, (busy ? 1 : link ? 2 : 20) * NSEC_PER_MSEC };
 		lck_mtx_lock(&vs_mtx);
