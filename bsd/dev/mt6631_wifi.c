@@ -3390,7 +3390,7 @@ mt6631_wifi_link(const char *args, char *out, size_t len)
 	/*
 	 * Boot-arg mp_wifi_steps: how far the link may go (default 0: status only). 1 detect (the A-die probe, Android's
 	 * at every boot, restored after), 2 on/off (rails incl. VCN33's voltage, MTCMOS, RAM patches), 3 wmt/fw/cap,
-	 * 4 init/up/scan/join/leave/sta/ring.
+	 * 4 init/up/scan, 5 join/leave/sta/ring.
 	 */
 	static int steps = -1;
 	if (steps < 0) {
@@ -3399,7 +3399,7 @@ mt6631_wifi_link(const char *args, char *out, size_t len)
 	}
 	static const struct { const char *cmd; int step; } need[] = {
 		{ "detect", 1 }, { "on", 2 }, { "off", 2 }, { "wmt", 3 }, { "fw", 3 }, { "cap", 3 }, { "init", 4 }, { "up", 4 },
-		{ "scan", 4 }, { "join", 4 }, { "leave", 4 }, { "sta", 4 }, { "ring", 4 },
+		{ "scan", 4 }, { "join", 5 }, { "leave", 5 }, { "sta", 5 }, { "ring", 5 },
 	};
 	for (unsigned i = 0; i < sizeof(need) / sizeof(need[0]); i++) {
 		if (strncmp(args, need[i].cmd, strlen(need[i].cmd)) == 0 && need[i].step > steps) {

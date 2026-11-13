@@ -8,6 +8,9 @@
  * mt6631_wifi_dma_alloc(): the WFDMA rings and buffers (any contiguous range below 4 GiB; the WFDMA takes 36 bits).
  * mt6631_wifi_reserve(): both taken at boot (MTKPwrap::start), before the contiguous scanout surfaces (mp_fb_scanout=1)
  * fragment the memory below 4 GiB; boot-arg mp_wifi=0 skips it (then "wifi on" tries later, and may fail).
+ * Boot-arg mp_wifi_emi=PA: the window at that physical address instead, only if all of it lies in one of the
+ * memory holes XNU never manages (mp_mem4g): on spaced 0xbf000000, where Android puts it, inside its Wi-Fi hole and
+ * Android's EMI MPU region 27 (AP and CONN allowed).
  */
 #include <pexpert/arm64/board_config.h>
 
@@ -16,11 +19,36 @@
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <pexpert/pexpert.h>
 
-static IOBufferMemoryDescriptor *gMappleWiFiEMI;
+static IOMemoryDescriptor *gMappleWiFiEMI;
+static IOMemoryMap *gMappleWiFiEMIMap;
+
+extern "C" bool mapple_pa_in_hole(uint64_t pa);      /* osfmk/arm64/arm_vm_init.c */
 
 extern "C" void *
 mt6631_wifi_emi_alloc(uint32_t size, uint64_t *pa)
 {
+	uint64_t fixed = 0;
+	if (gMappleWiFiEMI == NULL && PE_parse_boot_argn("mp_wifi_emi", &fixed, sizeof(fixed)) && fixed != 0) {
+		if ((fixed & 0xffff) || !mapple_pa_in_hole(fixed) || !mapple_pa_in_hole(fixed + size - 1)) {
+			IOLog("WIFI: mp_wifi_emi 0x%llx refused: not 64 KiB aligned inside one memory hole\n", fixed);
+			return NULL;
+		}
+		gMappleWiFiEMI = IOMemoryDescriptor::withPhysicalAddress(fixed, size, kIODirectionInOut);
+		gMappleWiFiEMIMap = gMappleWiFiEMI ? gMappleWiFiEMI->map() : NULL;
+		if (gMappleWiFiEMIMap == NULL) {
+			OSSafeReleaseNULL(gMappleWiFiEMI);
+			return NULL;
+		}
+		bzero((void *)gMappleWiFiEMIMap->getVirtualAddress(), size);
+		gMappleWiFiEMI->performOperation(kIOMemoryIncoherentIOFlush, 0, size);
+	}
+	if (gMappleWiFiEMIMap != NULL) {
+		if (gMappleWiFiEMI->getLength() < size) {
+			return NULL;
+		}
+		*pa = gMappleWiFiEMI->getPhysicalSegment(0, NULL, kIOMemoryMapperNone);
+		return (void *)gMappleWiFiEMIMap->getVirtualAddress();
+	}
 	if (gMappleWiFiEMI == NULL) {
 		static const uint64_t masks[] = { 0x00000000ff000000ull, 0x00000000ffff0000ull };
 		for (unsigned i = 0; i < 2 && gMappleWiFiEMI == NULL; i++) {
@@ -30,14 +58,14 @@ mt6631_wifi_emi_alloc(uint32_t size, uint64_t *pa)
 		if (gMappleWiFiEMI == NULL) {
 			return NULL;
 		}
-		bzero(gMappleWiFiEMI->getBytesNoCopy(), size);
+		bzero(((IOBufferMemoryDescriptor *)gMappleWiFiEMI)->getBytesNoCopy(), size);
 		gMappleWiFiEMI->performOperation(kIOMemoryIncoherentIOFlush, 0, size);
 	}
 	if (gMappleWiFiEMI->getLength() < size) {
 		return NULL;
 	}
 	*pa = gMappleWiFiEMI->getPhysicalSegment(0, NULL, kIOMemoryMapperNone);
-	return gMappleWiFiEMI->getBytesNoCopy();
+	return ((IOBufferMemoryDescriptor *)gMappleWiFiEMI)->getBytesNoCopy();
 }
 
 static IOBufferMemoryDescriptor *gMappleWiFiDMA;
