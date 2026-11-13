@@ -364,6 +364,127 @@ skel_ctl_register(void)
 }
 
 /*
+ * ---- BlueTool's channel ----
+ * BlueTool's built-in boot script (chosen by MobileGestalt's WifiVendor) opens the kernel control com.apple.uart.bluetooth, sets the line
+ * with termios over getsockopt/setsockopt, and brings up a Broadcom chip: reset, baud rates, the RAM firmware embedded in BlueTool (0xfc2e,
+ * write-RAM records, launch-RAM), address, name, calibration, sleep mode -- each command waiting for its Command Complete with status 0.
+ * The controller is up already: every command is answered here, as a Broadcom chip would, and nothing reaches the MT6631.
+ * Read_Local_Version says Broadcom (15) with a BCM4357B1's LMP subversion (0x420e): its calibration step needs a chip name.
+ */
+static kern_ctl_ref bcm_ctl_ref;
+static uint8_t bcm_termios[0x48];
+static uint8_t bcm_in[4 + 255];         /* the command being written */
+static unsigned bcm_have;
+static uint32_t bcm_said;
+
+static void
+bcm_answer(u_int32_t unit, uint16_t opcode)
+{
+	static const uint8_t version[8] = { 0x06, 0x00, 0x10, 0x06, 0x0f, 0x00, 0x0e, 0x42 };
+	uint8_t event[7 + sizeof(version)] = { 0x04, 0x0e, 4, 0x01, (uint8_t)opcode, (uint8_t)(opcode >> 8), 0x00 };
+	unsigned length = 7;
+
+	if (opcode == 0x1001) {
+		memcpy(event + 7, version, sizeof(version));
+		event[2] += sizeof(version);
+		length += sizeof(version);
+	}
+	if (bcm_said++ < 64) {
+		say("BlueTool: %#06x answered here", opcode);
+	}
+	(void)ctl_enqueuedata(bcm_ctl_ref, unit, event, length, 0);
+}
+
+static errno_t
+bcm_ctl_connect(__unused kern_ctl_ref ref, struct sockaddr_ctl *sac, __unused void **unitinfo)
+{
+	char name[32] = "";
+
+	proc_selfname(name, sizeof(name));
+	say("BlueTool's control connected by %s (pid %d): unit %u", name, proc_selfpid(), sac->sc_unit);
+	bcm_have = 0;
+	return 0;
+}
+
+static errno_t
+bcm_ctl_disconnect(__unused kern_ctl_ref ref, u_int32_t unit, __unused void *unitinfo)
+{
+	say("BlueTool's control: unit %u disconnected", unit);
+	return 0;
+}
+
+/* H4 command packets, however the writes split them; anything that is not a command is dropped */
+static errno_t
+bcm_ctl_send(__unused kern_ctl_ref ref, u_int32_t unit, __unused void *unitinfo, mbuf_t m, __unused int flags)
+{
+	for (mbuf_t part = m; part != NULL; part = mbuf_next(part)) {
+		const uint8_t *bytes = mbuf_data(part);
+
+		for (size_t i = 0; i < mbuf_len(part); i++) {
+			bcm_in[bcm_have++] = bytes[i];
+			if (bcm_in[0] != 0x01) {
+				if (bcm_said++ < 64) {
+					say("BlueTool: a write begins with %02x, not a command: dropped", bcm_in[0]);
+				}
+				bcm_have = 0;
+			} else if (bcm_have >= 4 && bcm_have == 4u + bcm_in[3]) {
+				bcm_answer(unit, (uint16_t)(bcm_in[1] | bcm_in[2] << 8));
+				bcm_have = 0;
+			}
+		}
+	}
+	mbuf_freem(m);
+	return 0;
+}
+
+/* the line's termios (TIOCSETA/W/F, TIOCGETA): kept and given back, nothing else changes */
+static errno_t
+bcm_ctl_setopt(__unused kern_ctl_ref ref, __unused u_int32_t unit, __unused void *unitinfo, int opt, void *data, size_t len)
+{
+	if (((unsigned)opt == TIOCSETA || (unsigned)opt == TIOCSETAW || (unsigned)opt == TIOCSETAF) && data != NULL) {
+		memcpy(bcm_termios, data, MIN(len, sizeof(bcm_termios)));
+	} else if (bcm_said++ < 64) {
+		say("BlueTool: setsockopt %#x, %zu bytes: taken", (unsigned)opt, len);
+	}
+	return 0;
+}
+
+static errno_t
+bcm_ctl_getopt(__unused kern_ctl_ref ref, __unused u_int32_t unit, __unused void *unitinfo, int opt, void *data, size_t *len)
+{
+	if ((unsigned)opt == TIOCGETA && data != NULL) {
+		*len = MIN(*len, sizeof(bcm_termios));
+		memcpy(data, bcm_termios, *len);
+	} else {
+		if (bcm_said++ < 64) {
+			say("BlueTool: getsockopt %#x: nothing", (unsigned)opt);
+		}
+		*len = 0;
+	}
+	return 0;
+}
+
+static void
+bcm_ctl_register(void)
+{
+	struct kern_ctl_reg reg;
+	errno_t error;
+
+	bzero(&reg, sizeof(reg));
+	strlcpy(reg.ctl_name, "com.apple.uart.bluetooth", sizeof(reg.ctl_name));
+	reg.ctl_flags = CTL_FLAG_REG_SOCK_STREAM;
+	reg.ctl_sendsize = 65536;
+	reg.ctl_recvsize = 65536;
+	reg.ctl_connect = bcm_ctl_connect;
+	reg.ctl_disconnect = bcm_ctl_disconnect;
+	reg.ctl_send = bcm_ctl_send;
+	reg.ctl_setopt = bcm_ctl_setopt;
+	reg.ctl_getopt = bcm_ctl_getopt;
+	error = ctl_register(&reg, &bcm_ctl_ref);
+	say("kernel control com.apple.uart.bluetooth (BlueTool's) %s (%d)", error == 0 ? "registered" : "NOT REGISTERED", error);
+}
+
+/*
  * ---- the nodes ----
  * /dev/btwake, /dev/btreset, /dev/btpoweroff: bluetoothd opens btwake again and again, BlueTool the others; on Apple's hardware they are pins.
  * Nothing is behind them here: opened, read as empty, written and forgotten, the terminal ioctls taken. (The working driver also makes
@@ -545,6 +666,40 @@ skel_hci(const char *what, uint16_t opcode)
 	return false;
 }
 
+/* bluetoothd's vendor commands (OGF 0x3f) and Read_Local_Version on the real channel, and their answers: the first 300 lines */
+static uint32_t skel_vsc_said;
+
+static bool
+skel_vsc_watched(uint16_t opcode)
+{
+	return (opcode >> 10) == 0x3f || opcode == 0x1001;
+}
+
+static void
+skel_vsc_out(const uint8_t *packet, unsigned length)
+{
+	uint16_t opcode = length >= 4 ? (uint16_t)(packet[1] | packet[2] << 8) : 0;
+
+	if (length >= 4 && packet[0] == 0x01 && skel_vsc_watched(opcode) && skel_vsc_said++ < 300) {
+		say("bluetoothd sends %#06x, %u bytes of parameters", opcode, packet[3]);
+	}
+}
+
+static void
+skel_vsc_in(const uint8_t *event, unsigned length, const char *who)
+{
+	bool complete = length >= 7 && event[0] == 0x04 && event[1] == 0x0e;
+	bool status = length >= 7 && event[0] == 0x04 && event[1] == 0x0f;
+	uint16_t opcode = complete ? (uint16_t)(event[4] | event[5] << 8) : status ? (uint16_t)(event[5] | event[6] << 8) : 0;
+
+	if ((complete || status) && skel_vsc_watched(opcode) && skel_vsc_said++ < 300) {
+		say("%s %#06x: %s, status %#x", who, opcode, complete ? "Command Complete" : "Command Status", complete ? event[6] : event[3]);
+		if (complete && opcode == 0x1001 && length >= 15) {
+			say("Read_Local_Version: manufacturer %u, LMP subversion %#x", event[11] | event[12] << 8, event[13] | event[14] << 8);
+		}
+	}
+}
+
 /* what is written is sent a packet at a time; what comes is given to the Skywalk channel. Never returns. */
 static void
 skel_bridge(void)
@@ -586,6 +741,7 @@ skel_bridge(void)
 				skel_vsc_sub = skel_packet[4];
 			}
 			skel_dump("out", skel_packet, n, &skel_said_out);
+			skel_vsc_out(skel_packet, n);
 			if (p->wake != NULL) {
 				p->wake();
 			}
@@ -617,7 +773,14 @@ skel_bridge(void)
 		}
 		length = skel_receive(2);
 		if (length > 0) {
+			uint8_t head[7];
+
+			memcpy(head, skel_frame, MIN(sizeof(head), (unsigned)length));
+			skel_vsc_in(skel_frame, (unsigned)length, "the MT6631 answers");
 			length = (int)skel_quirks(skel_frame, (unsigned)length);
+			if (length >= 7 && memcmp(head, skel_frame, sizeof(head)) != 0) {
+				skel_vsc_in(skel_frame, (unsigned)length, "the bridge answers instead");
+			}
 			skel_dump("in ", skel_frame, (unsigned)length, &skel_said_in);
 			mtk_btsk_deliver(skel_frame, (unsigned)length);
 		} else if (length < 0) {
@@ -707,6 +870,7 @@ skel_thread(void *arg, __unused wait_result_t w)
 		p->function_off();
 		goto out;
 	}
+	bcm_ctl_register();
 	mtk_btsk_init();
 	say("%s: the bridge runs", p->name);
 	lck_mtx_lock(&skel_lock);
