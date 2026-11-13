@@ -7,8 +7,9 @@
  * firmware started, how the Bluetooth function is switched on, and how a packet gets to the controller and back -- is a table of operations,
  * struct mtkbt_platform, that a port fills in. Nothing here knows a register.
  *
- * It does nothing until the USB link asks for it ("bt on", "bt up": mtk_bt_link below, gated by the boot-arg mp_bt_steps) AND the
- * platform is complete: every operation that is still missing is said and nothing is made.
+ * It does nothing until the USB link asks for it or Wi-Fi's radio comes up ("bt on", "bt up": mtk_bt_link and mtk_bt_wmt_up
+ * below, gated by the boot-arg mp_bt_steps) AND the platform is complete: every operation that is still missing is said and
+ * nothing is made.
  *
  * The MT6781's platform is the Wi-Fi driver's STP over BTIF (bsd/dev/mt6631_wifi.c, mt6631_bt_*): CONNSYS comes up with "wifi on" and
  * "wifi wmt", and Bluetooth's packets then go on STP's channel 0 beside WMT's.
@@ -717,6 +718,21 @@ out:
 	skel_state = 0;
 	lck_mtx_unlock(&skel_lock);
 	thread_terminate(current_thread());
+}
+
+/* Wi-Fi's radio is up (WMT, and the BT RAM patch "wifi on" loads): once a boot, "bt up" as if the link asked (mp_bt_steps). */
+void
+mtk_bt_wmt_up(void)
+{
+	static bool done;
+	char out[128];
+
+	if (done) {
+		return;
+	}
+	done = true;
+	mtk_bt_link("up", out, sizeof(out));
+	printf("BT: Wi-Fi is up: %s", out);
 }
 
 /*
