@@ -8,7 +8,7 @@
  * are the ceiling, and the writes enforce it: MTKPwrap::writeAudio (codec, VIBR), mt6781_afe.c (clocks, AFE),
  * pa_write() here (the amplifier). The samples go through the speaker guard (bsd/dev/speaker_guard.c) last.
  *
- * Boot-arg mp_audio_steps (default 4; 0 on a safe boot, whose line has mp_bootrec=0), each with the ones before it:
+ * Boot-arg mp_audio_steps (default 5; 0 on a safe boot, whose line has mp_bootrec=0), each with the ones before it:
  *   0  status, read only: the codec's rails and IDs, the AFE's clocks and pins, the amplifier's pin, the motor's rail
  *   1  clocks, AFE, ADDA DL and the codec's supplies and digital path up; held mp_audio_secs, then all down
  *   2  the codec's line-out up and a 1 kHz tone through DL1, the amplifier off; held, then down
@@ -933,7 +933,7 @@ mtk_audio_start(void)
 	uint32_t record = 1;
 
 	(void)PE_parse_boot_argn("mp_bootrec", &record, sizeof(record));
-	steps = record == 0 ? 0 : 4;
+	steps = record == 0 ? 0 : 5;
 	vib_steps = record == 0 ? 0 : 2;
 	(void)PE_parse_boot_argn("mp_audio_steps", &steps, sizeof(steps));
 	(void)PE_parse_boot_argn("mp_audio_below", &below_base, sizeof(below_base));

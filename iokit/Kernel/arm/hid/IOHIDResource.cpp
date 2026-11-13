@@ -32,9 +32,13 @@ OSDefineMetaClassAndStructors( IOHIDResource, IOService )
 
 bool IOHIDResource::start(IOService *provider)
 {    
-    uint32_t enable = 0;
+    uint32_t record = 1, enable;
 
-    if ( !PE_parse_boot_argn("mp_hidres", &enable, sizeof(enable)) || !enable )
+    // on by default; off on a safe boot (mp_bootrec=0) or with mp_hidres=0
+    (void)PE_parse_boot_argn("mp_bootrec", &record, sizeof(record));
+    enable = record != 0;
+    (void)PE_parse_boot_argn("mp_hidres", &enable, sizeof(enable));
+    if ( !enable )
         return false;
 
     if ( !super::start(provider) )
