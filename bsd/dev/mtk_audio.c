@@ -53,8 +53,8 @@ extern void mt6781_afe_down(void);
 #define AW87319         0x58
 #define SIA8109         0x28
 #define SIA_MODE        6               /* the phone's owi_mode: the only one sent */
-#define VIBR_VOSEL      0xff            /* Android's VIBR_ANA_CON0 [11:8] (AUDIO.md, the VIBR dump), as in MTKPwrap.cpp's
-                                         * whitelist; 0xff: not known yet, the motor stays off */
+#define VIBR_VOSEL      4               /* 1.8 V: Android's VIBR_ANA_CON0 [11:8] (its vibrator's vmax, at most 9 = 2.8 V),
+                                         * as in MTKPwrap.cpp's whitelist */
 
 static uint32_t steps, vib_steps, below_base = 160, gain, secs = 5;
 
@@ -237,17 +237,17 @@ lineout_down(void)
 /* ---- the amplifier ---- */
 
 enum { PA_NONE, PA_AW87319, PA_SIA8109 };
-#define PA_FITTED       PA_NONE         /* the amplifier this phone has, from Android (AUDIO.md: the I2C3 probe) */
+#define PA_FITTED       PA_AW87319      /* Android drives only the AW87319 (mt6781-mt6366.c); its ID is read before any write */
 static int pa_kind;
 static bool pa_on;
 static bool sia_i2c;            /* the SIA8109 answers on I2C (0x41 reads 0x09): Android's registers are written */
 
 /*
- * AW87319: registers 0x01-0x09 as Android has them while it plays on the speaker (AUDIO.md: the I2C3 dump), the only
- * values written, in this order, SYSCTRL (0x01) last; switched off by SYSCTRL without EN_SW (bit 2). 0 until known.
+ * AW87319: registers 0x01-0x09 as Android sets them for the speaker (its aw87319_spk.bin: the ID, then 0x01-0x09), the
+ * only values written, in this order, SYSCTRL (0x01) last; switched off by SYSCTRL without EN_SW (bit 2).
  */
-#define AW_ANDROID      0
-static const uint8_t aw_android[10] = { 0 };
+#define AW_ANDROID      1
+static const uint8_t aw_android[10] = { 0x9b, 0x07, 0x28, 0x05, 0x04, 0x09, 0x05, 0x52, 0xa8, 0x03 };
 
 /* SIA8109: Android's register values (sia8109_regs.c), the only ones written; 0x02 = 0xcc is its boost, 8.5 V. */
 static const uint8_t sia_regs[14] = { 0x07, 0x80, 0xcc, 0x19, 0x26, 0x0a, 0x02, 0x28, 0x05, 0x8a, 0x00, 0x00, 0x00, 0x00 };
