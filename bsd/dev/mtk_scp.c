@@ -14,7 +14,9 @@
  *   (cfg+0 = 1) when LK's region info is there and its DRAM lies in a memory hole; READY (30 s), the hub's
  *   INIT_DONE, the ring (1 MiB below 2 GiB, taken at boot) given with SET_CONFIG, SET_TIMESTAMP every 10 s. The SCP's
  *   first 64 messages are logged.
- * 3 the accelerometer and its HID service (one sample a second logged for the first 30 s).
+ * 3 the accelerometer and its HID service (one sample a second logged for the first 30 s). For 30 s after the hub is
+ *   up, a status line a second (the ring's header, what was pushed) and, at 3 and 6 s, the hub's own latest accel
+ *   record (GET_DATA).
  * 4 the plain sensors and their HID services.
  * 5 and what locationd reads from the SPU beyond them: steps and activity, raise to wake, device motion.
  */
@@ -61,6 +63,8 @@ static uint64_t hz, last_stamp;
 static int64_t offset;                  /* system counter - hub ticks (mtk_scp_hub.h) */
 static int64_t mach_minus_counter;
 static uint32_t nh_seq;
+static uint32_t notifies, records, last_wp, bad_wp;      /* what the hub has pushed, for the status lines */
+static uint8_t last_event;
 
 /* what the HID services want, per Android type; applied by the thread */
 static LCK_GRP_DECLARE(scp_grp, "mp_scp");
@@ -92,20 +96,39 @@ say(uint32_t id, const uint8_t *m, uint32_t len)
 	}
 }
 
+/* the ring's own header: the hub moves wp as it writes (the Hot 20 read its samples from it) */
+static uint32_t
+ring_word(uint32_t off)
+{
+	return *(volatile uint32_t *)(ring + off);
+}
+
+/*
+ * Records up to wp (from a notification, or the header while no notification has come: then stamped on arrival, as
+ * there is no clock pairing); a wp that is not a record boundary is counted, not used.
+ */
 static void
 drain(uint32_t wp)
 {
-	uint32_t rp = sh_get32((const uint8_t *)ring);
+	uint64_t arrival = notifies ? 0 : mach_absolute_time();
+	uint32_t rp = ring_word(0);
 	uint32_t n = sh_ring_count(rp, wp);
 	uint8_t rec[SH_REC];
 	struct sh_record r;
 
+	if (n == 0 && wp != rp && (wp % SH_REC || wp > SH_RING_DATA)) {
+		if (bad_wp++ < 4) {
+			printf("scp: ring wp %u not a record boundary (rp %u, header wp %u)\n", wp, rp, ring_word(4));
+		}
+		return;
+	}
+	records += n;
 	for (; n; n--) {
 		for (uint32_t i = 0; i < SH_REC; i++) {
 			rec[i] = ring[SH_RING_HDR + rp + i];
 		}
 		sh_parse_record(rec, &r);
-		mapple_spu_record(&r, (uint64_t)((int64_t)sh_record_ticks(r.scp_ns, offset, hz) + mach_minus_counter));
+		mapple_spu_record(&r, arrival ? arrival : (uint64_t)((int64_t)sh_record_ticks(r.scp_ns, offset, hz) + mach_minus_counter));
 		rp = sh_ring_next(rp);
 	}
 	*(volatile uint32_t *)ring = wp == SH_RING_DATA ? 0 : wp;
@@ -135,6 +158,11 @@ pump(void)
 				say(id, m, len);
 				hub_init = true;
 			} else if (hub_up && (nt.event == SH_EV_DIRECT_PUSH || nt.event == SH_EV_FIFO_FULL)) {
+				if (notifies++ < 4) {
+					say(id, m, len);
+				}
+				last_wp = nt.wp;
+				last_event = nt.event;
 				offset = sh_time_offset(&nt, hz);
 				drain(nt.wp);
 			} else {
@@ -259,6 +287,19 @@ nh_send_config(uint8_t type, uint32_t period_us, uint32_t latency_us)
 	return false;
 }
 
+/* IPI 8 GET_DATA: the hub's latest record of one sensor, straight from it (data_unit_t at byte 4 of the answer) */
+static void
+get_data(uint8_t type)
+{
+	uint8_t m[SH_MSG] = { (uint8_t)(type - 1), SH_GET_DATA };
+
+	if (sh_request(m)) {
+		printf("scp: sensor %u now: handle %u, action %u, time %llu, %d %d %d\n", type, sh_reply[4], sh_reply[5],
+		    sh_get64(sh_reply + 8), (int32_t)sh_get32(sh_reply + 16), (int32_t)sh_get32(sh_reply + 20),
+		    (int32_t)sh_get32(sh_reply + 24));
+	}
+}
+
 /* After READY and INIT_DONE: the ring's header, its address, the time; then what is wanted. */
 static void
 hub_power_up(void)
@@ -273,6 +314,7 @@ hub_power_up(void)
 	__builtin_arm_dsb(0xf);
 	absolutetime_to_nanoseconds((uint64_t)((int64_t)c + mach_minus_counter), &ns);
 	sh_msg_time(m, SH_SET_CONFIG, (uint32_t)ring_pa, ns, c);
+	sh_put32(m + 8, SH_RING_BYTES);         /* Android leaves it unset; the Hot 20's hub ran with it filled */
 	hub_up = sh_request(m);
 	printf("scp: hub %s, ring at %#llx\n", hub_up ? "up" : "did not take its ring", ring_pa);
 	if (hub_up) {
@@ -358,8 +400,9 @@ worker(__unused void *arg, __unused wait_result_t w)
 	if (steps < 2) {
 		goto out;
 	}
-	bool sane = info[0] && info[1] && info[2] && info[3] && info[4] && info[5] && mapple_pa_in_hole(info[0]) &&
-	    mapple_pa_in_hole(info[0] + info[1] - 1) && mapple_pa_in_hole(info[4]) && mapple_pa_in_hole(info[4] + info[5] - 1);
+	/* the DRAM's size reads 0xffffffff on spaced: its start only */
+	bool sane = info[0] && info[1] && info[2] && info[3] && info[4] && mapple_pa_in_hole(info[0]) &&
+	    mapple_pa_in_hole((uint64_t)info[0] + info[1] - 1) && mapple_pa_in_hole(info[4]);
 	if (!sane || ring == NULL || mt6781_scp_cfg(0) != 0) {
 		printf("scp: not started (%s)\n", !sane ? "LK's region info missing or outside the memory holes" :
 		    ring == NULL ? "no ring" : "already running");
@@ -390,10 +433,23 @@ worker(__unused void *arg, __unused wait_result_t w)
 	if (!hub_up) {
 		goto out;
 	}
-	for (uint64_t tick = counter_now();;) {
+	uint64_t up_at = counter_now();
+	for (uint64_t tick = up_at;;) {
 		while (pump()) {
 		}
 		apply_wanted();
+		if (notifies == 0 && ring_word(4) != ring_word(0)) {
+			drain(ring_word(4));
+		}
+		if (counter_now() - up_at < 30 * hz && counter_now() - tick > hz) {
+			uint32_t secs = (uint32_t)((counter_now() - up_at) / hz);
+			printf("scp: %u s: ring rp %u wp %u size %u, %u notifications (last wp %u, event %u), %u records, %u bad wp; "
+			    "to host %#x, PC %#x\n", secs, ring_word(0), ring_word(4), ring_word(8), notifies, last_wp, last_event,
+			    records, bad_wp, mt6781_scp_cfg(0x1c), mt6781_scp_cfg(0xb4));
+			if (secs == 3 || secs == 6) {
+				get_data(SH_ACCEL);
+			}
+		}
 		if (counter_now() - last_stamp > 10 * hz) {
 			stamp();
 		}
