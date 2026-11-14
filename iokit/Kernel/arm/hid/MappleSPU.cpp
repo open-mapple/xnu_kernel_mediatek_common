@@ -22,7 +22,9 @@
  *
  * ReportInterval (us, 0 = off) and BatchInterval (us) from iOS become the hub's rate and latency; DetectionMode
  * (0 = off) turns proximity on and off. Orientation runs the accelerometer at 10 Hz while it is on (from the start).
- * mp_spu_prox=0 leaves the proximity service out. Calibration knobs: mp_imu_axes, mp_mag_axes (default 0x123: a nibble per output axis x, y, z = the hub's axis 1-3,
+ * mp_spu_off: a bit per service left out, in the order of the table below (accel 0, gyro 1, compass 2, prox 3,
+ * als 4, orientation 5, cma 6, gesture 7, devmotion 8, devmotion6 9, devmotion3 10); mp_spu_prox=0 = bit 3.
+ * Calibration knobs: mp_imu_axes, mp_mag_axes (default 0x123: a nibble per output axis x, y, z = the hub's axis 1-3,
  * +8 to flip it); mp_als_div (default 100: the hub's light value per lux, alsps's vender_div); mp_stride_cm
  * (default 70).
  */
@@ -338,6 +340,9 @@ MappleSPUSensor::copyEvent(IOHIDEventType type, IOHIDEvent *matching __unused, I
 		}
 		return e;
 	}
+	if (fKind == SPU_ALS && type == kIOHIDEventTypeAmbientLightSensor && fLastTicks) {
+		return IOHIDEvent::ambientLightSensorEvent(fLastTicks, fLast);         /* the last lux the hub gave */
+	}
 	return NULL;
 }
 
@@ -605,7 +610,9 @@ mapple_spu_record(const struct sh_record *r, uint64_t ticks)
 		break;
 	case SH_LIGHT:
 		if ((s = gSPU[SPU_ALS]) && s->fReportUs) {
-			s->post(IOHIDEvent::ambientLightSensorEvent(ticks, r->d[0] < 0 ? 0 : (UInt32)r->d[0] / gAlsDiv));
+			s->fLast = r->d[0] < 0 ? 0 : (uint32_t)r->d[0] / gAlsDiv;
+			s->fLastTicks = ticks;
+			s->post(IOHIDEvent::ambientLightSensorEvent(ticks, s->fLast));
 			if (s->fSequence++ < 20) {
 				IOLog("SPU: light raw %d\n", r->d[0]);
 			}
@@ -702,10 +709,13 @@ mapple_spu_start(uint32_t steps)
 			}
 		}
 	}
-	uint32_t prox = 1;
+	uint32_t prox = 1, off = 0;
 	PE_parse_boot_argn("mp_spu_prox", &prox, sizeof(prox));
+	PE_parse_boot_argn("mp_spu_off", &off, sizeof(off));
+	off |= prox ? 0 : 1u << SPU_PROX;
 	for (unsigned k = 0; k < count; k++) {
-		if (k == SPU_PROX && prox == 0) {
+		if (off & (1u << k)) {
+			IOLog("SPU: %s left out (mp_spu_off)\n", kinds[k].name);
 			continue;
 		}
 		MappleSPUSensor *s = OSTypeAlloc(MappleSPUSensor);

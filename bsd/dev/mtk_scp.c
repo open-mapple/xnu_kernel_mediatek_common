@@ -15,9 +15,9 @@
  *   INIT_DONE, the ring (1 MiB below 2 GiB, taken at boot) given with SET_CONFIG, the non-wakeup interrupt
  *   unmasked (mp_scp_unmask=0 skips it), SET_TIMESTAMP every 10 s. The SCP's
  *   first 64 messages are logged.
- * 3 the accelerometer and its HID service (one sample a second logged for the first 30 s). For 30 s after the hub is
- *   up, a status line a second (the ring's header, what was pushed) and, at 3 and 6 s, the hub's own latest accel
- *   record (GET_DATA).
+ * 3 the accelerometer and its HID service (one sample a second logged for the first 30 s). Once the hub is up, a
+ *   status line (the ring's header, what was pushed, records by Android type) a second for 30 s, then every 10 s
+ *   while records come and every minute regardless; at 3 and 6 s the hub's own latest accel record (GET_DATA).
  * 4 the plain sensors and their HID services.
  * 5 and what locationd reads from the SPU beyond them: steps and activity, raise to wake, device motion.
  */
@@ -65,6 +65,7 @@ static int64_t offset;                  /* system counter - hub ticks (mtk_scp_h
 static int64_t mach_minus_counter;
 static uint32_t nh_seq;
 static uint32_t notifies, records, last_wp, bad_wp;      /* what the hub has pushed, for the status lines */
+static uint32_t by_type[SH_DEVICE_ORIENTATION + 1];
 static uint8_t last_event;
 
 /* what the HID services want, per Android type; applied by the thread */
@@ -129,6 +130,9 @@ drain(uint32_t wp)
 			rec[i] = ring[SH_RING_HDR + rp + i];
 		}
 		sh_parse_record(rec, &r);
+		if (r.type <= SH_DEVICE_ORIENTATION) {
+			by_type[r.type]++;
+		}
 		mapple_spu_record(&r, arrival ? arrival : (uint64_t)((int64_t)sh_record_ticks(r.scp_ns, offset, hz) + mach_minus_counter));
 		rp = sh_ring_next(rp);
 	}
@@ -454,6 +458,7 @@ worker(__unused void *arg, __unused wait_result_t w)
 		goto out;
 	}
 	uint64_t up_at = counter_now();
+	uint32_t said_records = 0;
 	for (uint64_t tick = up_at;;) {
 		while (pump()) {
 		}
@@ -461,11 +466,19 @@ worker(__unused void *arg, __unused wait_result_t w)
 		if (notifies == 0 && ring_word(4) != ring_word(0)) {
 			drain(ring_word(4));
 		}
-		if (counter_now() - up_at < 30 * hz && counter_now() - tick > hz) {
-			uint32_t secs = (uint32_t)((counter_now() - up_at) / hz);
-			printf("scp: %u s: ring rp %u wp %u size %u, %u notifications (last wp %u, event %u), %u records, %u bad wp; "
-			    "to host %#x, PC %#x\n", secs, ring_word(0), ring_word(4), ring_word(8), notifies, last_wp, last_event,
-			    records, bad_wp, mt6781_scp_cfg(0x1c), mt6781_scp_cfg(0xb4));
+		uint32_t secs = (uint32_t)((counter_now() - up_at) / hz);
+		if (counter_now() - tick > hz && (secs < 30 || (secs % 10 == 0 && records != said_records) || secs % 60 == 0)) {
+			char types[96] = "";
+			size_t at = 0;
+			for (unsigned t = 0; t <= SH_DEVICE_ORIENTATION && at < sizeof(types) - 12; t++) {
+				if (by_type[t]) {
+					at += (size_t)snprintf(types + at, sizeof(types) - at, " %u:%u", t, by_type[t]);
+				}
+			}
+			said_records = records;
+			printf("scp: %u s: ring rp %u wp %u size %u, %u notifications (last wp %u, event %u), %u records (by type%s), "
+			    "%u bad wp; to host %#x, PC %#x\n", secs, ring_word(0), ring_word(4), ring_word(8), notifies, last_wp,
+			    last_event, records, types, bad_wp, mt6781_scp_cfg(0x1c), mt6781_scp_cfg(0xb4));
 			if (secs == 3 || secs == 6) {
 				get_data(SH_ACCEL);
 			}
