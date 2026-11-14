@@ -305,7 +305,7 @@ public:
 	vm_offset_t   fCcorr;
 	uint32_t      fMaxNits;       /* mp_panel_nits: nits at level 2047 */
 	volatile uint32_t fBlWant;    /* panel level to send at the next tick, 0xffffffff = none */
-	uint32_t      fBlLevel;       /* last level sent */
+	uint32_t      fBlLevel;       /* last level sent; until fBlSent, LK's level, not known */
 	uint32_t      fBlOff;         /* mp_fb_bloff: backlight off while the display is */
 	uint32_t      fBlResume;      /* level for when the display is on again */
 	uint64_t      fBlSent, fMatrixCalls, fMatrixApplied;
@@ -2288,7 +2288,7 @@ AppleCLCD::lightTick(void)
 			fBlResume = bl;
 			fBlWant = 0xffffffffu;
 		}
-		bl = fBlLevel != 0 ? 0 : 0xffffffffu;
+		bl = fBlLevel != 0 || fBlSent == 0 ? 0 : 0xffffffffu;
 	}
 	if (bl == 0xffffffffu && !matrix) {
 		return;
@@ -2296,7 +2296,7 @@ AppleCLCD::lightTick(void)
 	IOLockLock(fScanLock);
 	if (bl != 0xffffffffu) {
 		uint8_t cmd[3] = { 0x51, (uint8_t)(bl >> 8), (uint8_t)bl };
-		if (bl == fBlLevel) {
+		if (bl == fBlLevel && fBlSent != 0) {
 			fBlWant = 0xffffffffu;
 		} else if (dsiSendDcs(cmd, 3, false, false)) {      /* non-blocking: a fade must not hold the frames */
 			if (fBlWant == bl) {
@@ -3257,7 +3257,8 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
 				fFB->fFadeStep = 0;
 				fFB->fDirty = true;     /* on: redraw the latest frame */
 				if (off) {
-					fFB->fBlResume = fFB->fBlWant != 0xffffffffu ? fFB->fBlWant : fFB->fBlLevel;
+					fFB->fBlResume = fFB->fBlWant != 0xffffffffu ? fFB->fBlWant :
+					    fFB->fBlSent != 0 ? fFB->fBlLevel : PANEL_LEVEL_MAX / 2;
 				} else if (fFB->fBlOff && fFB->fBlLevel == 0 && fFB->fBlWant == 0xffffffffu) {
 					fFB->fBlWant = fFB->fBlResume;
 				}
