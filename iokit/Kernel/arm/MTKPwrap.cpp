@@ -12,8 +12,8 @@
  * live in the same PMIC, so writePMIC() only accepts the interrupt enable
  * SET/CLR and status registers of the PMIC interrupt groups (writeAllowed(),
  * table in MT6358PMIC.h), and writeRegulator() only the GPU rails' enable
- * and VOSEL fields under a voltage ceiling (MappleGPU.cpp); everything else
- * is refused and logged.
+ * and VOSEL fields under a voltage ceiling (MappleGPU.cpp), and the power off
+ * only MT6358PowerOff.h's writes; everything else is refused and logged.
  *
  * The PMIC is a device-tree child (/arm-io/pwrap/pmic): published as a
  * MappleDTNub, matched by MT6358PMIC. C entry point mtk_pwrap_read() for the
@@ -29,6 +29,11 @@
 #include <IOKit/IODeviceTreeSupport.h>
 
 #include "MT6358PMIC.h"
+#include "MT6358PowerOff.h"
+
+extern "C" {
+#include <machine/machine_routines.h>
+}
 
 #define PWRAP_INIT_DONE0        0x090
 #define PWRAP_WACS2_EN          0x09c
@@ -489,6 +494,90 @@ mtk_pwrap_read(uint32_t addr, uint32_t *value)
 		return -1;
 	}
 	return gMapplePwrap->readPMIC(addr, value) == kIOReturnSuccess ? 0 : -2;
+}
+
+/*
+ * Power off (MapplePlatformExpert::haltRestart, late in shutdown; other CPUs may still run). Interrupts off and fLock
+ * taken and never given back, so the WACS2 is polled without waiting on anyone, and no other PMIC access follows.
+ */
+int
+MTKPwrap::poRead(uint32_t addr, uint32_t *value)
+{
+	MTKPwrap *p = gMapplePwrap;
+
+	if (WACS_FSM(p->rd32(PWRAP_WACS2_RDATA)) == WACS_FSM_WFVLDCLR) {
+		p->wr32(PWRAP_WACS2_VLDCLR, 1);
+	}
+	if (!p->waitFSM(WACS_FSM_IDLE)) {
+		return -1;
+	}
+	p->wr32(PWRAP_WACS2_CMD, (addr >> 1) << 16);
+	if (!p->waitFSM(WACS_FSM_WFVLDCLR)) {
+		return -1;
+	}
+	*value = p->rd32(PWRAP_WACS2_RDATA) & 0xffff;
+	p->wr32(PWRAP_WACS2_VLDCLR, 1);
+	return 0;
+}
+
+int
+MTKPwrap::poWrite(uint32_t addr, uint32_t value)
+{
+	MTKPwrap *p = gMapplePwrap;
+
+	if (WACS_FSM(p->rd32(PWRAP_WACS2_RDATA)) == WACS_FSM_WFVLDCLR) {
+		p->wr32(PWRAP_WACS2_VLDCLR, 1);
+	}
+	if (!p->waitFSM(WACS_FSM_IDLE)) {
+		return -1;
+	}
+	p->wr32(PWRAP_WACS2_CMD, 0x80000000u | ((addr >> 1) << 16) | (value & 0xffff));
+	return p->waitFSM(WACS_FSM_IDLE) ? 0 : -1;
+}
+
+static void
+poDelay(uint32_t us)
+{
+	IODelay(us);
+}
+
+void
+MTKPwrap::powerOff(void)
+{
+	static const struct mt6358_poweroff_ops ops = { poRead, poWrite, poDelay };
+	const char *failed;
+	int i;
+
+	(void)ml_set_interrupts_enabled(FALSE);
+	for (i = 0; i < 5000 && !IOLockTryLock(fLock); i++) {
+		IODelay(10);
+	}
+	if (i == 5000) {
+		printf("platform: power off: PMIC wrapper busy for 50 ms\n");
+		return;
+	}
+	failed = mt6358_poweroff_prepare(&ops);
+	if (failed != NULL) {
+		printf("platform: power off: PMIC %s failed\n", failed);
+		return;
+	}
+	printf("platform: power off: PMIC PWRHOLD 0\n");
+	if (mt6358_poweroff_cut(&ops) != 0) {
+		printf("platform: power off: PMIC PPCCTL0 failed\n");
+		return;
+	}
+	IODelay(1000000);
+	printf("platform: power off: PMIC still on 1 s after PWRHOLD 0\n");
+}
+
+extern "C" void
+mtk_pmic_poweroff(void)
+{
+	if (gMapplePwrap == NULL) {
+		printf("platform: power off: PMIC wrapper not started\n");
+		return;
+	}
+	gMapplePwrap->powerOff();
 }
 
 /*

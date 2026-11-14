@@ -44,9 +44,13 @@ public:
 	IOReturn writeAudio(uint32_t addr, uint32_t mask, uint32_t value);
 	/* The started instance, waiting for it if needed (NULL after timeout). */
 	static MTKPwrap *wait(void);
+	/* MT6358PowerOff.h's sequence; returns only when the phone is still on. */
+	void powerOff(void);
 
 private:
 	bool waitFSM(uint32_t fsm);
+	static int poRead(uint32_t addr, uint32_t *value);
+	static int poWrite(uint32_t addr, uint32_t value);
 	inline uint32_t rd32(uint32_t off) { return *(volatile uint32_t *)(fRegs + off); }
 	inline void wr32(uint32_t off, uint32_t v) { *(volatile uint32_t *)(fRegs + off) = v; }
 
@@ -55,6 +59,9 @@ private:
 	IOLock      *fLock;
 	uint32_t     fTimeouts;
 };
+
+/* MapplePlatformExpert::haltRestart: MTKPwrap::powerOff; returns only when the phone is still on. */
+extern "C" void mtk_pmic_poweroff(void);
 
 /* PMIC interrupt groups (MT6358 "sp_top"), in TOP_INT_STATUS0 bit order. */
 enum {

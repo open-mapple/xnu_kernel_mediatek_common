@@ -24,6 +24,7 @@ public:
 };
 
 extern "C" int mapple_rtc_read(uint64_t *secs);   /* MTKPwrap.cpp: the PMIC's RTC (MT6781 only) */
+extern "C" void mtk_pmic_poweroff(void);      /* MTKPwrap.cpp: returns only when the phone is still on */
 extern "C" void mapple_mem4g_report(void);        /* arm_vm_init.c: mp_mem4g's holes (MT6781 only) */
 
 /* The calendar at boot from the PMIC's RTC (otherwise 1970: no TLS, every site refuses the clock). */
@@ -49,10 +50,13 @@ OSDefineMetaClassAndStructors(MapplePlatformExpert, IODTPlatformExpert);
 
 extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 
+/* Boot-arg mp_poweroff: 0 power off restarts, 1 Android's power off; 0 on a safe boot. */
+static uint32_t gMapplePowerOff;
+
 /*
  * iOS's restart (reboot(2): Settings, apps) reaches here after the shutdown notifications: the watchdog's software
- * reset, as the USB link's "reboot" does. Power off restarts too until a power-off path exists. Panics are left as
- * they are (wdt=-1 keeps the panic on screen).
+ * reset, as the USB link's "reboot" does. Power off restarts too unless mp_poweroff has the PMIC cut the power, and
+ * when that fails. Panics are left as they are (wdt=-1 keeps the panic on screen).
  */
 int
 MapplePlatformExpert::haltRestart(unsigned int type)
@@ -62,6 +66,9 @@ MapplePlatformExpert::haltRestart(unsigned int type)
 	if (type == kPERestartCPU || type == kPEHaltCPU) {
 		if (toprgu == 0) {
 			toprgu = ml_io_map(TOPRGU_PA, 0x1000);
+		}
+		if (type == kPEHaltCPU && gMapplePowerOff == 1) {
+			mtk_pmic_poweroff();            /* interrupts off from here */
 		}
 		printf("platform: %s: the watchdog's software reset\n", type == kPEHaltCPU ? "power off" : "restart");
 		for (;;) {
@@ -81,6 +88,13 @@ MapplePlatformExpert::start(IOService *provider)
 	}
 	registerService();
 	IOLog("platform expert registered\n");
+	uint32_t record = 1;
+	(void)PE_parse_boot_argn("mp_bootrec", &record, sizeof(record));
+	(void)PE_parse_boot_argn("mp_poweroff", &gMapplePowerOff, sizeof(gMapplePowerOff));
+	if (record == 0) {
+		gMapplePowerOff = 0;
+	}
+	IOLog("platform: mp_poweroff=%u%s\n", gMapplePowerOff, record == 0 ? " (safe boot)" : "");
 #if defined(MT6781)
 	mapple_mem4g_report();
 #endif
