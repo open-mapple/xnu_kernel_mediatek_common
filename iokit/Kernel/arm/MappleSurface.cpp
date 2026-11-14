@@ -6,7 +6,9 @@
  * talks to the user client below:
  *
  *   sel 13  limits: struct out 0x18, u16 at +0x16 must be 1 (ABI version),
- *           +0 offset alignment mask, +4 bytes-per-row alignment mask
+ *           +0 offset alignment mask, +4 bytes-per-row alignment mask,
+ *           +0xc / +0x10 largest width / height (IOSurfaceGetPropertyMaximum;
+ *           PhotoLibraryServices clamps its thumbnails to the smaller)
  *   sel 0   create: scalar [parent id], struct in = serialized property
  *           dictionary (binary or XML), struct out = lock result (0xa68)
  *   sel 4   lookup by id: scalar [id], struct out = lock result
@@ -1237,6 +1239,8 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
 		uint8_t limits[0x18] = { 0 };
 		put32(limits, 0x0, MAPPLE_SURFACE_ROW_ALIGN - 1);
 		put32(limits, 0x4, MAPPLE_SURFACE_ROW_ALIGN - 1);
+		put32(limits, 0xc, MAPPLE_SURFACE_MAX_DIM);
+		put32(limits, 0x10, MAPPLE_SURFACE_MAX_DIM);
 		limits[0x16] = 1;
 		mapple_surf_log_once("sel", selector);
 		return mapple_struct_out(args, limits, sizeof(limits));
