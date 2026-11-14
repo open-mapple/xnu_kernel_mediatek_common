@@ -644,6 +644,13 @@ mapple_spu_record(const struct sh_record *r, uint64_t ticks)
 		break;
 	case SH_LIGHT:
 		if ((s = gSPU[SPU_ALS]) && s->fReportUs) {
+			static uint64_t last_ns;
+			static uint32_t odd;
+			if ((r->d[0] < 0 || r->d[0] > 100000) && odd++ < 20) {
+				IOLog("SPU: light record %d %d %d %d %d %d %d %d, hub time %llu (last light %llu)\n", r->d[0], r->d[1],
+				    r->d[2], r->d[3], r->d[4], r->d[5], r->d[6], r->d[7], r->scp_ns, last_ns);
+			}
+			last_ns = r->scp_ns;
 			gAlsRaw = r->d[0];
 			s->fLast = r->d[0] < 0 ? 0 : (uint32_t)r->d[0] / gAlsDiv;
 			s->fLastTicks = ticks;
