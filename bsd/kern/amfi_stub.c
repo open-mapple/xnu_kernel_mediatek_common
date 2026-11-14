@@ -417,9 +417,12 @@ mapple_sandbox_syscall(struct proc *p, int call, user_addr_t arg)
 /*
  * __mac_syscall("AMFI", 90, {u64 input flags, user pointer to u64 output}): dyld's amfi_check_dyld_policy_self.
  * Without an answer dyld treats every process as restricted: no DYLD_ variables, no interposing (test tools'
- * tracing libraries). DEVELOPMENT/DEBUG kernels allow all of them but a custom shared cache, except to set-ID programs,
- * which get none; release kernels and every other AMFI call answer as when no AMFI policy existed.
+ * tracing libraries). DEVELOPMENT/DEBUG kernels allow all of them but a custom shared cache. Release kernels allow only
+ * what the tweak loader needs (DYLD_INSERT_LIBRARIES, interposing, a missing library skipped), and only with mp_inject=1,
+ * the Mapple app's jailbreak switch (kern_exec.c puts the loader in). Set-ID programs, programs with a __RESTRICT
+ * segment and encrypted ones get nothing on either. Every other AMFI call answers as when no AMFI policy existed.
  */
+TUNABLE(uint32_t, mapple_inject, "mp_inject", 0);
 #define AMFI_SYSCALL_CHECK_DYLD_POLICY_SELF     90
 #define AMFI_DYLD_OUTPUT_ALLOW_AT_PATH                  (1ULL << 0)
 #define AMFI_DYLD_OUTPUT_ALLOW_PATH_VARS                (1ULL << 1)
@@ -428,29 +431,35 @@ mapple_sandbox_syscall(struct proc *p, int call, user_addr_t arg)
 #define AMFI_DYLD_OUTPUT_ALLOW_FAILED_LIBRARY_INSERTION (1ULL << 5)
 #define AMFI_DYLD_OUTPUT_ALLOW_LIBRARY_INTERPOSING      (1ULL << 6)
 #define AMFI_DYLD_OUTPUT_ALLOW_EMBEDDED_VARS            (1ULL << 7)
+#define AMFI_DYLD_INPUT_PROC_HAS_RESTRICT_SEG           (1ULL << 1)
+#define AMFI_DYLD_INPUT_PROC_IS_ENCRYPTED               (1ULL << 2)
 
 static int
 amfi_stub_syscall(struct proc *p, int call, user_addr_t arg)
 {
-#if DEVELOPMENT || DEBUG
-	if (call == AMFI_SYSCALL_CHECK_DYLD_POLICY_SELF) {
-		uint64_t args[2];
-		uint64_t out = proc_issetugid(p) ? 0 : AMFI_DYLD_OUTPUT_ALLOW_AT_PATH | AMFI_DYLD_OUTPUT_ALLOW_PATH_VARS |
-		    AMFI_DYLD_OUTPUT_ALLOW_FALLBACK_PATHS | AMFI_DYLD_OUTPUT_ALLOW_PRINT_VARS |
-		    AMFI_DYLD_OUTPUT_ALLOW_FAILED_LIBRARY_INSERTION | AMFI_DYLD_OUTPUT_ALLOW_LIBRARY_INTERPOSING |
-		    AMFI_DYLD_OUTPUT_ALLOW_EMBEDDED_VARS;
-		int error = copyin(arg, args, sizeof(args));
-		if (error == 0) {
-			error = copyout(&out, (user_addr_t)args[1], sizeof(out));
-		}
-		return error;
+	if (call != AMFI_SYSCALL_CHECK_DYLD_POLICY_SELF) {
+		return ENOPOLICY;
 	}
+#if DEVELOPMENT || DEBUG
+	uint64_t allow = AMFI_DYLD_OUTPUT_ALLOW_AT_PATH | AMFI_DYLD_OUTPUT_ALLOW_PATH_VARS |
+	    AMFI_DYLD_OUTPUT_ALLOW_FALLBACK_PATHS | AMFI_DYLD_OUTPUT_ALLOW_PRINT_VARS |
+	    AMFI_DYLD_OUTPUT_ALLOW_FAILED_LIBRARY_INSERTION | AMFI_DYLD_OUTPUT_ALLOW_LIBRARY_INTERPOSING |
+	    AMFI_DYLD_OUTPUT_ALLOW_EMBEDDED_VARS;
 #else
-	(void)p;
-	(void)call;
-	(void)arg;
+	if (!mapple_inject) {
+		return ENOPOLICY;
+	}
+	uint64_t allow = AMFI_DYLD_OUTPUT_ALLOW_PATH_VARS | AMFI_DYLD_OUTPUT_ALLOW_LIBRARY_INTERPOSING |
+	    AMFI_DYLD_OUTPUT_ALLOW_FAILED_LIBRARY_INSERTION;
 #endif
-	return ENOPOLICY;
+	uint64_t args[2];
+	int error = copyin(arg, args, sizeof(args));
+	if (error == 0) {
+		uint64_t out = proc_issetugid(p) ||
+		    (args[0] & (AMFI_DYLD_INPUT_PROC_HAS_RESTRICT_SEG | AMFI_DYLD_INPUT_PROC_IS_ENCRYPTED)) ? 0 : allow;
+		error = copyout(&out, (user_addr_t)args[1], sizeof(out));
+	}
+	return error;
 }
 
 static const struct mac_policy_ops amfi_stub_mac_ops = {
