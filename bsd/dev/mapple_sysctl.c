@@ -24,6 +24,7 @@
 #include <pexpert/pexpert.h>
 #include <pexpert/arm64/boot.h>
 #include <machine/machine_routines.h>
+#include "mapple_safeline.h"
 
 extern void usblink_stat(char *out, size_t len);                          /* bsd/dev/usb_link.c */
 extern void bq27z561_link(const char *args, char *out, size_t len);     /* iokit/Kernel/arm/BQ27Z561Battery.cpp */
@@ -181,6 +182,38 @@ mapple_boot_part(void)
  */
 #define MAPPLE_PAYLOAD_LINE_OFF 0x1000
 
+/*
+ * A safe boot (mp_bootrec=0, mtkloader's Volume Down) runs a line the loader changed and leaves no copy of the
+ * payload's. The kept record, ignored for this boot, finds it (mapple_safeline.h) when it was saved against this
+ * payload; a record from an earlier image does not, and then the payload's line is not known.
+ */
+static bool
+mapple_safe_boot(void)
+{
+	uint32_t record = 1;
+	return PE_parse_boot_argn("mp_bootrec", &record, sizeof(record)) && record == 0;
+}
+
+/* mapple_sysctl_mtx held. The enabled record's base_hash: 0, or ENOENT when there is none. */
+static int
+mapple_record_base(uint64_t *base)
+{
+	uint8_t *blk = kalloc_data(4096, Z_WAITOK | Z_ZERO);
+	if (!blk) {
+		return ENOMEM;
+	}
+	int error = mtk_ufs_bootrec_raw(false, blk);
+	uint32_t ver, flags;
+	memcpy(&ver, blk + 8, sizeof(ver));
+	memcpy(&flags, blk + 12, sizeof(flags));
+	if (!error && (memcmp(blk, "MAPPLEBR", 8) != 0 || ver != 1 || !(flags & 1))) {
+		error = ENOENT;
+	}
+	memcpy(base, blk + 16, sizeof(*base));
+	kfree_data(blk, 4096);
+	return error;
+}
+
 static int
 mapple_payload_line(char *payload, size_t len)
 {
@@ -200,6 +233,10 @@ mapple_payload_line(char *payload, size_t len)
 	}
 	if (mtk_ufs_bootfile(false, 0, rec, sizeof(rec)) == 0 && strcmp(rec, PE_boot_args()) == 0) {
 		return ENOENT;
+	}
+	if (mapple_safe_boot()) {
+		uint64_t base = 0;
+		return mapple_record_base(&base) == 0 && mapple_safeline_payload(PE_boot_args(), base, payload, len) ? 0 : ENOENT;
 	}
 	strlcpy(payload, PE_boot_args(), len);
 	return 0;
@@ -226,6 +263,10 @@ static int
 mapple_next_line(char *cur, size_t len, char *payload, size_t plen)
 {
 	int error = mapple_payload_line(payload, plen);
+	if (error == ENOENT && mapple_safe_boot()) {
+		mapple_bootargs_src = "payload";     /* no record, or one from an earlier image: the payload's line is next */
+		return ENOENT;
+	}
 	if (error) {
 		return error;
 	}
@@ -305,7 +346,7 @@ sysctl_mapple_nextbootargs_src SYSCTL_HANDLER_ARGS
 	char cur[BOOTARGS_MAX + 1], payload[BOOTARGS_MAX + 1], out[16];
 	lck_mtx_lock(&mapple_sysctl_mtx);
 	int error = mapple_next_line(cur, sizeof(cur), payload, sizeof(payload));
-	strlcpy(out, error ? "error" : mapple_bootargs_src, sizeof(out));
+	strlcpy(out, error && !(error == ENOENT && mapple_safe_boot()) ? "error" : mapple_bootargs_src, sizeof(out));
 	lck_mtx_unlock(&mapple_sysctl_mtx);
 	return SYSCTL_OUT(req, out, strlen(out) + 1);
 }
