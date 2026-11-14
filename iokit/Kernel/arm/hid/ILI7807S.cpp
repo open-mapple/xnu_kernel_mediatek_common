@@ -110,12 +110,32 @@ private:
 	struct ili_fw_block     fFW[ILI_BLOCKS];
 	bool                    fHaveFW, fAlive;
 	uint32_t                fFailures, fBad;
+	uint32_t                fIrqs, fReports, fNoAck, fLowLong;
+	uint64_t                fLastIrqAt, fLastReportAt, fLastBadAt;
+	int                     fLastBad;
+public:
+	void diag(char *out, size_t len);
+private:
 	uint64_t                fLastTry, fReloadGap;
 	uint32_t                fDownMap;
 	uint32_t                fLastX[ILI_FINGERS], fLastY[ILI_FINGERS];
 };
 
 OSDefineMetaClassAndStructors(ILI7807S, MappleHIDTouch);
+
+static ILI7807S *gTouch;
+
+static uint64_t
+msSince(uint64_t at)
+{
+	uint64_t ns;
+
+	if (at == 0) {
+		return UINT64_MAX;
+	}
+	absolutetime_to_nanoseconds(mach_absolute_time() - at, &ns);
+	return ns / NSEC_PER_MSEC;
+}
 
 static uint32_t
 dtU32(IOService *provider, const char *key, unsigned int index, uint32_t dflt)
@@ -377,6 +397,14 @@ ILI7807S::readReport(void)
 
 	spiRead(rx, sizeof(rx));
 	int map = ili_parse(rx, pt);
+	if (map < 0) {
+		fNoAck += map == ILI_NO_ACK;
+		fLastBad = map;
+		fLastBadAt = mach_absolute_time();
+	} else {
+		fReports++;
+		fLastReportAt = mach_absolute_time();
+	}
 	if ((map != ILI_NO_ACK) != fAlive) {
 		fAlive = map != ILI_NO_ACK;
 		IOLog("MAPPLE TOUCH: firmware %s (ACK %02x)\n", fAlive ? "answers again" : "GONE", rx[1]);
@@ -424,6 +452,9 @@ void
 ILI7807S::watch(void)
 {
 	liftAll(" (no report)");
+	if (!pinGet(fINT) && msSince(fLastIrqAt) > 250) {
+		fLowLong++;
+	}
 	if (!pinGet(fINT)) {
 		readReport();
 	}
@@ -511,6 +542,7 @@ ILI7807S::start(IOService *provider)
 	}
 	fInterrupt->enable();
 	fTimer->setTimeoutMS(fAlive ? WATCH_MS : 1);
+	gTouch = this;
 	return true;
 }
 
@@ -544,6 +576,8 @@ ILI7807S::interruptOccurred(OSObject *owner, IOInterruptEventSource *src __unuse
 {
 	ILI7807S *self = OSDynamicCast(ILI7807S, owner);
 	if (self != NULL) {
+		self->fIrqs++;
+		self->fLastIrqAt = mach_absolute_time();
 		self->readReport();
 	}
 }
@@ -555,4 +589,26 @@ ILI7807S::timerFired(OSObject *owner, IOTimerEventSource *src __unused)
 	if (self != NULL) {
 		self->watch();
 	}
+}
+
+/* Read only, for the USB link's "touch": counters since boot and the INT line now. */
+void
+ILI7807S::diag(char *out, size_t len)
+{
+	snprintf(out, len, "touch: INT %s; %u interrupts, %u reports, %u bad (%u no ACK, %u not a report), last bad %d "
+	    "%llu ms ago; INT held low past 250 ms without an interrupt %u times; last interrupt %llu ms ago, last report %llu "
+	    "ms ago; firmware %s\n", pinGet(fINT) ? "high" : "low", fIrqs, fReports, fNoAck + fBad, fNoAck, fBad, fLastBad,
+	    msSince(fLastBadAt), fLowLong, msSince(fLastIrqAt), msSince(fLastReportAt), fAlive ? "answers" : "gone");
+}
+
+extern "C" void mapple_touch_link(char *out, size_t len);
+
+extern "C" void
+mapple_touch_link(char *out, size_t len)
+{
+	if (gTouch == NULL) {
+		snprintf(out, len, "touch: no ILI7807S\n");
+		return;
+	}
+	gTouch->diag(out, len);
 }
