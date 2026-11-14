@@ -323,7 +323,7 @@ status(const char *when)
 
 	delay(1000);
 	printf("scp: %s: scp_sel %u%s, run %#x, PC %#x then %#x, LR %#x, sleep %#x, to host %#x, GIPC %#x, general %#x "
-	    "%#x %#x %#x %#x %#x %#x %#x\n", when, (clk >> 8) & 7, (clk & (1u << 15)) ? " gated" : "", mt6781_scp_cfg(0),
+	    "%#x %#x %#x %#x %#x %#x %#x\n", when, (clk >> 8) & 7, (clk & (1u << 15)) ? " powered down" : "", mt6781_scp_cfg(0),
 	    pc0, mt6781_scp_cfg(0xb4), mt6781_scp_cfg(0xac), mt6781_scp_cfg(0x114), mt6781_scp_cfg(0x1c),
 	    mt6781_scp_cfg(0x28), mt6781_scp_cfg(0x50), mt6781_scp_cfg(0x54), mt6781_scp_cfg(0x58), mt6781_scp_cfg(0x5c),
 	    mt6781_scp_cfg(0x60), mt6781_scp_cfg(0x64), mt6781_scp_cfg(0x68), mt6781_scp_cfg(0x6c));
@@ -351,7 +351,10 @@ worker(__unused void *arg, __unused wait_result_t w)
 		goto out;
 	}
 	(void)PE_parse_boot_argn("mp_scp_clk26m", &clk26m, sizeof(clk26m));
-	if ((mt6781_scp_clock() & 0x8700u) != 0) {
+	if (mt6781_scp_clock() & (1u << 15)) {
+		printf("scp: scp_sel powered down (CLK_CFG_0 %#x), left as it is\n", mt6781_scp_clock());
+	}
+	if ((mt6781_scp_clock() & 0x700u) != 0) {
 		printf("scp: scp_sel not on clk26m%s\n", clk26m ? ", setting it" : " (mp_scp_clk26m=1 sets it)");
 		if (clk26m && !mt6781_scp_clock_26m()) {
 			printf("scp: scp_sel still %#x\n", mt6781_scp_clock());
