@@ -88,9 +88,17 @@ enum {
 
 #define MAPPLE_AKS_FILE          "/private/var/keybags/mapple.kb"
 
+/*
+ * IOGeneralInterest messages MobileKeyBag's MKBEventsRegister turns into events (aksNotificationCB): SpringBoard
+ * re-reads the lock state, passcode and back-off on the first, and runs its first-unlock work on the second.
+ */
+#define MAPPLE_AKS_MSG_STATUS    0xe3ffd00d
+#define MAPPLE_AKS_MSG_FIRST     0xe3ffd00f
+
 static IOLock *gAKSLock;
 static struct mapple_aks_rec gAKSRec;
 static bool gAKSLoaded, gAKSLocked, gAKSBeenUnlocked;
+static IOService *gAKSService;
 
 static uint64_t
 mapple_aks_now(void)
@@ -330,6 +338,7 @@ AppleKeyStore::start(IOService *provider)
 		return false;
 	}
 	setProperty(kIOUserClientClassKey, "AppleKeyStoreUserClient");
+	gAKSService = this;
 	registerService();
 	IOLog("AKS: AppleKeyStore registered\n");
 	return true;
@@ -573,6 +582,8 @@ AppleKeyStoreUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
 
 	IOLockLock(gAKSLock);
 	mapple_aks_load();
+	uint32_t bits = mapple_aks_lock_bits(), failed = gAKSRec.failed;
+	uint64_t until = gAKSRec.until;
 	switch (selector) {
 	case kAKSOpen:
 	case kAKSUnloadBag:
@@ -646,7 +657,15 @@ AppleKeyStoreUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
 		ret = kIOReturnUnsupported;
 		break;
 	}
+	bool first = (mapple_aks_lock_bits() & ~bits & MAPPLE_AKS_BEEN_UNLOCKED) != 0;
+	bool status = mapple_aks_lock_bits() != bits || gAKSRec.failed != failed || gAKSRec.until != until;
 	IOLockUnlock(gAKSLock);
+	if (first) {
+		gAKSService->messageClients(MAPPLE_AKS_MSG_FIRST);
+	}
+	if (status) {
+		gAKSService->messageClients(MAPPLE_AKS_MSG_STATUS);
+	}
 
 	char name[32];
 	proc_selfname(name, sizeof(name));
