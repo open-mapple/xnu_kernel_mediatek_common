@@ -37,6 +37,7 @@
 extern "C" {
 processor_t cpu_to_processor(int cpu);
 processor_t thread_bind(processor_t processor);
+int mapple_gic_describe(IOService *nub, int source, char *buf, size_t len);
 }
 
 #define GICD_CTLR               0x0000
@@ -44,7 +45,9 @@ processor_t thread_bind(processor_t processor);
 #define GICD_IGROUPR(n)         (0x0080 + 4 * ((n) / 32))
 #define GICD_ISENABLER(n)       (0x0100 + 4 * ((n) / 32))
 #define GICD_ICENABLER(n)       (0x0180 + 4 * ((n) / 32))
+#define GICD_ISPENDR(n)         (0x0200 + 4 * ((n) / 32))
 #define GICD_ICPENDR(n)         (0x0280 + 4 * ((n) / 32))
+#define GICD_ISACTIVER(n)       (0x0300 + 4 * ((n) / 32))
 #define GICD_IPRIORITYR(n)      (0x0400 + (n))
 #define GICD_ICFGR(n)           (0x0c00 + 4 * ((n) / 16))
 #define GICD_IROUTER(n)         (0x6000 + 8 * (n))
@@ -75,6 +78,8 @@ public:
 	virtual void disableVectorHard(IOInterruptVectorNumber vectorNumber, IOInterruptVector *vector) APPLE_KEXT_OVERRIDE;
 	virtual void enableVector(IOInterruptVectorNumber vectorNumber, IOInterruptVector *vector) APPLE_KEXT_OVERRIDE;
 
+	int describe(IOService *nub, int source, char *buf, size_t len);
+
 private:
 	bool spec(IOService *nub, int source, uint32_t *intid, uint32_t *flags);
 	void wait_rwp(void);
@@ -89,6 +94,8 @@ private:
 };
 
 OSDefineMetaClassAndStructors(MappleGIC, IOInterruptController);
+
+static MappleGIC *gMappleGIC;
 
 bool
 MappleGIC::start(IOService *provider)
@@ -138,6 +145,7 @@ MappleGIC::start(IOService *provider)
 	IOLog("GIC: %s, %u INTIDs (GICD_TYPER 0x%08x, GICD_CTLR 0x%08x)\n",
 	    name->getCStringNoCopy(), fNumIntids, typer, rd32(GICD_CTLR));
 	name->release();
+	gMappleGIC = this;
 	registerService();
 	return true;
 }
@@ -250,6 +258,28 @@ MappleGIC::handleInterrupt(void *refCon __unused, IOService *nub __unused, int s
 	}
 	vector->interruptActive = 0;
 	return kIOReturnSuccess;
+}
+
+/* For a driver whose interrupt stopped coming: the distributor's and IOKit's state of one of its lines. */
+int
+MappleGIC::describe(IOService *nub, int source, char *buf, size_t len)
+{
+	uint32_t intid, flags;
+
+	if (!spec(nub, source, &intid, &flags)) {
+		return snprintf(buf, len, "no INTID");
+	}
+	uint32_t bit = 1u << (intid % 32);
+	IOInterruptVector *v = &vectors[intid];
+	return snprintf(buf, len, "INTID %u enabled %d pending %d active %d, soft-off %d hard-off %d", intid,
+	           (rd32(GICD_ISENABLER(intid)) & bit) != 0, (rd32(GICD_ISPENDR(intid)) & bit) != 0,
+	           (rd32(GICD_ISACTIVER(intid)) & bit) != 0, (int)v->interruptDisabledSoft, (int)v->interruptDisabledHard);
+}
+
+extern "C" int
+mapple_gic_describe(IOService *nub, int source, char *buf, size_t len)
+{
+	return gMappleGIC != NULL ? gMappleGIC->describe(nub, source, buf, len) : snprintf(buf, len, "no GIC");
 }
 
 bool

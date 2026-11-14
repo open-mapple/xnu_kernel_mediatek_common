@@ -964,6 +964,9 @@ MappleGPUAccelerator::start(IOService *provider)
 	flag = JOB_TIMEOUT_MS;
 	PE_parse_boot_argn("mp_gpu_jobms", &flag, sizeof(flag));
 	fJobTimeoutMs = flag < 1000 ? 1000 : flag > 30000 ? 30000 : flag;
+	flag = 0;
+	PE_parse_boot_argn("mp_gpu_lostirq", &flag, sizeof(flag));
+	fRecoverIrq = flag != 0;
 	int64_t mib = GPU_MEMORY_LIMIT >> 20;
 	PE_parse_boot_argn_alias("mp_gpu_memtotal", "vivagpumemtotal", &mib, sizeof(mib));
 	fMemLimit = mib << 20;
@@ -3278,6 +3281,55 @@ MappleGPUAccelerator::logStuckJob(uint32_t slot, const char *when)
 	}
 }
 
+extern "C" int mapple_gic_describe(IOService *nub, int source, char *buf, size_t len);   /* MappleGIC.cpp */
+
+/*
+ * Gated, from the job timer. Interrupt causes still set a whole tick later never reached their handlers (the job and
+ * MMU lines can go silent, and then every job times out, through GPU resets). Logged with the lines' GIC state; with
+ * mp_gpu_lostirq=1 handled here, then each line is switched off and on (a line left hard-disabled comes back).
+ */
+void
+MappleGPUAccelerator::lostInterrupts(void)
+{
+	uint32_t job = rd(JOB_INT_STAT), mmu = rd(MMU_INT_STAT);
+	uint32_t lostJob = job & fPrevJobStat, lostMmu = mmu & fPrevMmuStat;
+
+	fPrevJobStat = job;
+	fPrevMmuStat = mmu;
+	if ((lostJob | lostMmu) == 0) {
+		return;
+	}
+	fLostIrqs++;
+	if (fLostIrqs <= 8) {
+		IOLog("GPU: interrupt not handled for %u ms: JOB_INT_STAT 0x%x (mask 0x%x) MMU_INT_STAT 0x%x (mask 0x%x)%s\n",
+		    TIMER_MS, job, rd(JOB_INT_MASK), mmu, rd(MMU_INT_MASK), fRecoverIrq ? ", handled here" : "");
+		for (int i = 0; i < 3; i++) {
+			char gic[96];
+
+			mapple_gic_describe(const_cast<IOService *>(fIrq[i]->getProvider()), fIrq[i]->getIntIndex(), gic, sizeof(gic));
+			IOLog("GPU: %s line: %s; event source %s\n", i == 0 ? "GPU" : i == 1 ? "MMU" : "job", gic,
+			    fIrq[i]->isEnabled() ? "enabled" : "disabled");
+		}
+	}
+	if (!fRecoverIrq) {
+		return;
+	}
+	if (lostMmu) {
+		mmuInterrupt(this, NULL, 0);
+	}
+	if (lostJob && fPowered) {
+		boolean_t ie = ml_set_interrupts_enabled(FALSE);
+		jobFilterRun();         /* the done bits, under the filter's lock, as the filter takes them */
+		(void)ml_set_interrupts_enabled(ie);
+		jobInterrupt(this, NULL, 0);
+	}
+	for (int i = 0; fPowered && i < 3; i++) {
+		fIrq[i]->disable();
+		fIrq[i]->enable();
+	}
+	fPrevJobStat = fPrevMmuStat = 0;
+}
+
 void
 MappleGPUAccelerator::jobTimer(OSObject *owner, IOTimerEventSource *src __unused)
 {
@@ -3293,6 +3345,10 @@ MappleGPUAccelerator::jobTimer(OSObject *owner, IOTimerEventSource *src __unused
 			self->fTimerArmed = true;
 			self->fTimer->setTimeoutMS(TIMER_MS);
 		}
+		return;
+	}
+	self->lostInterrupts();
+	if (!self->fPowered) {
 		return;
 	}
 	self->fastSync();
