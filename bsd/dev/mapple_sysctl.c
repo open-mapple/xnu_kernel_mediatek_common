@@ -7,9 +7,10 @@
  *   wifi [status|sta]. Root (the app's setuid helper) may also run the other gpu/disp/bat/cpu/wifi subcommands
  *   ("gpu freq 800", "gpu dvfs off", "bat lpm on", ...). Never peek/poke/pmic/i2c, push/pull/run, panic, reboot.
  *   "gpu kv" / "disp kv": stable key=value lines (MappleGPU.cpp, MappleFramebuffer.cpp).
- * kern.mapple_nextbootargs (KA2): the boot-args of the next boot, i.e. the cmdline in the MAPPLEPL payload of the
- *   active slot's boot partition (androidboot.slot_suffix, else boot_b): read by everybody, written by root
- *   (bsd/dev/mtk_ufs.c mtk_ufs_bootargs: one 4 KiB block, checked, read back).
+ * kern.mapple_nextbootargs (KA2): the boot-args of the next boot: the MAPPLEBR record's line when it applies, else the
+ *   cmdline in the MAPPLEPL payload of the active slot's boot partition (androidboot.slot_suffix, else boot_b). Read
+ *   by everybody, written by root into the record only (mtk_ufs_bootfile: checked, read back); the payload is never
+ *   written, so safe boot always has its line.
  * kern.mapple_nextbootargs_orig: what that partition held the first time either sysctl was used (for "restore").
  * kern.mapple_linkstate (0182): USB state for the SpringBoard island: 0 no host, 1 standard, 2 Mapple link active.
  */
@@ -30,7 +31,7 @@ extern void mt6631_wifi_link(const char *args, char *out, size_t len);        /*
 extern void mapple_gpu_link(const char *args, char *out, size_t len);         /* iokit/Kernel/arm/MappleGPU.cpp */
 extern void mt6781_cpufreq_link(const char *args, char *out, size_t len);     /* osfmk/arm64/mt6781_cpufreq.c */
 extern void mapple_disp_link(const char *args, char *out, size_t len);        /* iokit/Kernel/arm/MappleFramebuffer.cpp */
-extern int mtk_ufs_bootargs(const char *part, bool write, char *cmdline, size_t len); /* bsd/dev/mtk_ufs.c */
+extern int mtk_ufs_bootargs(const char *part, char *cmdline, size_t len);            /* bsd/dev/mtk_ufs.c */
 extern int mtk_ufs_bootfile(bool write, uint64_t base, char *cmdline, size_t len);     /* bsd/dev/mtk_ufs.c, 0180 */
 extern uint64_t mapple_bootrec_hash(const char *s);
 extern int mtk_ufs_bootrec_raw(bool write, uint8_t *blk);                          /* bsd/dev/mtk_ufs.c, 0180 */
@@ -184,7 +185,7 @@ static int
 mapple_payload_line(char *payload, size_t len)
 {
 	char rec[BOOTARGS_MAX + 1];
-	int error = mtk_ufs_bootargs(mapple_boot_part(), false, payload, len);
+	int error = mtk_ufs_bootargs(mapple_boot_part(), payload, len);
 	if (error != ENOENT) {
 		return error;
 	}
@@ -214,11 +215,10 @@ mapple_bootargs_remember(void)
 }
 
 /*
- * 0180: LK write-protects the boot partitions while iOS runs, so a line that cannot go into the payload goes into the
- * MAPPLEBR record in userdata (mtk_ufs_bootfile), which the shim reads before XNU while the payload still holds the
- * line it was saved against. mapple_bootargs_src: where the next boot's line comes from.
+ * 0180: the next boot's line goes into the MAPPLEBR record in the root partition (mtk_ufs_bootfile), which the shim
+ * reads before XNU while the payload still holds the line it was saved against. mapple_bootargs_src: where the next
+ * boot's line comes from.
  */
-static int mapple_bootpart_wp = -1;               /* boot partition: -1 unknown, 0 writable, 1 write-protected */
 static const char *mapple_bootargs_src = "payload";
 
 /* mapple_sysctl_mtx held. The next boot's command line: the MAPPLEBR record if it applies, else the payload's. */
@@ -238,30 +238,18 @@ mapple_next_line(char *cur, size_t len, char *payload, size_t plen)
 	return 0;
 }
 
-/* mapple_sysctl_mtx held. Payload first (it fails while LK's write protection is on), else the MAPPLEBR record. */
+/* mapple_sysctl_mtx held. Only the record is written; the payload's line, or an empty one, disables it. */
 static int
 mapple_next_line_set(char *want, size_t len, const char *payload)
 {
 	uint64_t base = mapple_bootrec_hash(payload);
 	if (want[0] == 0 || strcmp(want, payload) == 0) {
-		/* empty = back to the payload's line: never an empty command line in the boot partition */
 		char old[BOOTARGS_MAX + 1];
 		if (mtk_ufs_bootfile(false, base, old, sizeof(old)) == 0) {
 			char none[1] = "";
 			return mtk_ufs_bootfile(true, base, none, sizeof(none));
 		}
 		return 0;
-	}
-	int error = mapple_bootpart_wp == 1 ? EROFS : mtk_ufs_bootargs(mapple_boot_part(), true, want, len);
-	if (error == 0) {
-		mapple_bootpart_wp = 0;
-		return 0;               /* the payload changed: an old record no longer applies (other base) */
-	}
-	if (error != EROFS && error != EIO) {
-		return error;
-	}
-	if (error == EROFS) {
-		mapple_bootpart_wp = 1;
 	}
 	return mtk_ufs_bootfile(true, base, want, len);
 }
@@ -314,12 +302,10 @@ static int
 sysctl_mapple_nextbootargs_src SYSCTL_HANDLER_ARGS
 {
 #pragma unused(oidp, arg1, arg2)
-	char cur[BOOTARGS_MAX + 1], payload[BOOTARGS_MAX + 1], out[96];
+	char cur[BOOTARGS_MAX + 1], payload[BOOTARGS_MAX + 1], out[16];
 	lck_mtx_lock(&mapple_sysctl_mtx);
 	int error = mapple_next_line(cur, sizeof(cur), payload, sizeof(payload));
-	snprintf(out, sizeof(out), "%s %s", error ? "error" : mapple_bootargs_src,
-	    mapple_bootpart_wp == 1 ? "boot-partition-write-protected" : mapple_bootpart_wp == 0 ? "boot-partition-writable" :
-	    "boot-partition-untested");
+	strlcpy(out, error ? "error" : mapple_bootargs_src, sizeof(out));
 	lck_mtx_unlock(&mapple_sysctl_mtx);
 	return SYSCTL_OUT(req, out, strlen(out) + 1);
 }

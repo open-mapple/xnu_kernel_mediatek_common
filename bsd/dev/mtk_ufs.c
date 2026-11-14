@@ -418,40 +418,20 @@ mtk_ufs_read_part(const char *name, uint64_t off, void *buf, uint32_t len, uint6
 }
 
 /*
- * KA2 (gpu/docs/RICHIESTE-KERNEL.md): the boot-args of the next boot = cmdline[608] at +0x48 of the MAPPLEPL
- * payload that tools/mkboot.sh puts at the start of the ramdisk of boot_a / boot_b (header v2, ramdisk at
- * page_size * (1 + ceil(kernel_size / page_size))). The one write outside the root partition this driver does:
- * only to a GPT partition named exactly "boot_a" or "boot_b" on the root's LUN, only the one 4 KiB block that holds
- * +0x48..+0x2a8 (read-modify-write, the rest of the block unchanged), after checking the Android header, the
- * offset, the magic and the version; then the block is read back and compared. Boot-arg mp_bootrec_nowrite=1
- * refuses writes. Errors: EINVAL (string), ENOENT (partition, header, magic), EIO.
+ * KA2 (gpu/docs/RICHIESTE-KERNEL.md): the payload's command line = cmdline[608] at +0x48 of the MAPPLEPL payload
+ * that tools/mkboot.sh puts at the start of the ramdisk of boot_a / boot_b (header v2, ramdisk at
+ * page_size * (1 + ceil(kernel_size / page_size))). Read only: the next boot's line goes into the MAPPLEBR record,
+ * and the payload keeps the line safe boot falls back to. Errors: ENOENT (partition, header, magic), EIO.
  */
 #define PAYLOAD_CMDLINE         0x48
 #define PAYLOAD_CMDLINE_LEN     608
 
-int mtk_ufs_bootargs(const char *part, bool write, char *cmdline, size_t len);
-
-/* WRITE(10) of the bounce buffer's first block to lba, which must lie inside [first, first + nblocks). */
-static int
-ufs_write_block_in(uint64_t first, uint64_t nblocks, uint64_t lba)
-{
-	if (nblocks == 0 || lba < first || lba - first >= nblocks || lba > UINT32_MAX) {
-		printf("UFS: refusing boot-args write at 0x%llx (partition 0x%llx + 0x%llx)\n", lba, first, nblocks);
-		return EPERM;
-	}
-	uint8_t cdb[10] = {
-		0x2a, 0,
-		(uint8_t)(lba >> 24), (uint8_t)(lba >> 16), (uint8_t)(lba >> 8), (uint8_t)lba,
-		0, 0, 1, 0
-	};
-	return ufs_scsi(cdb, sizeof(cdb), UFS_BLOCK, true);
-}
+int mtk_ufs_bootargs(const char *part, char *cmdline, size_t len);
 
 int
-mtk_ufs_bootargs(const char *part, bool write, char *cmdline, size_t len)
+mtk_ufs_bootargs(const char *part, char *cmdline, size_t len)
 {
 	uint8_t *b = (uint8_t *)(su.dma + DMA_BOUNCE);
-	static uint8_t blk[UFS_BLOCK];
 	uint64_t first = 0, nblocks = 0;
 	int error;
 
@@ -460,19 +440,6 @@ mtk_ufs_bootargs(const char *part, bool write, char *cmdline, size_t len)
 	}
 	if (!su.ready) {
 		return ENXIO;
-	}
-	if (write) {
-		uint32_t no = 0;
-		PE_parse_boot_argn_alias("mp_bootrec_nowrite", "vivanobootargswrite", &no, sizeof(no));
-		size_t n = strnlen(cmdline, len);
-		if (no || n == 0 || n == len || n >= PAYLOAD_CMDLINE_LEN) {
-			return no ? EPERM : EINVAL;       /* 0180: never an empty command line */
-		}
-		for (size_t i = 0; i < n; i++) {
-			if (cmdline[i] < 0x20 || cmdline[i] > 0x7e) {
-				return EINVAL;
-			}
-		}
 	}
 	lck_mtx_lock(&mtk_ufs_lock);
 	error = ufs_lookup_partition(part, &first, &nblocks);
@@ -518,32 +485,10 @@ mtk_ufs_bootargs(const char *part, bool write, char *cmdline, size_t len)
 		error = ENOENT;
 		goto out;
 	}
-	if (!write) {
-		size_t n = MIN(len - 1, (size_t)PAYLOAD_CMDLINE_LEN);
-		memcpy(cmdline, b + in, n);
-		cmdline[n] = 0;
-		cmdline[strnlen(cmdline, n)] = 0;
-		goto out;
-	}
-	memcpy(blk, b, UFS_BLOCK);
-	bzero(blk + in, PAYLOAD_CMDLINE_LEN);
-	memcpy(blk + in, cmdline, strlen(cmdline));
-	memcpy(b, blk, UFS_BLOCK);
-	error = ufs_write_block_in(first, nblocks, lba);
-	if (!error) {
-		error = ufs_sync_cache();
-	}
-	if (!error) {
-		error = ufs_read_blocks(lba, 1);
-	}
-	if (!error && memcmp(b, blk, UFS_BLOCK) != 0) {
-		error = EIO;
-	}
-	printf("UFS: %s: next boot-args %s (block 0x%llx): \"%s\"\n", part, error ? "NOT written" : "written", lba,
-	    cmdline);
-	if (error && error != EPERM && error != EROFS) {
-		error = EIO;
-	}
+	size_t n = MIN(len - 1, (size_t)PAYLOAD_CMDLINE_LEN);
+	memcpy(cmdline, b + in, n);
+	cmdline[n] = 0;
+	cmdline[strnlen(cmdline, n)] = 0;
 out:
 	lck_mtx_unlock(&mtk_ufs_lock);
 	return error;
