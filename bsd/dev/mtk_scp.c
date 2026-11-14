@@ -13,7 +13,8 @@
  * 2 the IPI handshake: scp_sel to clk26m (only with mp_scp_clk26m=1, and only if it is not there), the start
  *   (cfg+0 = 1) when LK's region info is there and its DRAM lies in a memory hole; READY (30 s), the hub's
  *   INIT_DONE, the ring (1 MiB below 2 GiB, taken at boot) given with SET_CONFIG, the non-wakeup interrupt
- *   unmasked (mp_scp_unmask=0 skips it; again whenever sensors are on and 5 s pass with no record),
+ *   unmasked (mp_scp_unmask=0 skips it; again whenever sensors are on and 5 s pass with no record, and every
+ *   10 s the ring and the wanted sensors again too, six tries),
  *   SET_TIMESTAMP every 10 s. The SCP's
  *   first 64 messages are logged.
  * 3 the accelerometer and its HID service (one sample a second logged for the first 30 s). Once the hub is up, a
@@ -491,7 +492,7 @@ worker(__unused void *arg, __unused wait_result_t w)
 		goto out;
 	}
 	uint64_t up_at = counter_now(), quiet_since = up_at;
-	uint32_t said_records = 0, quiet_records = 0, unmasks = 0;
+	uint32_t said_records = 0, quiet_records = 0, kicks = 0;
 	for (uint64_t tick = up_at;;) {
 		while (pump()) {
 		}
@@ -499,14 +500,33 @@ worker(__unused void *arg, __unused wait_result_t w)
 		if (notifies == 0 && ring_word(4) != ring_word(0)) {
 			drain(ring_word(4));
 		}
-		/* sensors on, no record for 5 s: unmasked again (some boots the hub holds its data despite the first) */
-		if (records != quiet_records) {
+		/*
+		 * Sensors on and no record: some boots the hub holds its data despite the same start. After 5 s quiet the
+		 * unmask again; after 10 s the ring and every wanted sensor again too, as Android does after an SCP restart.
+		 */
+		if (records != quiet_records || !any_wanted()) {
 			quiet_records = records;
 			quiet_since = counter_now();
-		} else if (unmask && counter_now() - quiet_since > 5 * hz && any_wanted()) {
+			kicks = 0;
+		} else if (counter_now() - quiet_since > 5 * hz && kicks < 6) {
 			quiet_since = counter_now();
-			if (unmasks++ < 10) {
+			kicks++;
+			if (unmask) {
 				printf("scp: no records for 5 s, non-wakeup interrupt unmasked again: %d\n", unmask_nonwakeup());
+			}
+			if (kicks % 2 == 0) {
+				uint8_t m[SH_MSG];
+				*(volatile uint32_t *)(ring + 0) = 0;
+				*(volatile uint32_t *)(ring + 4) = 0;
+				__builtin_arm_dsb(0xf);
+				sh_msg_time(m, SH_SET_CONFIG, (uint32_t)ring_pa, 0, 0);
+				sh_put32(m + 8, SH_RING_BYTES);
+				printf("scp: ring given again: %s\n", sh_request(m) ? "taken" : "refused");
+				lck_spin_lock(&want_lock);
+				for (unsigned t = 0; t <= SH_DEVICE_ORIENTATION; t++) {
+					want[t].dirty = want[t].period_us != 0;
+				}
+				lck_spin_unlock(&want_lock);
 			}
 		}
 		uint32_t secs = (uint32_t)((counter_now() - up_at) / hz);
