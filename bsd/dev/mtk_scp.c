@@ -15,7 +15,8 @@
  *   INIT_DONE, the ring (1 MiB below 2 GiB, taken at boot) given with SET_CONFIG, SET_TIMESTAMP every 10 s. The SCP's
  *   first 64 messages are logged.
  * 3 the accelerometer and its HID service (one sample a second logged for the first 30 s).
- * 4 every sensor and its HID service.
+ * 4 the plain sensors and their HID services.
+ * 5 and what locationd reads from the SPU beyond them: steps and activity, raise to wake, device motion.
  */
 #if defined(ARM64_BOARD_CONFIG_MT6781)
 #include <stdbool.h>
@@ -41,10 +42,12 @@ extern bool mapple_pa_in_hole(uint64_t pa);                                     
 extern volatile uint8_t *mapple_spu_ring(uint64_t *pa);                         /* MappleSPU.cpp */
 extern void mapple_spu_start(uint32_t steps);                                   /* MappleSPU.cpp */
 extern void mapple_spu_record(const struct sh_record *r, uint64_t ticks);       /* MappleSPU.cpp */
+extern void mapple_spu_tick(void);                                              /* MappleSPU.cpp */
 extern kern_return_t thread_terminate(thread_t thread);
 
 void mtk_scp_start(void);
 void mtk_scp_sensor_set(uint8_t type, uint32_t period_us, uint32_t latency_us);
+void mtk_scp_sensor_rearm(uint8_t type);
 
 #define REGION_INFO     0x400           /* LK's: loader, firmware, DRAM (start, size each), ... */
 #define SAID_MAX        64
@@ -316,6 +319,18 @@ mtk_scp_sensor_set(uint8_t type, uint32_t period_us, uint32_t latency_us)
 	lck_spin_unlock(&want_lock);
 }
 
+/* A one-shot sensor (pickup) disables itself when it fires: enabled again as it was. */
+void
+mtk_scp_sensor_rearm(uint8_t type)
+{
+	if (type > SH_DEVICE_ORIENTATION) {
+		return;
+	}
+	lck_spin_lock(&want_lock);
+	want[type].dirty = want[type].period_us != 0;
+	lck_spin_unlock(&want_lock);
+}
+
 static void
 status(const char *when)
 {
@@ -375,12 +390,16 @@ worker(__unused void *arg, __unused wait_result_t w)
 	if (!hub_up) {
 		goto out;
 	}
-	for (;;) {
+	for (uint64_t tick = counter_now();;) {
 		while (pump()) {
 		}
 		apply_wanted();
 		if (counter_now() - last_stamp > 10 * hz) {
 			stamp();
+		}
+		if (counter_now() - tick > hz) {
+			tick = counter_now();
+			mapple_spu_tick();
 		}
 		pause_ms(2);
 	}
