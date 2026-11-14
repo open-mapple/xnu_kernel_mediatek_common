@@ -349,6 +349,19 @@ AppleKeyStoreUserClient::clientClose(void)
 	return kIOReturnSuccess;
 }
 
+/* A structure past the inline limit comes as a descriptor over the caller's memory: wired only while prepared. */
+static IOByteCount
+mapple_aks_md_copy(IOMemoryDescriptor *md, void *buf, IOByteCount len, bool write)
+{
+	IOByteCount n = 0;
+
+	if (md->prepare() == kIOReturnSuccess) {
+		n = write ? md->writeBytes(0, buf, len) : md->readBytes(0, buf, len);
+		md->complete();
+	}
+	return n;
+}
+
 /* Copy len bytes to the caller's output structure (inband or descriptor). */
 static IOReturn
 mapple_aks_struct_out(IOExternalMethodArguments *args, const void *buf, uint32_t len)
@@ -357,7 +370,9 @@ mapple_aks_struct_out(IOExternalMethodArguments *args, const void *buf, uint32_t
 		if (len > args->structureOutputDescriptor->getLength()) {
 			return kIOReturnNoSpace;
 		}
-		args->structureOutputDescriptor->writeBytes(0, buf, len);
+		if (mapple_aks_md_copy(args->structureOutputDescriptor, (void *)(uintptr_t)buf, len, true) != len) {
+			return kIOReturnNoSpace;
+		}
 		args->structureOutputDescriptorSize = len;
 		return kIOReturnSuccess;
 	}
@@ -457,7 +472,7 @@ mapple_aks_read_in(IOExternalMethodArguments *args, uint8_t *buf, uint32_t *len)
 
 	if (args->structureInputDescriptor != NULL) {
 		n = (uint32_t)args->structureInputDescriptor->getLength();
-		if (n > *len || args->structureInputDescriptor->readBytes(0, buf, n) != n) {
+		if (n > *len || mapple_aks_md_copy(args->structureInputDescriptor, buf, n, false) != n) {
 			return kIOReturnBadArgument;
 		}
 	} else {
@@ -476,7 +491,7 @@ mapple_aks_write_out(IOExternalMethodArguments *args, const uint8_t *buf, uint32
 {
 	if (args->structureOutputDescriptor != NULL) {
 		if (args->structureOutputDescriptor->getLength() < len ||
-		    args->structureOutputDescriptor->writeBytes(0, buf, len) != len) {
+		    mapple_aks_md_copy(args->structureOutputDescriptor, (void *)(uintptr_t)buf, len, true) != len) {
 			return kIOReturnNoSpace;
 		}
 		args->structureOutputDescriptorSize = len;
