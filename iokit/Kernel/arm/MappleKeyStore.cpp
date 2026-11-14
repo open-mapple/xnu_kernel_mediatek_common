@@ -591,12 +591,19 @@ AppleKeyStoreUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
 	case kAKSChangeSecretEpilogue:
 	case kAKSUnlockBag:
 	case kAKSLockBag:
-	case kAKSAssertHold:
 	case kAKSAssertDrop:
 	case kAKSAssertConsume:
 	case kAKSUnloadSessionBags:
 	case kAKSNotifyStateSet:
 		args->scalarOutputCount = 0;
+		break;
+	case kAKSAssertHold:
+		/*
+		 * aks_assert_hold(type, timeout, handle): an assertion keeps an unlocked bag unlocked and cannot be
+		 * taken on a locked one. SpringBoard stays authenticated while its grace assertion (type 2) holds.
+		 */
+		args->scalarOutputCount = 0;
+		ret = gAKSRec.has && gAKSLocked ? kIOReturnNotPermitted : kIOReturnSuccess;
 		break;
 	case kAKSLockDevice:
 	case kAKSLockDeviceNow:
