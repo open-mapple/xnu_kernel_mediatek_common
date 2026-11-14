@@ -423,6 +423,27 @@ mapple_sandbox_syscall(struct proc *p, int call, user_addr_t arg)
  * segment and encrypted ones get nothing on either. Every other AMFI call answers as when no AMFI policy existed.
  */
 TUNABLE(uint32_t, mapple_inject, "mp_inject", 0);
+
+/*
+ * mp_inject_debugged=1 (with mp_inject=1): a process the tweak loader went into (inside an .app, as kern_exec.c puts
+ * it there, and given the answer above) is marked debugged as dyld asks, before any tweak runs, so a tweak may patch
+ * its code pages. Never a set-ID, __RESTRICT or encrypted one: those get no answer.
+ */
+static TUNABLE(uint32_t, mapple_inject_debugged, "mp_inject_debugged", 0);
+
+static bool
+mapple_in_app(proc_t p)
+{
+	char path[MAXPATHLEN];
+	int len = sizeof(path);
+	vnode_t vp = proc_getexecutablevnode(p);
+	if (vp == NULLVP) {
+		return false;
+	}
+	bool in = vn_getpath(vp, path, &len) == 0 && strnstr(path, ".app/", sizeof(path)) != NULL;
+	vnode_put(vp);
+	return in;
+}
 #define AMFI_SYSCALL_CHECK_DYLD_POLICY_SELF     90
 #define AMFI_DYLD_OUTPUT_ALLOW_AT_PATH                  (1ULL << 0)
 #define AMFI_DYLD_OUTPUT_ALLOW_PATH_VARS                (1ULL << 1)
@@ -458,6 +479,12 @@ amfi_stub_syscall(struct proc *p, int call, user_addr_t arg)
 		uint64_t out = proc_issetugid(p) ||
 		    (args[0] & (AMFI_DYLD_INPUT_PROC_HAS_RESTRICT_SEG | AMFI_DYLD_INPUT_PROC_IS_ENCRYPTED)) ? 0 : allow;
 		error = copyout(&out, (user_addr_t)args[1], sizeof(out));
+		if (error == 0 && out && mapple_inject && mapple_inject_debugged && mapple_in_app(p)) {
+			char name[32];
+			proc_name(proc_pid(p), name, sizeof(name));
+			printf("AMFI: %s marked debugged (mp_inject_debugged): %s\n", name,
+			    cs_allow_invalid(p) ? "ok" : "refused");
+		}
 	}
 	return error;
 }
