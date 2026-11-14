@@ -58,6 +58,7 @@
 #define NH_ACK                  0
 #define NH_NACK                 1
 #define NH_BUSY                 2
+#define NH_UNMASK_INTR          0x1082          /* u8 interrupt (2: non-wakeup), answer 1 */
 #define NH_WRITE                0x1091
 #define NH_HDR                  10              /* sync, seq, reason, len */
 #define NH_MAX                  (NH_HDR + 255 + 4)

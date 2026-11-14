@@ -197,7 +197,7 @@ static MappleSPUSensor *gSPU[SPU_COUNT];
 static IOLock *gSPULock;
 static uint32_t gSteps, gSamplesSaid;
 static int8_t gImuAxes[3] = { 1, 2, 3 }, gMagAxes[3] = { 1, 2, 3 };
-static uint32_t gAlsDiv = 100, gStrideCm = 70;
+static uint32_t gAlsDiv = 100, gStrideCm = 70, gStep3AccelUs = 20000;
 static uint64_t gWokeTicks;             /* raise to wake detected, not yet dismissed */
 
 /* the latest of each, iOS's units (Q16), for the fusion */
@@ -249,8 +249,8 @@ spu_update(void)
 	bool gesture = gSPU[SPU_GESTURE] != NULL;
 	IOLockUnlock(gSPULock);
 
-	if (gSteps == 3 && (accel == 0 || accel > 20000)) {
-		accel = 20000;          /* step 3 runs the accelerometer at 50 Hz whatever iOS asks */
+	if (gSteps == 3) {
+		accel = gStep3AccelUs;  /* step 3 runs the accelerometer whatever iOS asks (mp_scp_accel_us, default 50 Hz) */
 	}
 	/* batching only when nothing else needs the sensor live */
 	mtk_scp_sensor_set(SH_ACCEL, accel, accel == on(SPU_ACCEL) && !on(SPU_ORIENT) && !dm ? latency[SPU_ACCEL] : 0);
@@ -677,6 +677,7 @@ mapple_spu_start(uint32_t steps)
 	axes_arg("mp_mag_axes", gMagAxes);
 	PE_parse_boot_argn("mp_als_div", &gAlsDiv, sizeof(gAlsDiv));
 	PE_parse_boot_argn("mp_stride_cm", &gStrideCm, sizeof(gStrideCm));
+	PE_parse_boot_argn("mp_scp_accel_us", &gStep3AccelUs, sizeof(gStep3AccelUs));
 	gAlsDiv = gAlsDiv ? gAlsDiv : 1;
 	gMotion = CMA_STATIC;
 

@@ -12,7 +12,8 @@
  *   info in the SCP's SRAM.
  * 2 the IPI handshake: scp_sel to clk26m (only with mp_scp_clk26m=1, and only if it is not there), the start
  *   (cfg+0 = 1) when LK's region info is there and its DRAM lies in a memory hole; READY (30 s), the hub's
- *   INIT_DONE, the ring (1 MiB below 2 GiB, taken at boot) given with SET_CONFIG, SET_TIMESTAMP every 10 s. The SCP's
+ *   INIT_DONE, the ring (1 MiB below 2 GiB, taken at boot) given with SET_CONFIG, the non-wakeup interrupt
+ *   unmasked (mp_scp_unmask=0 skips it), SET_TIMESTAMP every 10 s. The SCP's
  *   first 64 messages are logged.
  * 3 the accelerometer and its HID service (one sample a second logged for the first 30 s). For 30 s after the hub is
  *   up, a status line a second (the ring's header, what was pushed) and, at 3 and 6 s, the hub's own latest accel
@@ -253,11 +254,31 @@ stamp(void)
 	last_stamp = c;
 }
 
-/* A ConfigCmd through nanohub: the packet, its ACK, then a one-byte answer, nonzero = taken. */
+/* One nanohub transaction: the packet, its ACK, then the answer; its first byte (nonzero = taken), -1 if none. */
+static int
+nh_transact(uint32_t reason, const uint8_t *data, uint8_t len)
+{
+	uint8_t pkt[NH_MAX];
+
+	for (int attempt = 0; attempt < 3; attempt++) {
+		size_t n = nh_packet(pkt, ++nh_seq, reason, data, len);
+		nh_wait_seq = nh_seq;
+		nh_waiting = true;
+		nh_ack = nh_got = false;
+		if (mt6781_scp_send(SCP_IPI_CHRE, pkt, (uint32_t)n) && wait_for(&nh_got, 200) && nh_len >= 1 && nh_buf[0]) {
+			nh_waiting = false;
+			return nh_buf[0];
+		}
+		nh_waiting = false;
+	}
+	return nh_got && nh_len ? nh_buf[0] : -1;
+}
+
+/* A ConfigCmd through nanohub. */
 static bool
 nh_send_config(uint8_t type, uint32_t period_us, uint32_t latency_us)
 {
-	uint8_t c[NH_CONFIG], pkt[NH_MAX];
+	uint8_t c[NH_CONFIG];
 	uint32_t rate;
 	bool on = period_us != 0;
 
@@ -270,17 +291,9 @@ nh_send_config(uint8_t type, uint32_t period_us, uint32_t latency_us)
 		rate = nh_rate(period_us);
 	}
 	nh_config(c, type, on ? NH_CMD_ENABLE : NH_CMD_DISABLE, on ? rate : 0, (uint64_t)latency_us * 1000);
-	for (int attempt = 0; attempt < 3; attempt++) {
-		size_t n = nh_packet(pkt, ++nh_seq, NH_WRITE, c, NH_CONFIG);
-		nh_wait_seq = nh_seq;
-		nh_waiting = true;
-		nh_ack = nh_got = false;
-		if (mt6781_scp_send(SCP_IPI_CHRE, pkt, (uint32_t)n) && wait_for(&nh_got, 200) && nh_len >= 1 && nh_buf[0]) {
-			nh_waiting = false;
-			printf("scp: sensor %u %s (%u us, latency %u us)\n", type, on ? "on" : "off", period_us, latency_us);
-			return true;
-		}
-		nh_waiting = false;
+	if (nh_transact(NH_WRITE, c, NH_CONFIG) > 0) {
+		printf("scp: sensor %u %s (%u us, latency %u us)\n", type, on ? "on" : "off", period_us, latency_us);
+		return true;
 	}
 	printf("scp: sensor %u %s: not taken (ack %d, answer %d, %u bytes, %#x)\n", type, on ? "on" : "off", nh_ack,
 	    nh_got, nh_len, nh_len ? nh_buf[0] : 0);
@@ -318,6 +331,13 @@ hub_power_up(void)
 	hub_up = sh_request(m);
 	printf("scp: hub %s, ring at %#llx\n", hub_up ? "up" : "did not take its ring", ring_pa);
 	if (hub_up) {
+		uint32_t unmask = 1;
+		(void)PE_parse_boot_argn("mp_scp_unmask", &unmask, sizeof(unmask));
+		if (unmask) {
+			/* the non-wakeup interrupt, as Android's nanohub unmasks it on resume: the hub holds such data otherwise */
+			uint8_t intr = 2;
+			printf("scp: non-wakeup interrupt unmasked: %d\n", nh_transact(NH_UNMASK_INTR, &intr, 1));
+		}
 		stamp();
 		lck_spin_lock(&want_lock);
 		for (unsigned t = 0; t <= SH_DEVICE_ORIENTATION; t++) {
