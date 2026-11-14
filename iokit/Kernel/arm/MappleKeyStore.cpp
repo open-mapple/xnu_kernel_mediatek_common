@@ -33,6 +33,7 @@
 #include <kern/clock.h>
 #include <sys/proc.h>
 #include <sys/vnode.h>
+#include <sys/vnode_if.h>
 #include <sys/fcntl.h>
 #include <sys/random.h>
 
@@ -153,6 +154,10 @@ mapple_aks_save(struct mapple_aks_rec *r)
 	if (err == 0) {
 		err = vnode_vtype(vp) == VREG ? vn_rdwr(UIO_WRITE, vp, (caddr_t)r, sizeof(*r), (off_t)(r->seq & 1) * sizeof(*r),
 		    UIO_SYSSPACE, IO_NODELOCKED | IO_UNIT | IO_SYNC, vfs_context_ucred(ctx), NULL, vfs_context_proc(ctx)) : EFTYPE;
+		if (err == 0) {
+			/* IO_SYNC leaves the file's creation and size in the HFS+ journal: a reset could lose them */
+			err = VNOP_IOCTL(vp, F_FULLFSYNC, NULL, 0, ctx);
+		}
 		vnode_close(vp, FWRITE, ctx);
 	}
 	if (err != 0) {
