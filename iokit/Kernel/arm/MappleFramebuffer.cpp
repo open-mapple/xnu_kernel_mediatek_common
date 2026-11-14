@@ -111,6 +111,7 @@
 extern "C" int mapple_console_muted;     /* osfmk/console/serial_console.c */
 extern "C" void (*mapple_fb_panic_hook)(void);   /* pexpert/arm/pe_serial.c */
 extern "C" void mt6781_cpufreq_ui_activity(void);        /* osfmk/arm64/mt6781_cpufreq.c: 0183 UI boost */
+extern "C" void mtk_ufs_safe_clear(void);                /* bsd/dev/mtk_ufs.c */
 
 #if defined(MT6781)
 #include <IOKit/IOService.h>
@@ -225,6 +226,7 @@ public:
 	uint32_t      waitWhy(uint32_t swap);
 	void          waitResult(uint32_t swap, bool done);
 	bool          fConsolePaused;
+	bool          fUp;
 	uint8_t       fPending[MAPPLE_FB_SWAP_REC_SIZE];     /* latest swap (redrawn when the display comes on) */
 	bool          fDirty;
 	uint8_t       fQueue[MAPPLE_FB_QUEUE][MAPPLE_FB_SWAP_REC_SIZE];       /* swaps not shown yet, oldest first */
@@ -1150,6 +1152,10 @@ AppleCLCD::present(const uint8_t *rec, bool force, uint64_t jobs)
 	uint64_t jobsAfter = 0;
 
 	IOLockLock(fScanLock);
+	if (!fUp) {
+		fUp = true;                     /* the GUI's first frame: the boot got this far */
+		mtk_ufs_safe_clear();
+	}
 	if (fFlipAllowed && !fFlipTried) {
 		fFlipTried = true;              /* once: findLKLayer and the frame-end calibration (< 0.1 s) */
 		flipSetup(NULL, NULL);

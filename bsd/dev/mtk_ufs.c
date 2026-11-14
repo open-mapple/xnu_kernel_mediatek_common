@@ -34,6 +34,7 @@
 #include <kern/kalloc.h>
 #include <kern/clock.h>
 #include <kern/sched_prim.h>
+#include <kern/thread_call.h>
 #include <machine/machine_routines.h>
 #include <arm/caches_internal.h>
 #include <vm/pmap.h>
@@ -503,11 +504,13 @@ out:
  */
 #define BOOTREC_TAIL_BLOCKS    256u
 #define BOOTREC_LINE           608
+#define BOOTREC_SAFE           0x2u    /* the next boot is a safe boot: set from Mapple (kern.mapple_bootrec), acted on by
+					* mtkloader, cleared here once the GUI is up */
 
 struct bootrec_rec {
 	char magic[8];
 	uint32_t version;
-	uint32_t flags;                         /* bit 0: enabled */
+	uint32_t flags;                         /* bit 0: enabled; bit 1: BOOTREC_SAFE */
 	uint64_t base_hash;                     /* FNV-1a 64 of the payload command line it replaces */
 	uint64_t seq;
 	uint64_t line_hash;                     /* FNV-1a 64 of cmdline */
@@ -519,6 +522,7 @@ _Static_assert(sizeof(struct bootrec_rec) == 672, "MAPPLEBR layout (shim/bootrec
 uint64_t mapple_bootrec_hash(const char *s);
 int mtk_ufs_bootfile(bool write, uint64_t base, char *cmdline, size_t len);
 int mtk_ufs_bootrec_raw(bool write, uint8_t *blk);
+void mtk_ufs_safe_clear(void);
 
 uint64_t
 mapple_bootrec_hash(const char *s)
@@ -648,10 +652,11 @@ mtk_ufs_bootfile(bool write, uint64_t base, char *cmdline, size_t len)
 		goto out;
 	}
 	uint64_t seq = memcmp(rec.magic, "MAPPLEBR", 8) == 0 ? rec.seq + 1 : 1;
+	uint32_t safe = memcmp(rec.magic, "MAPPLEBR", 8) == 0 && rec.version == 1 ? rec.flags & BOOTREC_SAFE : 0;
 	bzero(&rec, sizeof(rec));
 	memcpy(rec.magic, "MAPPLEBR", 8);
 	rec.version = 1;
-	rec.flags = n ? 1 : 0;
+	rec.flags = (n ? 1 : 0) | safe;
 	rec.base_hash = base;
 	rec.seq = seq;
 	memcpy(rec.cmdline, cmdline, n);
@@ -664,6 +669,45 @@ mtk_ufs_bootfile(bool write, uint64_t base, char *cmdline, size_t len)
 out:
 	lck_mtx_unlock(&mtk_ufs_lock);
 	return error;
+}
+
+static void
+bootrec_safe_clear(thread_call_param_t p0 __unused, thread_call_param_t p1 __unused)
+{
+	static uint8_t blk[UFS_BLOCK];
+	struct bootrec_rec rec;
+
+	if (!su.ready || !su.writable || su.nblocks <= BOOTREC_TAIL_BLOCKS) {
+		return;
+	}
+	uint64_t lba = su.first_block + su.nblocks - BOOTREC_TAIL_BLOCKS;
+	lck_mtx_lock(&mtk_ufs_lock);
+	int error = ufs_read_blocks(lba, 1);
+	if (!error) {
+		memcpy(blk, (const void *)(su.dma + DMA_BOUNCE), UFS_BLOCK);
+		memcpy(&rec, blk, sizeof(rec));
+		if (memcmp(rec.magic, "MAPPLEBR", 8) == 0 && rec.version == 1 && (rec.flags & BOOTREC_SAFE)) {
+			rec.flags &= ~BOOTREC_SAFE;
+			memcpy(blk, &rec, sizeof(rec));
+			error = bootrec_volume_clear(lba);
+			if (!error) {
+				error = bootrec_write_locked(lba, blk);
+			}
+			printf("UFS: MAPPLEBR safe-next-boot mark %s (block 0x%llx)\n", error ? "NOT cleared" : "cleared", lba);
+		}
+	}
+	lck_mtx_unlock(&mtk_ufs_lock);
+}
+
+/* The GUI is up: the safe-next-boot mark goes (a boot that never gets here keeps it, so the next one is safe again). */
+void
+mtk_ufs_safe_clear(void)
+{
+	thread_call_t call = thread_call_allocate(bootrec_safe_clear, NULL);
+
+	if (call != NULL) {
+		thread_call_enter(call);
+	}
 }
 
 static int
