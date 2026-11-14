@@ -546,28 +546,28 @@ MTKPwrap::powerOff(void)
 {
 	static const struct mt6358_poweroff_ops ops = { poRead, poWrite, poDelay };
 	const char *failed;
+	char why[48];
 	int i;
 
+	/* no console output with interrupts off: the line first, a failure's only after they are back on */
+	printf("platform: power off: PMIC shutdown hook, then PWRHOLD 0\n");
 	(void)ml_set_interrupts_enabled(FALSE);
 	for (i = 0; i < 5000 && !IOLockTryLock(fLock); i++) {
 		IODelay(10);
 	}
 	if (i == 5000) {
-		printf("platform: power off: PMIC wrapper busy for 50 ms\n");
-		return;
+		failed = "wrapper busy for 50 ms";
+	} else if ((failed = mt6358_poweroff_prepare(&ops)) != NULL) {
+		snprintf(why, sizeof(why), "%s failed", failed);
+		failed = why;
+	} else if (mt6358_poweroff_cut(&ops) != 0) {
+		failed = "PPCCTL0 failed";
+	} else {
+		IODelay(1000000);
+		failed = "still on 1 s after PWRHOLD 0";
 	}
-	failed = mt6358_poweroff_prepare(&ops);
-	if (failed != NULL) {
-		printf("platform: power off: PMIC %s failed\n", failed);
-		return;
-	}
-	printf("platform: power off: PMIC PWRHOLD 0\n");
-	if (mt6358_poweroff_cut(&ops) != 0) {
-		printf("platform: power off: PMIC PPCCTL0 failed\n");
-		return;
-	}
-	IODelay(1000000);
-	printf("platform: power off: PMIC still on 1 s after PWRHOLD 0\n");
+	(void)ml_set_interrupts_enabled(TRUE);
+	printf("platform: power off: PMIC %s\n", failed);
 }
 
 extern "C" void

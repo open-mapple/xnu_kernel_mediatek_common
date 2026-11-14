@@ -68,7 +68,7 @@ MapplePlatformExpert::haltRestart(unsigned int type)
 			toprgu = ml_io_map(TOPRGU_PA, 0x1000);
 		}
 		if (type == kPEHaltCPU && gMapplePowerOff == 1) {
-			mtk_pmic_poweroff();            /* interrupts off from here */
+			mtk_pmic_poweroff();            /* returns, interrupts on, only when the power is still on */
 		}
 		printf("platform: %s: the watchdog's software reset\n", type == kPEHaltCPU ? "power off" : "restart");
 		for (;;) {
