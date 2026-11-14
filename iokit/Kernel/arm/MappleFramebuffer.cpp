@@ -24,7 +24,9 @@
  *   12 RequestPowerChange [state]: 0 = display off (backboardd, power
  *      button / auto-lock), else on. Off fades the panel out over a few
  *      vsyncs (halving each pixel) and keeps it black until on again;
- *      the panel itself stays powered (AMOLED black pixels are off).
+ *      the panel itself stays powered. spaced's panel is an LCD, so once
+ *      black the backlight goes to level 0 too, and back to iOS's level
+ *      at on (mp_fb_bloff, 1 default; 0 leaves the backlight alone).
  *   18 IsMainDisplay,
  *   28 GetDotPitch, 72 Enable/DisableNotifications [func, refcon, type, 0]
  * Everything else is accepted and logged once.
@@ -304,6 +306,8 @@ public:
 	uint32_t      fMaxNits;       /* mp_panel_nits: nits at level 2047 */
 	volatile uint32_t fBlWant;    /* panel level to send at the next tick, 0xffffffff = none */
 	uint32_t      fBlLevel;       /* last level sent */
+	uint32_t      fBlOff;         /* mp_fb_bloff: backlight off while the display is */
+	uint32_t      fBlResume;      /* level for when the display is on again */
 	uint64_t      fBlSent, fMatrixCalls, fMatrixApplied;
 	int32_t       fMatrix[16][9]; /* per matrix type (Night Shift = 9), fixed point 1.0 = 0x800 */
 	bool          fMatrixUsed[16];
@@ -558,6 +562,8 @@ AppleCLCD::start(IOService *provider)
 	PE_parse_boot_argn_alias("mp_panel_nits", "vivapanelnits", &fMaxNits, sizeof(fMaxNits));
 	fMaxNits = MIN(MAX(fMaxNits, 50u), 2000u);
 	fBlWant = 0xffffffffu;
+	fBlOff = 1;
+	PE_parse_boot_argn("mp_fb_bloff", &fBlOff, sizeof(fBlOff));
 	fHzIdleMs = 500;
 	PE_parse_boot_argn_alias("mp_panel_idle", "vivapanelidle", &fHzIdleMs, sizeof(fHzIdleMs));
 	fHzIdleMs = MIN(MAX(fHzIdleMs, 100u), 60000u);
@@ -2275,6 +2281,15 @@ AppleCLCD::lightTick(void)
 {
 	uint32_t bl = fBlWant;
 	bool matrix = fMatrixDirty;
+	bool dark = fBlOff && fPowerOff && fFadeStep > 6;
+	if (dark) {
+		/* faded to black: backlight off, and what iOS asks for meanwhile kept for the display on */
+		if (bl != 0xffffffffu) {
+			fBlResume = bl;
+			fBlWant = 0xffffffffu;
+		}
+		bl = fBlLevel != 0 ? 0 : 0xffffffffu;
+	}
 	if (bl == 0xffffffffu && !matrix) {
 		return;
 	}
@@ -2289,7 +2304,7 @@ AppleCLCD::lightTick(void)
 			}
 			fBlLevel = bl;
 			fBlSent++;
-			if (fBacklight != NULL) {
+			if (fBacklight != NULL && !dark) {
 				fBacklight->publishLevel(bl);
 			}
 		}
@@ -3241,6 +3256,11 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
 				fFB->fPowerOff = off;
 				fFB->fFadeStep = 0;
 				fFB->fDirty = true;     /* on: redraw the latest frame */
+				if (off) {
+					fFB->fBlResume = fFB->fBlWant != 0xffffffffu ? fFB->fBlWant : fFB->fBlLevel;
+				} else if (fFB->fBlOff && fFB->fBlLevel == 0 && fFB->fBlWant == 0xffffffffu) {
+					fFB->fBlWant = fFB->fBlResume;
+				}
 			}
 			IOLockUnlock(fFB->fLock);
 			IOLog("FB: display %s\n", off ? "off" : "on");
