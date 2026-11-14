@@ -2289,6 +2289,10 @@ AppleCLCD::lightTick(void)
 			fBlWant = 0xffffffffu;
 		}
 		bl = fBlLevel != 0 || fBlSent == 0 ? 0 : 0xffffffffu;
+	} else if (bl == 0 && fBlSent == 0) {
+		/* iOS asks for 0 early in boot, long before its first real level: LK's level stays until then */
+		fBlWant = 0xffffffffu;
+		bl = 0xffffffffu;
 	}
 	if (bl == 0xffffffffu && !matrix) {
 		return;
