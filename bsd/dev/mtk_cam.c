@@ -40,6 +40,7 @@ void mtk_cam_link(const char *args, char *out, size_t outLen);                  
 #define JN1_ADDR        0x2d
 #define JN1_CHIP_ID     0x38e1
 #define UP_MS           2000
+#define JN1_BOOT_MS     10      /* on top of MCLK's 2 ms: Android reads the ID ~6 ms after MCLK, the Hot 20 ~13 ms */
 #define MT6781_CAM_RST_LOW      0       /* mt6781_cam.h */
 #define MT6781_CAM_RST_HIGH     1
 #define MT6781_CAM_MCLK_OFF     2
@@ -238,7 +239,9 @@ power(char *out, size_t len)
 	if (ok && ms_since(t0) > UP_MS) {
 		say("cam: step 1: power-up past %u ms: chip ID not read\n", UP_MS);
 	} else if (ok) {
-		(void)jn1_id("step 1", out, len, &o);
+		(void)jn1_id("step 1, 2 ms after MCLK", out, len, &o);
+		delay_for_interval(JN1_BOOT_MS, NSEC_PER_MSEC);
+		(void)jn1_id("step 1, 12 ms after MCLK", out, len, &o);
 	}
 
 	/* Off: every step undone in reverse, whether it ran or not; an enable bit is only ever cleared. */
