@@ -2306,6 +2306,11 @@ AppleCLCD::lightTick(void)
 			if (fBlWant == bl) {
 				fBlWant = 0xffffffffu;
 			}
+			if (fBlSent == 0) {
+				IOLog("FB: backlight LK's level -> %u\n", bl);
+			} else if (bl == 0 || fBlLevel == 0) {
+				IOLog("FB: backlight %u -> %u\n", fBlLevel, bl);
+			}
 			fBlLevel = bl;
 			fBlSent++;
 			if (fBacklight != NULL && !dark) {
