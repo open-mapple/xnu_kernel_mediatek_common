@@ -583,11 +583,10 @@ mtk_scp_start(void)
 		thread_deallocate(t);
 	}
 }
-#endif /* ARM64_BOARD_CONFIG_MT6781 */
-
 /*
- * kern.mapple_sensors: a line per sensor the hub has, "name enabled samples last_ms": enabled when a published service
- * makes us ask the hub for it, samples since boot, milliseconds since the last one arrived (-1: none).
+ * kern.mapple_sensors: a line per sensor the hub has, "name present enabled samples last_ms": present while the hub is
+ * up, enabled when a published service makes us ask the hub for it, samples since boot, the last one's arrival in ms
+ * of mach time (0: none).
  */
 static int
 sysctl_mapple_sensors(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
@@ -598,25 +597,23 @@ sysctl_mapple_sensors(__unused struct sysctl_oid *oidp, __unused void *arg1, __u
 		uint32_t services;      /* MappleSPU's: accel 0, gyro 1, compass 2, prox 3, als 4, orient 5, cma 6, dm 8-10 */
 	} sensors[] = {
 		{ "accel", SH_ACCEL, 0x721 }, { "gyro", SH_GYRO, 0x702 }, { "mag", SH_MAG, 0x104 },
-		{ "light", SH_LIGHT, 0x10 }, { "prox", SH_PROX, 0x8 }, { "steps", SH_STEP_COUNTER, 0x40 },
+		{ "light", SH_LIGHT, 0x10 }, { "proximity", SH_PROX, 0x8 }, { "steps", SH_STEP_COUNTER, 0x40 },
 	};
 	uint32_t published = mapple_spu_published();
-	uint64_t now = mach_absolute_time(), ns;
+	uint64_t ns;
 	char out[384];
 	int len = 0;
 
 	for (unsigned i = 0; i < sizeof(sensors) / sizeof(sensors[0]); i++) {
 		uint8_t t = sensors[i].type;
-		long long ms = -1;
-		if (last_at[t]) {
-			absolutetime_to_nanoseconds(now - last_at[t], &ns);
-			ms = (long long)(ns / 1000000);
-		}
-		len += snprintf(out + len, sizeof(out) - len, "%s %d %u %lld\n", sensors[i].name,
-		    (published & sensors[i].services) != 0, by_type[t], ms);
+		absolutetime_to_nanoseconds(last_at[t], &ns);
+		len += snprintf(out + len, sizeof(out) - len, "%s %d %d %u %llu\n", sensors[i].name, hub_up,
+		    (published & sensors[i].services) != 0, by_type[t], ns / 1000000);
 	}
 	return SYSCTL_OUT(req, out, len + 1);
 }
 
 SYSCTL_PROC(_kern, OID_AUTO, mapple_sensors, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
-    0, 0, sysctl_mapple_sensors, "A", "the hub's sensors: name enabled samples last_ms");
+    0, 0, sysctl_mapple_sensors, "A", "the hub's sensors: name present enabled samples last_ms");
+
+#endif /* ARM64_BOARD_CONFIG_MT6781 */
