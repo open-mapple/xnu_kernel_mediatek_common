@@ -20,6 +20,7 @@ public:
 	const char *excludeList(void) APPLE_KEXT_OVERRIDE;
 	void getUTCTimeOfDay(clock_sec_t *secs, clock_nsec_t *nsecs) APPLE_KEXT_OVERRIDE;
 	void setUTCTimeOfDay(clock_sec_t secs, clock_nsec_t nsecs) APPLE_KEXT_OVERRIDE;
+	int haltRestart(unsigned int type) APPLE_KEXT_OVERRIDE;
 };
 
 extern "C" int mapple_rtc_read(uint64_t *secs);   /* MTKPwrap.cpp: the PMIC's RTC (MT6781 only) */
@@ -41,6 +42,35 @@ MapplePlatformExpert::setUTCTimeOfDay(__unused clock_sec_t secs, __unused clock_
 }
 
 OSDefineMetaClassAndStructors(MapplePlatformExpert, IODTPlatformExpert);
+
+#define TOPRGU_PA       0x10007000u
+#define WDT_SWRST       0x14
+#define WDT_SWRST_KEY   0x1209
+
+extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+
+/*
+ * iOS's restart (reboot(2): Settings, apps) reaches here after the shutdown notifications: the watchdog's software
+ * reset, as the USB link's "reboot" does. Power off restarts too until a power-off path exists. Panics are left as
+ * they are (wdt=-1 keeps the panic on screen).
+ */
+int
+MapplePlatformExpert::haltRestart(unsigned int type)
+{
+	static vm_offset_t toprgu;
+
+	if (type == kPERestartCPU || type == kPEHaltCPU) {
+		if (toprgu == 0) {
+			toprgu = ml_io_map(TOPRGU_PA, 0x1000);
+		}
+		printf("platform: %s: the watchdog's software reset\n", type == kPEHaltCPU ? "power off" : "restart");
+		for (;;) {
+			*(volatile uint32_t *)(toprgu + WDT_SWRST) = WDT_SWRST_KEY;
+			IODelay(5000);
+		}
+	}
+	return IODTPlatformExpert::haltRestart(type);
+}
 
 bool
 MapplePlatformExpert::start(IOService *provider)
