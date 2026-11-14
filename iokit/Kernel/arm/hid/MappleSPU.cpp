@@ -748,7 +748,8 @@ mapple_spu_start(uint32_t steps)
 	spu_update();
 }
 
-/* The hub's ring: 1 MiB, physically contiguous below 2 GiB (the SCP reaches 0x40000000-0x8fffffff), taken at boot;
+/* The hub's ring: 1 MiB, physically contiguous below 2 GiB (the SCP reaches 0x40000000-0x8fffffff), taken at boot
+ * (mp_scp_ring_max lowers the limit);
  * read through a write-combined mapping so the CPU sees what the SCP writes. */
 extern "C" volatile uint8_t *
 mapple_spu_ring(uint64_t *pa)
@@ -757,8 +758,27 @@ mapple_spu_ring(uint64_t *pa)
 	static IOMemoryMap *map;
 
 	if (map == NULL) {
-		mem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
-		    kIODirectionInOut | kIOMemoryPhysicallyContiguous, SH_RING_BYTES, 0x000000007ffff000ull);
+		/* mp_scp_ring_max=PA: blocks are taken (and the misses given back) until one ends at or below PA */
+		uint64_t max = 0;
+		IOBufferMemoryDescriptor *miss[32];
+		unsigned misses = 0;
+		PE_parse_boot_argn("mp_scp_ring_max", &max, sizeof(max));
+		for (;;) {
+			mem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+			    kIODirectionInOut | kIOMemoryPhysicallyContiguous, SH_RING_BYTES, 0x000000007ffff000ull);
+			if (mem == NULL || max == 0 || mem->getPhysicalSegment(0, NULL, kIOMemoryMapperNone) + SH_RING_BYTES <= max) {
+				break;
+			}
+			if (misses == 32) {
+				IOLog("SPU: no ring below %#llx in 32 tries\n", max);
+				OSSafeReleaseNULL(mem);
+				break;
+			}
+			miss[misses++] = mem;
+		}
+		while (misses) {
+			miss[--misses]->release();
+		}
 		if (mem == NULL) {
 			return NULL;
 		}
