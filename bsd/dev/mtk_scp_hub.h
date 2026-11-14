@@ -231,6 +231,26 @@ sh_ring_count(uint32_t rp, uint32_t wp)
 	return ((wp + SH_RING_DATA - rp) % SH_RING_DATA) / SH_REC;
 }
 
+/*
+ * More than half the ring between rp and wp is the hub having lapped us (it writes faster than we read): those
+ * records are partly overwritten, so they are skipped, not read.
+ */
+static inline bool
+sh_ring_overrun(uint32_t count)
+{
+	return count > SH_RING_DATA / SH_REC / 2;
+}
+
+/* the fastest a continuous sensor runs (100 Hz, CoreMotion's own ceiling); iOS asks for 1 us at times */
+#define SH_MIN_PERIOD_US        10000u
+
+static inline uint32_t
+sh_period(uint8_t type, uint32_t period_us)
+{
+	bool continuous = type == SH_ACCEL || type == SH_GYRO || type == SH_MAG || type == SH_PRESSURE;
+	return continuous && period_us && period_us < SH_MIN_PERIOD_US ? SH_MIN_PERIOD_US : period_us;
+}
+
 static inline uint32_t
 sh_ring_next(uint32_t off)
 {

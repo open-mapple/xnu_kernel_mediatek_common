@@ -142,6 +142,19 @@ test_ring(void)
 		seen++;
 	}
 	CHECK(seen == 5 && rp == wp);
+
+	/* the hub a little past us is fine; a wp just behind rp is a lap */
+	CHECK(!sh_ring_overrun(sh_ring_count(0, 44 * 100)));
+	CHECK(sh_ring_overrun(sh_ring_count(44 * 10, 44 * 9)));
+	CHECK(!sh_ring_overrun(sh_ring_count(44 * 10, 44 * 10)));
+}
+
+static void
+test_periods(void)
+{
+	CHECK(sh_period(SH_ACCEL, 1) == 10000 && sh_period(SH_GYRO, 9999) == 10000 && sh_period(SH_MAG, 16667) == 16667);
+	CHECK(sh_period(SH_ACCEL, 0) == 0);                    /* off stays off */
+	CHECK(sh_period(SH_LIGHT, 1000) == 1000 && sh_period(SH_PICKUP, 1) == 1);
 }
 
 static void
@@ -217,6 +230,7 @@ main(void)
 	test_ipi8();
 	test_records();
 	test_ring();
+	test_periods();
 	test_time();
 	test_units();
 	test_orientation();

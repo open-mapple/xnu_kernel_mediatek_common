@@ -25,7 +25,7 @@
  * mp_spu_off: a bit per service left out, in the order of the table below (accel 0, gyro 1, compass 2, prox 3,
  * als 4, orientation 5, cma 6, gesture 7, devmotion 8, devmotion6 9, devmotion3 10); mp_spu_prox=0 = bit 3.
  * Calibration knobs: mp_imu_axes, mp_mag_axes (default 0x123: a nibble per output axis x, y, z = the hub's axis 1-3,
- * +8 to flip it); mp_als_div (default 100: the hub's light value per lux, alsps's vender_div); mp_stride_cm
+ * +8 to flip it); mp_als_div (default 1: the hub's light value is lux; indoors it reads tens); mp_stride_cm
  * (default 70).
  */
 #include <IOKit/IOLib.h>
@@ -199,7 +199,7 @@ static MappleSPUSensor *gSPU[SPU_COUNT];
 static IOLock *gSPULock;
 static uint32_t gSteps, gSamplesSaid;
 static int8_t gImuAxes[3] = { 1, 2, 3 }, gMagAxes[3] = { 1, 2, 3 };
-static uint32_t gAlsDiv = 100, gStrideCm = 70, gStep3AccelUs = 20000;
+static uint32_t gAlsDiv = 1, gStrideCm = 70, gStep3AccelUs = 20000;
 static uint64_t gWokeTicks;             /* raise to wake detected, not yet dismissed */
 
 /* the latest of each, iOS's units (Q16), for the fusion */
