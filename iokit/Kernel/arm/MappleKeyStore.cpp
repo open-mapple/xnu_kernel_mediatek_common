@@ -1,6 +1,6 @@
 /*
- * Built-in AppleKeyStore for a device without a passcode whose
- * system keybag is always loaded and unlocked.
+ * Built-in AppleKeyStore: the system keybag is always loaded; with a passcode
+ * set it is locked at boot and on lock, and unlocked by the passcode.
  *
  * Apple's AppleKeyStore kext (closed, SEP-backed) owns the keybags behind
  * data protection. libaks (AppleKeyStore.framework, statically in keybagd)
@@ -9,6 +9,11 @@
  * --init asks for the system bag (14) and only loads systembag.kb when the
  * answer is kIOReturnNotFound; answering with a handle is the path a
  * userspace reboot takes, so no bag file is needed.
+ *
+ * The passcode (MappleKeyStorePasscode.h) is checked here, with iOS's delays
+ * after wrong attempts, and kept as a salted PBKDF2 verifier in
+ * /private/var/keybags/mapple.kb. Without a Secure Enclave nothing is
+ * hardware-bound and no data is encrypted under it: it locks the UI only.
  *
  * Every call is logged (selector, caller, argument shapes, result) so the
  * next selectors the system needs show up on the console; unknown ones fail
@@ -23,7 +28,15 @@
 #include <IOKit/IOLib.h>
 #include <IOKit/IOMemoryDescriptor.h>
 #include <libkern/c++/OSString.h>
+#include <IOKit/IOLocks.h>
+#include <IOKit/system.h>
+#include <kern/clock.h>
 #include <sys/proc.h>
+#include <sys/vnode.h>
+#include <sys/fcntl.h>
+#include <sys/random.h>
+
+#include "MappleKeyStorePasscode.h"
 
 /* libaks selectors (AppleKeyStore.framework, iOS 16.7). */
 enum {
@@ -34,30 +47,263 @@ enum {
 	kAKSSetSystem        = 5,
 	kAKSLoadBag          = 6,
 	kAKSGetLockState     = 7,
+	kAKSLockDevice       = 8,
 	kAKSUnlockDevice     = 9,
 	kAKSWrapKey          = 10,
 	kAKSUnwrapKey        = 11,
 	kAKSUnlockBag        = 12,
 	kAKSLockBag          = 13,
 	kAKSGetSystem        = 14,
+	kAKSChangeSecret     = 15,      /* aks_change_secret_se: handle, flags, -, old, old len, new, new len */
 	kAKSGetDeviceState   = 17,
 	kAKSGetExtDeviceState = 35,     /* aks_get_extended_device_state */
 	kAKSAssertHold       = 26,
 	kAKSAssertDrop       = 27,
+	kAKSLockDeviceNow    = 32,
+	kAKSVerifyPassword   = 42,      /* aks_verify_password: handle; packed {passcode, context} */
 	kAKSUnloadSessionBags = 55,
 	kAKSNotifyStateSet   = 102,
 	kAKSNotifyStateIsSet = 103,
 	kAKSAssertConsume    = 101,     /* aks_assert_consume */
+	kAKSChangeSecretEpilogue = 105,
 };
 
 /* The system (device) bag handle. */
 #define MAPPLE_AKS_SYSTEM_HANDLE 0
 
 /*
- * aks lock state bits (aks_get_lock_state): bit 2 is "unlocked since boot"
- * (MobileKeyBag MKBDeviceUnlockedSinceBoot); clear lock bits = unlocked.
+ * aks_get_lock_state bits: 0 locked, 1 no passcode, 2 unlocked since boot
+ * (MKBDeviceUnlockedSinceBoot). keybagd takes bit 13 for an SE-bound
+ * passcode and bit 22 for an xART bag; both stay clear here.
  */
-#define MAPPLE_AKS_LOCK_STATE    0x4
+#define MAPPLE_AKS_LOCKED        0x1
+#define MAPPLE_AKS_NO_PASSCODE   0x2
+#define MAPPLE_AKS_BEEN_UNLOCKED 0x4
+
+/* MKBGetDeviceLockState (the "sls" field): ManagedConfiguration takes 3 as "no passcode". */
+#define MAPPLE_MKB_UNLOCKED      0
+#define MAPPLE_MKB_LOCKED        1
+#define MAPPLE_MKB_DISABLED      3
+
+#define MAPPLE_AKS_FILE          "/private/var/keybags/mapple.kb"
+
+static IOLock *gAKSLock;
+static struct mapple_aks_rec gAKSRec;
+static bool gAKSLoaded, gAKSLocked, gAKSBeenUnlocked;
+
+static uint64_t
+mapple_aks_now(void)
+{
+	clock_sec_t sec;
+	clock_usec_t usec;
+
+	clock_get_calendar_microtime(&sec, &usec);
+	return sec;
+}
+
+/* Read the record once; a missing file is no passcode. Called with gAKSLock held. */
+static void
+mapple_aks_load(void)
+{
+	struct mapple_aks_rec slot[2];
+	const struct mapple_aks_rec *r;
+	vfs_context_t ctx = vfs_context_kernel();
+	vnode_t vp = NULLVP;
+	int resid = 0, err;
+
+	if (gAKSLoaded) {
+		return;
+	}
+	bzero(slot, sizeof(slot));
+	err = vnode_open(MAPPLE_AKS_FILE, FREAD | O_NOFOLLOW, 0, VNODE_LOOKUP_NOFOLLOW, &vp, ctx);
+	if (err == 0) {
+		err = vn_rdwr(UIO_READ, vp, (caddr_t)slot, sizeof(slot), 0, UIO_SYSSPACE, IO_NODELOCKED,
+		    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
+		vnode_close(vp, FREAD, ctx);
+	}
+	if (err != 0 && err != ENOENT) {
+		IOLog("AKS: %s: error %d, trying again at the next call\n", MAPPLE_AKS_FILE, err);
+		return;
+	}
+	gAKSLoaded = true;
+	r = mapple_aks_rec_pick(slot);
+	if (r != NULL) {
+		gAKSRec = *r;
+	} else if (err == 0) {
+		IOLog("AKS: %s holds no valid record: no passcode\n", MAPPLE_AKS_FILE);
+	}
+	bzero(slot, sizeof(slot));
+	gAKSLocked = gAKSRec.has != 0;
+	gAKSBeenUnlocked = !gAKSLocked;
+	IOLog("AKS: passcode %s, %u failed attempts\n", gAKSRec.has ? "set, locked" : "not set", gAKSRec.failed);
+}
+
+/* Write r into the older slot. Called with gAKSLock held. */
+static int
+mapple_aks_save(struct mapple_aks_rec *r)
+{
+	vfs_context_t ctx = vfs_context_kernel();
+	vnode_t vp = NULLVP;
+	int err;
+
+	r->magic = MAPPLE_AKS_REC_MAGIC;
+	r->seq = gAKSRec.seq + 1;
+	mapple_aks_rec_sum(r, r->sum);
+	err = vnode_open(MAPPLE_AKS_FILE, O_CREAT | FWRITE | O_NOFOLLOW, S_IRUSR | S_IWUSR, VNODE_LOOKUP_NOFOLLOW, &vp, ctx);
+	if (err == 0) {
+		err = vnode_vtype(vp) == VREG ? vn_rdwr(UIO_WRITE, vp, (caddr_t)r, sizeof(*r), (off_t)(r->seq & 1) * sizeof(*r),
+		    UIO_SYSSPACE, IO_NODELOCKED | IO_UNIT | IO_SYNC, vfs_context_ucred(ctx), NULL, vfs_context_proc(ctx)) : EFTYPE;
+		vnode_close(vp, FWRITE, ctx);
+	}
+	if (err != 0) {
+		IOLog("AKS: writing %s: error %d\n", MAPPLE_AKS_FILE, err);
+	}
+	return err;
+}
+
+static uint32_t
+mapple_aks_lock_bits(void)
+{
+	return (gAKSRec.has ? 0 : MAPPLE_AKS_NO_PASSCODE) | (gAKSLocked ? MAPPLE_AKS_LOCKED : 0) |
+	       (gAKSBeenUnlocked ? MAPPLE_AKS_BEEN_UNLOCKED : 0);
+}
+
+/* Up to MAPPLE_AKS_SECRET_MAX bytes from the caller's address space. */
+static IOReturn
+mapple_aks_copy_secret(uint64_t uaddr, uint64_t len, uint8_t *buf, size_t *outlen)
+{
+	if (len > MAPPLE_AKS_SECRET_MAX || (len > 0 && uaddr == 0)) {
+		return kIOReturnBadArgument;
+	}
+	if (len > 0 && copyin((user_addr_t)uaddr, buf, (vm_size_t)len) != 0) {
+		return kIOReturnBadArgument;
+	}
+	*outlen = (size_t)len;
+	return kIOReturnSuccess;
+}
+
+/*
+ * Check a passcode against the record; a wrong one is counted on disk before
+ * the answer goes back, so a reboot does not reset the delays.
+ */
+static IOReturn
+mapple_aks_check_secret(const uint8_t *pw, size_t len, const char *what)
+{
+	struct mapple_aks_rec r = gAKSRec;
+	uint64_t wait, t0 = mach_absolute_time(), ns;
+	int ret = mapple_aks_check(&r, pw, len, mapple_aks_now(), &wait);
+
+	absolutetime_to_nanoseconds(mach_absolute_time() - t0, &ns);
+	if (r.failed != gAKSRec.failed || r.until != gAKSRec.until) {
+		mapple_aks_save(&r);
+	}
+	gAKSRec = r;
+	if (gAKSRec.has) {
+		IOLog("AKS: %s: %s, %u failed, %llu s to wait (%llu ms)\n", what,
+		    ret == MAPPLE_AKS_OK ? "right" : ret == MAPPLE_AKS_WRONG ? "wrong" : "waiting", r.failed, wait, ns / 1000000);
+	}
+	return ret == MAPPLE_AKS_OK ? kIOReturnSuccess : kIOReturnNotPermitted;
+}
+
+/* aks_unlock_device(handle, passcode, length) */
+static IOReturn
+mapple_aks_unlock(IOExternalMethodArguments *args)
+{
+	uint8_t pw[MAPPLE_AKS_SECRET_MAX];
+	size_t len = 0;
+	IOReturn ret;
+
+	args->scalarOutputCount = 0;
+	if (args->scalarInputCount < 3) {
+		return kIOReturnBadArgument;
+	}
+	ret = mapple_aks_copy_secret(args->scalarInput[1], args->scalarInput[2], pw, &len);
+	if (ret == kIOReturnSuccess) {
+		ret = mapple_aks_check_secret(pw, len, "unlock");
+	}
+	cc_clear(sizeof(pw), pw);
+	if (ret == kIOReturnSuccess) {
+		gAKSLocked = false;
+		gAKSBeenUnlocked = true;
+	}
+	return ret;
+}
+
+static IOReturn mapple_aks_read_in(IOExternalMethodArguments *args, uint8_t *buf, uint32_t *len);
+static IOReturn mapple_aks_write_out(IOExternalMethodArguments *args, const uint8_t *buf, uint32_t len);
+
+/* aks_verify_password(handle, {passcode, context}): checks without unlocking. */
+static IOReturn
+mapple_aks_verify(IOExternalMethodArguments *args)
+{
+	uint8_t buf[1024];
+	const uint8_t *pw;
+	uint32_t len = sizeof(buf), pwlen;
+	IOReturn ret;
+
+	args->scalarOutputCount = 0;
+	ret = mapple_aks_read_in(args, buf, &len);
+	if (ret == kIOReturnSuccess) {
+		ret = mapple_aks_first_item(buf, len, &pw, &pwlen) ? mapple_aks_check_secret(pw, pwlen, "verify") :
+		    kIOReturnBadArgument;
+	}
+	cc_clear(sizeof(buf), buf);
+	return ret;
+}
+
+/*
+ * aks_change_secret_se(handle, flags, -, old, old length, new, new length): an
+ * empty new passcode removes it. With flags bit 2 keybagd asks for a new bag
+ * handle, then saves it, makes it the system bag and unloads the old one; the
+ * record is already final here, those steps only have to succeed.
+ */
+static IOReturn
+mapple_aks_change_secret(IOExternalMethodArguments *args)
+{
+	uint8_t old[MAPPLE_AKS_SECRET_MAX], pw[MAPPLE_AKS_SECRET_MAX], salt[MAPPLE_AKS_SALT_LEN];
+	struct mapple_aks_rec r = gAKSRec;
+	size_t oldlen = 0, len = 0;
+	uint64_t wait;
+	IOReturn ret;
+	int res;
+
+	if (args->scalarInputCount < 7) {
+		return kIOReturnBadArgument;
+	}
+	ret = mapple_aks_copy_secret(args->scalarInput[3], args->scalarInput[4], old, &oldlen);
+	if (ret == kIOReturnSuccess) {
+		ret = mapple_aks_copy_secret(args->scalarInput[5], args->scalarInput[6], pw, &len);
+	}
+	if (ret != kIOReturnSuccess) {
+		return ret;
+	}
+	read_random(salt, sizeof(salt));
+	res = mapple_aks_change(&r, old, oldlen, pw, len, salt, mapple_aks_now(), &wait);
+	cc_clear(sizeof(old), old);
+	cc_clear(sizeof(pw), pw);
+	if (res == MAPPLE_AKS_OK) {
+		if (mapple_aks_save(&r) != 0) {
+			return kIOReturnIOError;
+		}
+		gAKSRec = r;
+		gAKSLocked = false;
+		gAKSBeenUnlocked = true;
+		IOLog("AKS: passcode %s\n", r.has ? "set" : "removed");
+	} else {
+		if (r.failed != gAKSRec.failed) {
+			mapple_aks_save(&r);
+		}
+		gAKSRec = r;
+		IOLog("AKS: change passcode: old one %s, %u failed, %llu s to wait\n",
+		    res == MAPPLE_AKS_WRONG ? "wrong" : "not tried", r.failed, wait);
+		return kIOReturnNotPermitted;
+	}
+	if (args->scalarOutputCount >= 1) {
+		args->scalarOutput[0] = (args->scalarInput[1] & 4) ? args->scalarInput[0] + 1 : args->scalarInput[0];
+		args->scalarOutputCount = 1;
+	}
+	return kIOReturnSuccess;
+}
 
 class AppleKeyStore : public IOService {
 	OSDeclareDefaultStructors(AppleKeyStore);
@@ -74,9 +320,13 @@ AppleKeyStore::start(IOService *provider)
 	if (!IOService::start(provider)) {
 		return false;
 	}
+	gAKSLock = IOLockAlloc();
+	if (gAKSLock == NULL) {
+		return false;
+	}
 	setProperty(kIOUserClientClassKey, "AppleKeyStoreUserClient");
 	registerService();
-	IOLog("AKS: AppleKeyStore registered (no passcode, unlocked)\n");
+	IOLog("AKS: AppleKeyStore registered\n");
 	return true;
 }
 
@@ -119,21 +369,30 @@ mapple_aks_struct_out(IOExternalMethodArguments *args, const void *buf, uint32_t
 	return kIOReturnSuccess;
 }
 
-/* Append SEQUENCE { UTF8String key, INTEGER value } (short forms only). */
+/* Append SEQUENCE { UTF8String key, INTEGER value } (short length forms). */
 static uint32_t
-mapple_aks_der_pair(uint8_t *p, const char *key, uint8_t value)
+mapple_aks_der_pair(uint8_t *p, const char *key, uint32_t value)
 {
 	uint32_t klen = (uint32_t)strlen(key);
-	uint32_t n = 0;
+	uint32_t vlen = 1, n = 0;
+
+	while (vlen < 4 && (value >> (8 * vlen - 1)) != 0) {
+		vlen++;
+	}
+	if (vlen == 4 && (value >> 31) != 0) {
+		vlen = 5;       /* leading zero: INTEGER is signed */
+	}
 	p[n++] = 0x30;
-	p[n++] = (uint8_t)(2 + klen + 3);
+	p[n++] = (uint8_t)(2 + klen + 2 + vlen);
 	p[n++] = 0x0c;
 	p[n++] = (uint8_t)klen;
 	memcpy(p + n, key, klen);
 	n += klen;
 	p[n++] = 0x02;
-	p[n++] = 0x01;
-	p[n++] = value;
+	p[n++] = (uint8_t)vlen;
+	for (uint32_t i = vlen; i > 0; i--) {
+		p[n++] = i > 4 ? 0 : (uint8_t)(value >> (8 * (i - 1)));
+	}
 	return n;
 }
 
@@ -146,14 +405,17 @@ mapple_aks_der_pair(uint8_t *p, const char *key, uint8_t value)
 static IOReturn
 mapple_aks_device_state(IOExternalMethodArguments *args)
 {
-	static const struct {
+	uint64_t now = mapple_aks_now();
+	const struct {
 		const char *key;
-		uint8_t value;
+		uint32_t value;
 	} fields[] = {
-		{ "ss", MAPPLE_AKS_LOCK_STATE }, { "sls", 0 }, { "sb", 0 }, { "sfa", 0 },
-		{ "sgs", 0 }, { "sas", 0 }, { "sgpe", 0 }, { "srcd", 0 },
+		{ "ss", mapple_aks_lock_bits() },
+		{ "sls", (uint32_t)(!gAKSRec.has ? MAPPLE_MKB_DISABLED : gAKSLocked ? MAPPLE_MKB_LOCKED : MAPPLE_MKB_UNLOCKED) },
+		{ "sb", gAKSRec.until > now ? (uint32_t)MIN(gAKSRec.until - now, mapple_aks_delay(gAKSRec.failed)) : 0 },
+		{ "sfa", gAKSRec.failed }, { "sgs", 0 }, { "sas", 0 }, { "sgpe", 0 }, { "srcd", 0 },
 	};
-	uint8_t buf[128];
+	uint8_t buf[160];
 	uint32_t n = 2;
 	for (unsigned int i = 0; i < sizeof(fields) / sizeof(fields[0]); i++) {
 		n += mapple_aks_der_pair(buf + n, fields[i].key, fields[i].value);
@@ -289,11 +551,13 @@ AppleKeyStoreUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
 	uint32_t out_struct = mapple_aks_struct_out_size(args);
 	uint64_t arg0 = in_scalars > 0 ? args->scalarInput[0] : 0;
 
+	IOLockLock(gAKSLock);
+	mapple_aks_load();
 	switch (selector) {
 	case kAKSOpen:
 	case kAKSUnloadBag:
 	case kAKSSetSystem:
-	case kAKSUnlockDevice:
+	case kAKSChangeSecretEpilogue:
 	case kAKSUnlockBag:
 	case kAKSLockBag:
 	case kAKSAssertHold:
@@ -302,6 +566,25 @@ AppleKeyStoreUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
 	case kAKSUnloadSessionBags:
 	case kAKSNotifyStateSet:
 		args->scalarOutputCount = 0;
+		break;
+	case kAKSLockDevice:
+	case kAKSLockDeviceNow:
+		args->scalarOutputCount = 0;
+		gAKSLocked = gAKSRec.has != 0;
+		break;
+	case kAKSUnlockDevice:
+		ret = mapple_aks_unlock(args);
+		break;
+	case kAKSVerifyPassword:
+		ret = mapple_aks_verify(args);
+		break;
+	case kAKSChangeSecret:
+		ret = mapple_aks_change_secret(args);
+		break;
+	case kAKSSaveBag:
+		/* keybagd keeps this in systembag.kb; the record lives in MAPPLE_AKS_FILE. */
+		args->scalarOutputCount = 0;
+		ret = mapple_aks_write_out(args, (const uint8_t *)"MAPPLEKB", 8);
 		break;
 	case kAKSGetSystem:
 		if (out_scalars < 1) {
@@ -316,7 +599,7 @@ AppleKeyStoreUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
 			ret = kIOReturnBadArgument;
 			break;
 		}
-		args->scalarOutput[0] = MAPPLE_AKS_LOCK_STATE;
+		args->scalarOutput[0] = mapple_aks_lock_bits();
 		args->scalarOutputCount = 1;
 		break;
 	case kAKSNotifyStateIsSet:
@@ -343,6 +626,7 @@ AppleKeyStoreUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
 		ret = kIOReturnUnsupported;
 		break;
 	}
+	IOLockUnlock(gAKSLock);
 
 	char name[32];
 	proc_selfname(name, sizeof(name));
