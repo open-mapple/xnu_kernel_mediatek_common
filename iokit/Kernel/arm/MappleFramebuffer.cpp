@@ -308,6 +308,11 @@ public:
 	uint32_t      fBlLevel;       /* last level sent; until fBlSent, LK's level, not known */
 	uint32_t      fBlOff;         /* mp_fb_bloff: backlight off while the display is */
 	uint32_t      fBlResume;      /* level for when the display is on again */
+	const char   *fBlFrom;        /* who asked for fBlWant */
+	uint32_t      fBlNits16;      /* CoreBrightness's request, nits << 16 */
+	uint64_t      fBlLogSec;      /* backlight log: at most 10 lines a second */
+	uint32_t      fBlLogN, fBlLogSkipped;
+	void blLog(uint32_t bl, const char *from, const char *note);
 	uint64_t      fBlSent, fMatrixCalls, fMatrixApplied;
 	int32_t       fMatrix[16][9]; /* per matrix type (Night Shift = 9), fixed point 1.0 = 0x800 */
 	bool          fMatrixUsed[16];
@@ -2275,6 +2280,41 @@ AppleCLCD::dsiSendDcs(const uint8_t *b, uint32_t n, bool vbp, bool wait)
 	return done;
 }
 
+/* Every backlight write (DCS 51 is the panel's own PWM duty, 0..2047), at most 10 lines a second, then a count. */
+void
+AppleCLCD::blLog(uint32_t bl, const char *from, const char *note)
+{
+	uint64_t ns;
+	char was[16];
+
+	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+	if (ns / NSEC_PER_SEC != fBlLogSec) {
+		if (fBlLogSkipped != 0) {
+			IOLog("FB: backlight: %u more writes not logged\n", fBlLogSkipped);
+		}
+		fBlLogSec = ns / NSEC_PER_SEC;
+		fBlLogN = 0;
+		fBlLogSkipped = 0;
+	}
+	if (fBlLogN >= 10) {
+		fBlLogSkipped++;
+		return;
+	}
+	fBlLogN++;
+	if (fBlSent == 0) {
+		strlcpy(was, "LK's", sizeof(was));
+	} else {
+		snprintf(was, sizeof(was), "%u", fBlLevel);
+	}
+	from = from != NULL ? from : "?";
+	if (strcmp(from, "IOMFBBrightnessLevel") == 0) {
+		IOLog("FB: backlight %s -> %u (DCS 51 %02x %02x) from %s %u.%02u nits%s\n", was, bl, bl >> 8, bl & 0xff, from,
+		    fBlNits16 >> 16, ((fBlNits16 & 0xffff) * 100) >> 16, note);
+	} else {
+		IOLog("FB: backlight %s -> %u (DCS 51 %02x %02x) from %s%s\n", was, bl, bl >> 8, bl & 0xff, from, note);
+	}
+}
+
 /* 0191, vsync tick: pending brightness level and color matrix. */
 void
 AppleCLCD::lightTick(void)
@@ -2285,12 +2325,14 @@ AppleCLCD::lightTick(void)
 	if (dark) {
 		/* faded to black: backlight off, and what iOS asks for meanwhile kept for the display on */
 		if (bl != 0xffffffffu) {
+			blLog(bl, fBlFrom, ": held for the display on");
 			fBlResume = bl;
 			fBlWant = 0xffffffffu;
 		}
 		bl = fBlLevel != 0 || fBlSent == 0 ? 0 : 0xffffffffu;
 	} else if (bl == 0 && fBlSent == 0) {
 		/* iOS asks for 0 early in boot, long before its first real level: LK's level stays until then */
+		blLog(bl, fBlFrom, ": ignored, before iOS's first level");
 		fBlWant = 0xffffffffu;
 		bl = 0xffffffffu;
 	}
@@ -2301,21 +2343,20 @@ AppleCLCD::lightTick(void)
 	if (bl != 0xffffffffu) {
 		uint8_t cmd[3] = { 0x51, (uint8_t)(bl >> 8), (uint8_t)bl };
 		if (bl == fBlLevel && fBlSent != 0) {
+			blLog(bl, dark ? "display off" : fBlFrom, ": already there");
 			fBlWant = 0xffffffffu;
 		} else if (dsiSendDcs(cmd, 3, false, false)) {      /* non-blocking: a fade must not hold the frames */
 			if (fBlWant == bl) {
 				fBlWant = 0xffffffffu;
 			}
-			if (fBlSent == 0) {
-				IOLog("FB: backlight LK's level -> %u\n", bl);
-			} else if (bl == 0 || fBlLevel == 0) {
-				IOLog("FB: backlight %u -> %u\n", fBlLevel, bl);
-			}
+			blLog(bl, dark ? "display off" : fBlFrom, "");
 			fBlLevel = bl;
 			fBlSent++;
 			if (fBacklight != NULL && !dark) {
 				fBacklight->publishLevel(bl);
 			}
+		} else {
+			blLog(bl, dark ? "display off" : fBlFrom, ": DSI busy, again at the next tick");
 		}
 	}
 	if (matrix) {
@@ -2455,6 +2496,7 @@ AppleARMBacklight::setProperties(OSObject *properties)
 		return kIOReturnSuccess;        /* accepted (logged), nothing for the panel */
 	}
 	uint32_t level = (uint32_t)MIN(v, (uint64_t)PANEL_LEVEL_MAX);
+	fFB->fBlFrom = "the backlight nub";
 	fFB->fBlWant = level;
 	publishLevel(level);
 	return kIOReturnSuccess;
@@ -2500,6 +2542,8 @@ AppleCLCD::setProperties(OSObject *properties)
 	if (nits16 != 0 && level == 0) {
 		level = 1;
 	}
+	fBlFrom = "IOMFBBrightnessLevel";
+	fBlNits16 = (uint32_t)nits16;
 	fBlWant = (uint32_t)MIN(level, (uint64_t)PANEL_LEVEL_MAX);
 	setProperty("IOMFBBrightnessLevel", n);
 	return kIOReturnSuccess;
@@ -2972,6 +3016,7 @@ AppleCLCD::dispCommand(const char *args, char *out, size_t len)
 			for (; *a >= '0' && *a <= '9'; a++) {
 				v = v * 10 + (uint32_t)(*a - '0');
 			}
+			fBlFrom = "the link";
 			fBlWant = MIN(v, (uint32_t)PANEL_LEVEL_MAX);
 		}
 		disp_say(&p, end, "panel brightness level %u of %u (%u nits max), %llu sent; color matrices %llu calls, %llu applied\n",
@@ -3269,6 +3314,7 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
 					fFB->fBlResume = fFB->fBlWant != 0xffffffffu ? fFB->fBlWant :
 					    fFB->fBlSent != 0 ? fFB->fBlLevel : PANEL_LEVEL_MAX / 2;
 				} else if (fFB->fBlOff && fFB->fBlLevel == 0 && fFB->fBlWant == 0xffffffffu) {
+					fFB->fBlFrom = "display on";
 					fFB->fBlWant = fFB->fBlResume;
 				}
 			}
