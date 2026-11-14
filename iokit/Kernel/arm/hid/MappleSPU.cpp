@@ -52,6 +52,7 @@ volatile uint8_t *mapple_spu_ring(uint64_t *pa);
 void mapple_spu_start(uint32_t steps);
 void mapple_spu_record(const struct sh_record *r, uint64_t ticks);
 void mapple_spu_tick(void);
+uint32_t mapple_spu_published(void);
 }
 
 enum {
@@ -672,6 +673,18 @@ mapple_spu_record(const struct sh_record *r, uint64_t ticks)
 		mtk_scp_sensor_rearm(SH_PICKUP);        /* one shot: enabled again for the next */
 		break;
 	}
+}
+
+/* a bit per service published, in the order of kinds[] */
+extern "C" uint32_t
+mapple_spu_published(void)
+{
+	uint32_t m = 0;
+
+	for (unsigned k = 0; k < SPU_COUNT; k++) {
+		m |= gSPU[k] ? 1u << k : 0;
+	}
+	return m;
 }
 
 /* Once a second from the hub's thread: the last steps out, and static once they stop. */

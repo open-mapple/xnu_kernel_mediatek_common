@@ -32,6 +32,7 @@
 #include <libkern/libkern.h>
 #include <mach/mach_time.h>
 #include <pexpert/pexpert.h>
+#include <sys/sysctl.h>
 #include <sys/systm.h>
 #include "mtk_scp_hub.h"
 
@@ -48,6 +49,7 @@ extern volatile uint8_t *mapple_spu_ring(uint64_t *pa);                         
 extern void mapple_spu_start(uint32_t steps);                                   /* MappleSPU.cpp */
 extern void mapple_spu_record(const struct sh_record *r, uint64_t ticks);       /* MappleSPU.cpp */
 extern void mapple_spu_tick(void);                                              /* MappleSPU.cpp */
+extern uint32_t mapple_spu_published(void);                                      /* MappleSPU.cpp */
 extern kern_return_t thread_terminate(thread_t thread);
 
 void mtk_scp_start(void);
@@ -68,6 +70,7 @@ static int64_t mach_minus_counter;
 static uint32_t nh_seq;
 static uint32_t notifies, records, last_wp, bad_wp;      /* what the hub has pushed, for the status lines */
 static uint32_t by_type[SH_DEVICE_ORIENTATION + 1], stale;
+static uint64_t last_at[SH_DEVICE_ORIENTATION + 1];      /* arrival, mach time */
 static uint8_t last_event;
 
 /* what the HID services want, per Android type; applied by the thread */
@@ -140,6 +143,7 @@ drain(uint32_t wp)
 		sh_parse_record(rec, &r);
 		if (r.type <= SH_DEVICE_ORIENTATION) {
 			by_type[r.type]++;
+			last_at[r.type] = mach_absolute_time();
 		}
 		mapple_spu_record(&r, arrival ? arrival : (uint64_t)((int64_t)sh_record_ticks(r.scp_ns, offset, hz) + mach_minus_counter));
 		rp = sh_ring_next(rp);
@@ -580,3 +584,39 @@ mtk_scp_start(void)
 	}
 }
 #endif /* ARM64_BOARD_CONFIG_MT6781 */
+
+/*
+ * kern.mapple_sensors: a line per sensor the hub has, "name enabled samples last_ms": enabled when a published service
+ * makes us ask the hub for it, samples since boot, milliseconds since the last one arrived (-1: none).
+ */
+static int
+sysctl_mapple_sensors(__unused struct sysctl_oid *oidp, __unused void *arg1, __unused int arg2, struct sysctl_req *req)
+{
+	static const struct {
+		const char *name;
+		uint8_t type;
+		uint32_t services;      /* MappleSPU's: accel 0, gyro 1, compass 2, prox 3, als 4, orient 5, cma 6, dm 8-10 */
+	} sensors[] = {
+		{ "accel", SH_ACCEL, 0x721 }, { "gyro", SH_GYRO, 0x702 }, { "mag", SH_MAG, 0x104 },
+		{ "light", SH_LIGHT, 0x10 }, { "prox", SH_PROX, 0x8 }, { "steps", SH_STEP_COUNTER, 0x40 },
+	};
+	uint32_t published = mapple_spu_published();
+	uint64_t now = mach_absolute_time(), ns;
+	char out[384];
+	int len = 0;
+
+	for (unsigned i = 0; i < sizeof(sensors) / sizeof(sensors[0]); i++) {
+		uint8_t t = sensors[i].type;
+		long long ms = -1;
+		if (last_at[t]) {
+			absolutetime_to_nanoseconds(now - last_at[t], &ns);
+			ms = (long long)(ns / 1000000);
+		}
+		len += snprintf(out + len, sizeof(out) - len, "%s %d %u %lld\n", sensors[i].name,
+		    (published & sensors[i].services) != 0, by_type[t], ms);
+	}
+	return SYSCTL_OUT(req, out, len + 1);
+}
+
+SYSCTL_PROC(_kern, OID_AUTO, mapple_sensors, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
+    0, 0, sysctl_mapple_sensors, "A", "the hub's sensors: name enabled samples last_ms");
