@@ -33,6 +33,7 @@ iokit/Kernel/arm/MTKMDP.cpp                                     optional iokitcp
 iokit/Kernel/arm/MTKJPEGHW.cpp                                  optional iokitcpp
 iokit/Kernel/arm/MTKJPEG.cpp                                    optional iokitcpp
 iokit/Kernel/arm/hid/MappleHID.cpp                                optional iokitcpp
+iokit/Kernel/arm/hid/MappleSPU.cpp                                optional iokitcpp
 iokit/Kernel/arm/hid/MTKKeypad.cpp                              optional iokitcpp
 iokit/Kernel/arm/hid/MT6358Keys.cpp                            optional iokitcpp
 iokit/Kernel/arm/hid/GT9896.cpp                              optional iokitcpp
