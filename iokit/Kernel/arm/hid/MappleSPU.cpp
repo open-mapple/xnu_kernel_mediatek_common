@@ -12,7 +12,8 @@
  *   orientation    0x20/0x8A    from gravity (mtk_scp_hub.h), usages 0x64-0x6A, its time as a 0xFF15/2 child
  * and, with mp_sensor_steps=5, what locationd reads as vendor-defined reports (MappleSPU.h has the formats):
  *   CMA            0xFF0C/0x01  steps (StepCountUpdate) and activity (MotionStateUpdate) from the hub's step counter
- *   gesture        0xFF0C/0x03  raise to wake (WakeGesture) from the hub's pickup gesture
+ *   gesture        0xFF0C/0x03  raise to wake (detected) from the hub's pickup gesture; dismissed when it is laid
+ *                               flat again within 10 s
  *   device motion  0xFF0C/0x04  9 axes (attitude to magnetic north, heading), /0x05 6 axes, /0x07 3 axes
  *
  * Each service carries IOCFPlugInTypes for AppleSPULib, whose DriverClass opens it with type 'ashd' (our
@@ -23,7 +24,7 @@
  * (0 = off) turns proximity on and off. Orientation runs the accelerometer at 10 Hz while it is on (from the start).
  * Calibration knobs: mp_imu_axes, mp_mag_axes (default 0x123: a nibble per output axis x, y, z = the hub's axis 1-3,
  * +8 to flip it); mp_als_div (default 100: the hub's light value per lux, alsps's vender_div); mp_stride_cm
- * (default 70); mp_cma_conf (default 2); mp_wake_state, mp_wake_type (default 1, 1): the WakeGesture's bytes 1 and 2.
+ * (default 70).
  */
 #include <IOKit/IOLib.h>
 #include <IOKit/IOBufferMemoryDescriptor.h>
@@ -78,6 +79,8 @@ static const struct {
 #define SPU_PLUGIN_PATH         "AppleSPU.kext/PlugIns/AppleSPULib.plugin"
 #define SPU_UC_TYPE             0x61736864u     /* 'ashd' */
 #define ORIENT_PERIOD_US        100000
+#define CMA_CONF_HIGH           2       /* CLMotionActivity::Confidence: 0 low, 1 medium, 2 high */
+#define CMA_MAX_DELTA           40      /* more steps in one report ends locationd's walk bout */
 #define PROX_NEAR               (kIOHIDProximityDetectionReceiver | kIOHIDProximityDetectionLargeBodyContact)
 
 typedef IOReturn (*SPUCommand)(IOService *owner, uint32_t cmd, const uint8_t *in, uint32_t inLen, uint8_t *out,
@@ -194,7 +197,8 @@ static MappleSPUSensor *gSPU[SPU_COUNT];
 static IOLock *gSPULock;
 static uint32_t gSteps, gSamplesSaid;
 static int8_t gImuAxes[3] = { 1, 2, 3 }, gMagAxes[3] = { 1, 2, 3 };
-static uint32_t gAlsDiv = 100, gStrideCm = 70, gCmaConf = 2, gWakeState = 1, gWakeType = 1;
+static uint32_t gAlsDiv = 100, gStrideCm = 70;
+static uint64_t gWokeTicks;             /* raise to wake detected, not yet dismissed */
 
 /* the latest of each, iOS's units (Q16), for the fusion */
 static int32_t gAccel[3], gGyro[3], gMag[3];
@@ -485,7 +489,7 @@ send_motion(uint64_t ticks, uint32_t motion)
 		gMotionStartTicks = ticks;
 	}
 	if (s && gActivityOn) {
-		spu_cma_motion(m, motion, (uint8_t)gCmaConf, ++gMotionSeq, ticks_us(ticks), ticks_us(gMotionStartTicks));
+		spu_cma_motion(m, motion, CMA_CONF_HIGH, ++gMotionSeq, ticks_us(ticks), ticks_us(gMotionStartTicks));
 		s->vendor(ticks, m, CMA_MOTION_STATE_LEN);
 	}
 }
@@ -511,7 +515,7 @@ steps(uint32_t hub, uint64_t ticks)
 	}
 	gStepCount = total;
 	gLastStepTicks = ticks;
-	if (ticks_us(ticks) - ticks_us(gStepSentTicks) >= 1000000) {
+	if (ticks_us(ticks) - ticks_us(gStepSentTicks) >= 1000000 || gStepCount - gStepsSent >= CMA_MAX_DELTA) {
 		send_steps(ticks);
 	}
 	uint32_t motion = spu_activity(gCadenceQ16, 0);
@@ -558,6 +562,15 @@ mapple_spu_record(const struct sh_record *r, uint64_t ticks)
 				}
 				IOLog("SPU: orientation 0x%x\n", o);
 				s->post(e);
+				if (gWokeTicks && (o == SH_ORIENT_FACE_UP || o == SH_ORIENT_FACE_DOWN) && gSPU[SPU_GESTURE]) {
+					uint8_t m[SPU_WAKE_LEN];
+					if (ticks_us(ticks) - ticks_us(gWokeTicks) < 10000000) {
+						spu_wake(m, SPU_WAKE_DISMISSED, true);
+						gSPU[SPU_GESTURE]->vendor(ticks, m, SPU_WAKE_LEN);
+						IOLog("SPU: laid down -> raise to wake dismissed\n");
+					}
+					gWokeTicks = 0;
+				}
 			}
 		}
 		break;
@@ -600,9 +613,10 @@ mapple_spu_record(const struct sh_record *r, uint64_t ticks)
 	case SH_PICKUP:
 		if ((s = gSPU[SPU_GESTURE])) {
 			uint8_t m[SPU_WAKE_LEN];
-			spu_wake(m, (uint8_t)gWakeState, (uint8_t)gWakeType, false, ticks);
+			spu_wake(m, SPU_WAKE_DETECTED, false);
 			s->vendor(ticks, m, SPU_WAKE_LEN);
-			IOLog("SPU: pickup -> wake gesture (%u, %u)\n", gWakeState, gWakeType);
+			gWokeTicks = ticks;
+			IOLog("SPU: pickup -> raise to wake\n");
 		}
 		mtk_scp_sensor_rearm(SH_PICKUP);        /* one shot: enabled again for the next */
 		break;
@@ -659,9 +673,6 @@ mapple_spu_start(uint32_t steps)
 	axes_arg("mp_mag_axes", gMagAxes);
 	PE_parse_boot_argn("mp_als_div", &gAlsDiv, sizeof(gAlsDiv));
 	PE_parse_boot_argn("mp_stride_cm", &gStrideCm, sizeof(gStrideCm));
-	PE_parse_boot_argn("mp_cma_conf", &gCmaConf, sizeof(gCmaConf));
-	PE_parse_boot_argn("mp_wake_state", &gWakeState, sizeof(gWakeState));
-	PE_parse_boot_argn("mp_wake_type", &gWakeType, sizeof(gWakeType));
 	gAlsDiv = gAlsDiv ? gAlsDiv : 1;
 	gMotion = CMA_STATIC;
 

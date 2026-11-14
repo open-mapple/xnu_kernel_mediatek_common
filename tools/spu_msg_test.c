@@ -75,9 +75,11 @@ test_messages(void)
 	CHECK(m[0] == 3 && m[1] == 2 && u32(m + 4) == 0x10 && m[0x0a] == 1 && u32(m + 0x0c) == 7);
 	CHECK(u32(m + 0x10) == 9000000 && u32(m + 0x18) == 4000000 && u32(m + 0x20) == 0x10 && m[0x24] == 2 && m[118] == 0);
 
-	spu_wake(m, 1, 2, true, 0x1122334455667788ull);
-	CHECK(m[0] == 2 && m[1] == 1 && m[2] == 2 && m[3] == 1 && m[4] == 0 && u32(m + 8) == 0x55667788u &&
-	    u32(m + 12) == 0x11223344u);
+	static const uint8_t wake[8] = { 6, 1, 1, 1, 1, 0, 1, 0 }, dismiss[8] = { 6, 2, 1, 1, 1, 1, 1, 0 };
+	spu_wake(m, SPU_WAKE_DETECTED, false);
+	CHECK(memcmp(m, wake, 8) == 0 && u32(m + 20) == 0);
+	spu_wake(m, SPU_WAKE_DISMISSED, true);
+	CHECK(memcmp(m, dismiss, 8) == 0);
 
 	spu_orientation_reply(m, 0x67, 0xabcdef);
 	CHECK(m[0] == 2 && m[1] == 3 && u32(m + 2) == 0xabcdef && u32(m + 6) == 0);

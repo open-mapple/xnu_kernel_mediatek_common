@@ -119,19 +119,27 @@ spu_cma_motion(uint8_t m[CMA_MOTION_STATE_LEN], uint32_t motion, uint8_t conf, u
 	m[0x24] = conf;
 }
 
-/* ---- gesture (0xFF0C/3): WakeGesture, report type 2 ---- */
+/*
+ * ---- gesture (0xFF0C/3): raise to wake, report type 6 as SpringBoard's CoreMotion reads it ----
+ * +1 event (1 detected, 2 dismissed), +2 start pose (1 face up), +3 view pose (1 nominal), +4 mode (1 normal),
+ * +5 host awake, +6 orientation; the rest unused. The event's own time is what SpringBoard takes.
+ */
 
-#define SPU_WAKE_LEN            16
+#define SPU_WAKE_LEN            24
+#define SPU_WAKE_DETECTED       1
+#define SPU_WAKE_DISMISSED      2
 
 static inline void
-spu_wake(uint8_t m[SPU_WAKE_LEN], uint8_t state, uint8_t type, bool host_awake, uint64_t when)
+spu_wake(uint8_t m[SPU_WAKE_LEN], uint8_t event, bool host_awake)
 {
 	spu_zero(m, SPU_WAKE_LEN);
-	m[0] = 2;
-	m[1] = state;
-	m[2] = type;
-	m[3] = host_awake;
-	spu_put64(m + 8, when);
+	m[0] = 6;
+	m[1] = event;
+	m[2] = 1;
+	m[3] = 1;
+	m[4] = 1;
+	m[5] = host_awake;
+	m[6] = 1;
 }
 
 /* ---- orientation (0x20/0x8A): LastOrientation's answer to [0x02] ---- */
