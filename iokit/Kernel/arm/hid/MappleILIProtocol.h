@@ -5,7 +5,9 @@
  * A report is the read command 0x83 and 45 bytes back: two (the second the
  * firmware's ACK 0xA3), then the 43-byte demo packet: 0x5A, ten fingers of
  * four bytes (x high nibble | y high nibble, x low, y low, pressure; FF FF FF
- * is no finger), and a checksum that makes the packet's byte sum zero.
+ * is no finger), and a checksum that makes the packet's byte sum zero. The
+ * answer to a firmware-version query (0xF6 0x21, then 0x21) comes the same
+ * way, its first byte 0x21 instead of 0x5A.
  */
 #ifndef _IOKIT_ARM_HID_MAPPLEILIPROTOCOL_H
 #define _IOKIT_ARM_HID_MAPPLEILIPROTOCOL_H
@@ -20,6 +22,9 @@
 #define ILI_DEMO        0x5a
 #define ILI_NO_ACK      (-1)
 #define ILI_BAD         (-2)
+#define ILI_ANSWER      (-3)
+#define ILI_FW_VERSION  0x21
+#define ILI_CHIP        0x7807
 
 #define ILI_BLOCKS      3                       /* AP, DATA, TUNING */
 #define ILI_BLOCK_MAX   (160u << 10)
@@ -47,7 +52,7 @@ typedef const volatile uint8_t *(*ili_map_fn)(void *ctx, uint64_t pa, uint32_t l
 /*
  * One read's bytes: the fingers it names, one bit each, their places in pt
  * (grid units); ILI_NO_ACK when the firmware does not answer (it is gone),
- * ILI_BAD when the rest is not a report.
+ * ILI_ANSWER for a version answer, ILI_BAD when the rest is not a report.
  */
 static inline int
 ili_parse(const uint8_t *rx, struct ili_point *pt)
@@ -58,6 +63,9 @@ ili_parse(const uint8_t *rx, struct ili_point *pt)
 
 	if (rx[1] != ILI_ACK) {
 		return ILI_NO_ACK;
+	}
+	if (p[0] == ILI_FW_VERSION) {
+		return ILI_ANSWER;
 	}
 	for (int i = 0; i < ILI_PACKET; i++) {
 		sum += p[i];
@@ -131,6 +139,25 @@ ili_fw_walk(const volatile struct ili_loader_block *t, struct ili_fw_block *fw, 
 		}
 	}
 	return ILI_BLOCKS;
+}
+
+/*
+ * The firmware's own word that it runs from RAM sent by the host: bit 1
+ * (nIsHostDownload) of the first byte of its info block, which starts 0x50
+ * bytes before the end of the AP block (ILITEK's driver: fw_info at the AP
+ * block's last address - 0x4F, report_info_block).
+ */
+static inline int
+ili_fw_host_download(const volatile uint8_t *ap, uint32_t len)
+{
+	return len > 0x50 && (ap[len - 0x50] & 2) != 0;
+}
+
+/* the chip ID register (0x4009C, read in ICE mode, little-endian): chip << 16 | type << 8 | version */
+static inline int
+ili_chip_ok(uint32_t pid)
+{
+	return pid >> 16 == ILI_CHIP;
 }
 
 #endif /* _IOKIT_ARM_HID_MAPPLEILIPROTOCOL_H */

@@ -9,18 +9,24 @@
  * (MTKEINT.cpp) gives a short low pulse per report; the report's layout is
  * in MappleILIProtocol.h. A finger with no report for 150 ms is lifted.
  *
- * The chip loses its firmware by itself. When it answers without its ACK the
- * firmware is sent again from mtkloader's copy, as Android's driver does on
- * resume: ICE mode with the MCU stopped, blocks AP, DATA and TUNING each
- * checked against the chip's DMA CRC and its last four bytes, code reset, ICE
- * mode left; then edge-palm rejection on (without it a hand holding the
- * phone is a finger at x = 0). At most every 2 s, not after 5 failures in a
- * row.
+ * The chip loses its firmware by itself, or keeps its ACK but never raises
+ * INT again. When it answers without its ACK the firmware is sent again from
+ * mtkloader's copy, as Android's driver does on resume: ICE mode with the MCU
+ * stopped, the chip ID checked, blocks AP, DATA and TUNING each checked
+ * against the chip's DMA CRC and its last four bytes, code reset, ICE mode
+ * left; then edge-palm rejection on (without it a hand holding the phone is a
+ * finger at x = 0). With mp_ili_quiet=1, after QUIET_MS with the screen on
+ * and no interrupt the firmware's version is asked for; with no interrupt
+ * ANSWER_MS later (Android's wait for a command's INT pulse) the firmware is
+ * sent again, starting with Android's reset pulse instead of the PLL wake.
+ * Only a firmware whose info block says host download is sent; at most
+ * RESENDS sends a boot, at most every 2 s.
  *
  * Boot-args: mp_ili_touch=0 leaves the chip alone; mp_ili_fw=<phys> is
  * mtkloader's firmware table (without it the firmware is never sent again);
- * mp_touchlog=1 logs every landing and lifting.
- * ADT: spi-gpios <mosi miso clk cs>, max-x, max-y (the chip's grid),
+ * mp_ili_quiet=1 checks a quiet chip as above; mp_touchlog=1 logs every
+ * landing and lifting.
+ * ADT: spi-gpios <mosi miso clk cs>, reset-gpios <rst>, max-x, max-y (the chip's grid),
  * panel-size <w h>, interrupts/interrupt-parent (MTKEINT). GPIO registers
  * through the gpio node's reg (MTKIO.cpp).
  *
@@ -51,7 +57,9 @@
 #define STALE_MS        150
 #define WATCH_MS        1000
 #define RELOAD_GAP_MS   2000
-#define RELOAD_TRIES    5
+#define RESENDS         2
+#define QUIET_MS        2000                    /* Android's touch ESD period (WQ_ESD_DELAY) */
+#define ANSWER_MS       600                     /* Android's wait for a command's INT (AP_INT_TIMEOUT) */
 #define CHUNK           2048                    /* bytes of a block in one SPI write */
 #define BAD_LOGGED      20
 
@@ -90,11 +98,14 @@ private:
 	void iceWrite(uint32_t addr, uint32_t value, uint32_t n);
 	void iceBytes(uint32_t addr, uint8_t *b, uint32_t n);
 	uint32_t dmaCRC(uint32_t start, uint32_t size);
-	bool reload(void);
+	void resetPulse(void);
+	bool reload(bool android);
+	void resend(const char *why, bool android);
 	void edgePalmOn(void);
 
-	void readReport(void);
+	int readReport(void);
 	void liftAll(const char *why);
+	void quiet(void);
 	void watch(void);
 
 	IOWorkLoop             *fWorkLoop;
@@ -104,19 +115,19 @@ private:
 	IOMemoryMap            *fFWMap[ILI_BLOCKS + 1];
 	unsigned int            fFWMaps;
 	vm_offset_t             fGPIO;
-	uint32_t                fMO, fMI, fCLK, fCS, fINT;
+	uint32_t                fMO, fMI, fCLK, fCS, fINT, fRST;
 	uint32_t                fMaxX, fMaxY, fPanelW, fPanelH;
-	uint32_t                fLog;
+	uint32_t                fLog, fQuiet;
 	struct ili_fw_block     fFW[ILI_BLOCKS];
-	bool                    fHaveFW, fAlive;
-	uint32_t                fFailures, fBad;
+	bool                    fHaveFW, fAlive, fAsked, fGaveUp;
+	uint32_t                fResends, fAsks, fAnswers, fBad;
 	uint32_t                fIrqs, fReports, fNoAck, fLowLong;
 	uint64_t                fLastIrqAt, fLastReportAt, fLastBadAt;
 	int                     fLastBad;
 public:
 	void diag(char *out, size_t len);
 private:
-	uint64_t                fLastTry, fReloadGap;
+	uint64_t                fLastTry, fReloadGap, fAskedAt, fQuietFrom;
 	uint32_t                fDownMap;
 	uint32_t                fLastX[ILI_FINGERS], fLastY[ILI_FINGERS];
 };
@@ -124,6 +135,8 @@ private:
 OSDefineMetaClassAndStructors(ILI7807S, MappleHIDTouch);
 
 static ILI7807S *gTouch;
+
+extern "C" bool mapple_fb_display_on(void);     /* MappleFramebuffer.cpp */
 
 static uint64_t
 msSince(uint64_t at)
@@ -260,6 +273,11 @@ ILI7807S::findFirmware(void)
 		}
 		return;
 	}
+	if (!ili_fw_host_download(fFW[0].data, fFW[0].len)) {
+		IOLog("MAPPLE TOUCH: the firmware's info block does not say host download (%02x): not used\n",
+		    fFW[0].len > 0x50 ? fFW[0].data[fFW[0].len - 0x50] : 0);
+		return;
+	}
 	fHaveFW = true;
 	IOLog("MAPPLE TOUCH: mtkloader's firmware at %#llx: %u + %u + %u bytes, CRCs %08x %08x %08x right\n", table,
 	    fFW[0].len, fFW[1].len, fFW[2].len, fFW[0].crc, fFW[1].crc, fFW[2].crc);
@@ -317,19 +335,45 @@ ILI7807S::dmaCRC(uint32_t start, uint32_t size)
 	return 0;
 }
 
+/* Android's ili_tp_reset: high 1 ms, low 5 ms, high, then 10 ms (rst_edge_delay); busy waits as there */
+void
+ILI7807S::resetPulse(void)
+{
+	pinSet(fRST, true);
+	wr(GPIO_DIR_SET + 0x10 * (fRST / 32), 1u << (fRST % 32));
+	IODelay(1000);
+	pinSet(fRST, false);
+	IODelay(5000);
+	pinSet(fRST, true);
+	IODelay(10000);
+}
+
+/* android: the reset pulse first and no PLL wake, as Android's driver in AP mode */
 bool
-ILI7807S::reload(void)
+ILI7807S::reload(bool android)
 {
 	static const uint8_t wake[12] = { 0x82, 0x00, 0x09, 0xa3, 0xa3, 0xa3, 0xa3, 0xa3, 0xa3, 0xa3, 0xa3, 0xa3 };
 	static const uint8_t iceStop[5] = { 0x82, 0x25, 0x62, 0x10, 0x18 };
 	static const uint8_t iceOff[5] = { 0x82, 0x1b, 0x62, 0x10, 0x18 };
 	static uint8_t buf[5 + CHUNK + 4];
 	uint32_t dma[ILI_BLOCKS] = { 0 }, iram[ILI_BLOCKS] = { 0 };
+	uint8_t id[4];
 	bool good = true;
 
-	spiXfer(wake, sizeof(wake), NULL, sizeof(wake));
+	if (android) {
+		resetPulse();
+	} else {
+		spiXfer(wake, sizeof(wake), NULL, sizeof(wake));
+	}
 	spiXfer(iceStop, sizeof(iceStop), NULL, sizeof(iceStop));
 	IOSleep(1);
+	iceBytes(0x4009c, id, 4);
+	uint32_t pid = (uint32_t)id[0] | (uint32_t)id[1] << 8 | (uint32_t)id[2] << 16 | (uint32_t)id[3] << 24;
+	if (!ili_chip_ok(pid)) {
+		spiXfer(iceOff, sizeof(iceOff), NULL, sizeof(iceOff));
+		IOLog("MAPPLE TOUCH: chip ID %08x in ICE mode, not the ILI7807S's: the firmware is not sent\n", pid);
+		return false;
+	}
 	for (int i = 0; i < ILI_BLOCKS && good; i++) {
 		uint8_t b[4];
 
@@ -359,9 +403,36 @@ ILI7807S::reload(void)
 	}
 	spiXfer(iceOff, sizeof(iceOff), NULL, sizeof(iceOff));
 	IOSleep(100);
-	IOLog("MAPPLE TOUCH: firmware sent again (%s): dma/iram %08x/%08x %08x/%08x %08x/%08x\n",
-	    good ? "CRCs right" : "A CRC WRONG", dma[0], iram[0], dma[1], iram[1], dma[2], iram[2]);
+	IOLog("MAPPLE TOUCH: firmware sent again (%s, chip %08x%s): dma/iram %08x/%08x %08x/%08x %08x/%08x\n",
+	    good ? "CRCs right" : "A CRC WRONG", pid, android ? ", reset pulse" : "", dma[0], iram[0], dma[1], iram[1],
+	    dma[2], iram[2]);
 	return good;
+}
+
+void
+ILI7807S::resend(const char *why, bool android)
+{
+	uint8_t rx[ILI_RX_LEN];
+
+	if (fResends == RESENDS) {
+		if (!fGaveUp) {
+			fGaveUp = true;
+			IOLog("MAPPLE TOUCH: %s after %u re-sends: giving up until the next boot\n", why, RESENDS);
+		}
+		return;
+	}
+	fResends++;
+	IOLog("MAPPLE TOUCH: re-send %u of %u: %s\n", fResends, RESENDS, why);
+	reload(android);
+	fLastTry = mach_absolute_time();
+	fQuietFrom = fLastTry;
+	fAsked = false;
+	spiRead(rx, sizeof(rx));
+	fAlive = rx[1] == ILI_ACK;
+	IOLog("MAPPLE TOUCH: firmware %s after sending it again (ACK %02x)\n", fAlive ? "answers" : "STILL GONE", rx[1]);
+	if (fAlive) {
+		edgePalmOn();
+	}
 }
 
 /* a command, framed 0x82, length (two bytes), then 01 12 01 */
@@ -388,8 +459,8 @@ ILI7807S::liftAll(const char *why)
 	fDownMap = 0;
 }
 
-/* Work loop: one report; each finger it names lands or moves, each one it no longer names lifts. */
-void
+/* Work loop: one report; each finger it names lands or moves, each one it no longer names lifts. ili_parse's result. */
+int
 ILI7807S::readReport(void)
 {
 	uint8_t rx[ILI_RX_LEN];
@@ -397,6 +468,10 @@ ILI7807S::readReport(void)
 
 	spiRead(rx, sizeof(rx));
 	int map = ili_parse(rx, pt);
+	if (map == ILI_ANSWER) {
+		fAnswers++;
+		return map;
+	}
 	if (map < 0) {
 		fNoAck += map == ILI_NO_ACK;
 		fLastBad = map;
@@ -416,7 +491,7 @@ ILI7807S::readReport(void)
 		if (map == ILI_BAD && fBad++ < BAD_LOGGED) {
 			IOLog("MAPPLE TOUCH: not a report: packet %02x, sum byte %02x\n", rx[3], rx[ILI_RX_LEN - 1]);
 		}
-		return;
+		return map;
 	}
 	for (uint32_t f = 0; f < ILI_FINGERS; f++) {
 		if (!(map & (1 << f))) {
@@ -441,12 +516,54 @@ ILI7807S::readReport(void)
 	if (fDownMap != 0) {
 		fTimer->setTimeoutMS(STALE_MS);
 	}
+	return map;
+}
+
+/*
+ * An idle chip raises no interrupt (one per report, reports only with
+ * fingers), so a quiet one is asked for its version, which it answers with an
+ * interrupt as it does every command. Any interrupt clears fAsked.
+ */
+void
+ILI7807S::quiet(void)
+{
+	static const uint8_t pre[5] = { 0x82, 0x00, 0x02, 0xf6, ILI_FW_VERSION };
+	static const uint8_t ask[4] = { 0x82, 0x00, 0x01, ILI_FW_VERSION };
+	uint64_t from = fLastIrqAt > fQuietFrom ? fLastIrqAt : fQuietFrom;
+	char why[96];
+
+	if (!mapple_fb_display_on() || fDownMap != 0) {
+		fAsked = false;
+		fQuietFrom = mach_absolute_time();
+		return;
+	}
+	if (fAsked) {
+		if (msSince(fAskedAt) < ANSWER_MS) {
+			return;
+		}
+		fAsked = false;
+		int got = readReport();
+		if (got == ILI_NO_ACK) {
+			return;
+		}
+		snprintf(why, sizeof(why), "ACK but no interrupt %u ms after asking the version (%s)", ANSWER_MS,
+		    got == ILI_ANSWER ? "answer there" : "no answer");
+		resend(why, true);
+		return;
+	}
+	if (msSince(from) >= QUIET_MS) {
+		spiXfer(pre, sizeof(pre), NULL, sizeof(pre));
+		spiXfer(ask, sizeof(ask), NULL, sizeof(ask));
+		fAsks++;
+		fAsked = true;
+		fAskedAt = mach_absolute_time();
+	}
 }
 
 /*
  * Timer: it fires STALE_MS after the last report that had fingers, at once
- * when the firmware is found gone, and every WATCH_MS otherwise. A line held
- * low (no edge to catch) is read too.
+ * when the firmware is found gone, ANSWER_MS after the version is asked for,
+ * and every WATCH_MS otherwise. A line held low (no edge to catch) is read too.
  */
 void
 ILI7807S::watch(void)
@@ -456,32 +573,21 @@ ILI7807S::watch(void)
 		fLowLong++;
 	}
 	if (!pinGet(fINT)) {
+		fAsked = false;
 		readReport();
 	}
-	if (!fAlive && fHaveFW && fFailures < RELOAD_TRIES) {
-		uint64_t now = mach_absolute_time();
-
-		if (fLastTry == 0 || now - fLastTry >= fReloadGap) {
-			uint8_t rx[ILI_RX_LEN];
-			bool sent = reload();
-
-			fLastTry = mach_absolute_time();
-			spiRead(rx, sizeof(rx));
-			fAlive = rx[1] == ILI_ACK;
-			fFailures = sent && fAlive ? 0 : fFailures + 1;
-			IOLog("MAPPLE TOUCH: firmware %s after sending it again (ACK %02x)\n", fAlive ? "answers" : "STILL GONE", rx[1]);
-			if (fAlive) {
-				edgePalmOn();
-			}
-			if (fFailures == RELOAD_TRIES) {
-				IOLog("MAPPLE TOUCH: %u failures in a row: the firmware is not sent again\n", RELOAD_TRIES);
-			}
-		}
+	if (fQuiet && fAlive && fHaveFW && !fGaveUp) {
+		quiet();
+	}
+	if (!fAlive && fHaveFW && !fGaveUp && (fLastTry == 0 || mach_absolute_time() - fLastTry >= fReloadGap)) {
+		resend("firmware gone (no ACK)", false);
 	}
 	if (fDownMap != 0) {
 		fTimer->setTimeoutMS(STALE_MS);
-	} else if (!fAlive && fHaveFW && fFailures < RELOAD_TRIES) {
+	} else if (!fAlive && fHaveFW && !fGaveUp) {
 		fTimer->setTimeoutMS(RELOAD_GAP_MS);
+	} else if (fAsked) {
+		fTimer->setTimeoutMS(ANSWER_MS);
 	} else {
 		fTimer->setTimeoutMS(WATCH_MS);
 	}
@@ -498,10 +604,12 @@ ILI7807S::start(IOService *provider)
 		return false;
 	}
 	PE_parse_boot_argn_alias("mp_touchlog", "touchlog", &fLog, sizeof(fLog));
+	PE_parse_boot_argn("mp_ili_quiet", &fQuiet, sizeof(fQuiet));
 	fMO = dtU32(provider, "spi-gpios", 0, 13);
 	fMI = dtU32(provider, "spi-gpios", 1, 14);
 	fCLK = dtU32(provider, "spi-gpios", 2, 144);
 	fCS = dtU32(provider, "spi-gpios", 3, 145);
+	fRST = dtU32(provider, "reset-gpios", 0, 121);
 	fINT = dtU32(provider, "interrupts", 0, 12);    /* EINT n is GPIO n here */
 	fMaxX = dtU32(provider, "max-x", 0, 2047);
 	fMaxY = dtU32(provider, "max-y", 0, 2047);
@@ -541,6 +649,7 @@ ILI7807S::start(IOService *provider)
 		return false;
 	}
 	fInterrupt->enable();
+	fQuietFrom = mach_absolute_time();
 	fTimer->setTimeoutMS(fAlive ? WATCH_MS : 1);
 	gTouch = this;
 	return true;
@@ -578,6 +687,7 @@ ILI7807S::interruptOccurred(OSObject *owner, IOInterruptEventSource *src __unuse
 	if (self != NULL) {
 		self->fIrqs++;
 		self->fLastIrqAt = mach_absolute_time();
+		self->fAsked = false;
 		self->readReport();
 	}
 }
@@ -597,8 +707,9 @@ ILI7807S::diag(char *out, size_t len)
 {
 	snprintf(out, len, "touch: INT %s; %u interrupts, %u reports, %u bad (%u no ACK, %u not a report), last bad %d "
 	    "%llu ms ago; INT held low past 250 ms without an interrupt %u times; last interrupt %llu ms ago, last report %llu "
-	    "ms ago; firmware %s\n", pinGet(fINT) ? "high" : "low", fIrqs, fReports, fNoAck + fBad, fNoAck, fBad, fLastBad,
-	    msSince(fLastBadAt), fLowLong, msSince(fLastIrqAt), msSince(fLastReportAt), fAlive ? "answers" : "gone");
+	    "ms ago; firmware %s; %u version queries, %u answers; %u re-sends\n", pinGet(fINT) ? "high" : "low", fIrqs,
+	    fReports, fNoAck + fBad, fNoAck, fBad, fLastBad, msSince(fLastBadAt), fLowLong, msSince(fLastIrqAt),
+	    msSince(fLastReportAt), fAlive ? "answers" : "gone", fAsks, fAnswers, fResends);
 }
 
 extern "C" void mapple_touch_link(char *out, size_t len);

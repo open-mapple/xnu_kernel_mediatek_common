@@ -425,6 +425,13 @@ mapple_fb_set_duty_cap(uint32_t pct)
 	gMappleFbDutyCap = pct > 100 ? 100 : pct;
 }
 
+/* ILI7807S.cpp: false with no framebuffer or while RequestPowerChange(0) holds the panel dark */
+extern "C" bool
+mapple_fb_display_on(void)
+{
+	return gMappleFB != NULL && !gMappleFB->fPowerOff;
+}
+
 class IOMobileFramebufferUserClient : public IOUserClient {
 	OSDeclareDefaultStructors(IOMobileFramebufferUserClient);
 
