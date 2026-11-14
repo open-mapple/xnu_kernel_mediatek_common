@@ -14,7 +14,9 @@
 #define CAM_LDO_REGS            16
 #define CAM_LDO_OUT(n)          (0x02 + (n))
 #define CAM_LDO_EN              0x0e
-#define CAM_LDO_JN1_RAILS       ((1u << 6) | (1u << 1) | (1u << 2))     /* DOVDD, DVDD, AVDD */
+#define CAM_LDO_BIT(n)          (1u << ((n) - 1))
+#define CAM_LDO_JN1_RAILS       (CAM_LDO_BIT(7) | CAM_LDO_BIT(2) | CAM_LDO_BIT(3))      /* DOVDD, DVDD, AVDD */
+#define CAM_LDO_JN1_ALL         (CAM_LDO_JN1_RAILS | CAM_LDO_BIT(5))
 
 static inline uint32_t
 cam_ldo_mv(uint32_t n, uint8_t out)
@@ -22,9 +24,44 @@ cam_ldo_mv(uint32_t n, uint8_t out)
 	return (n <= 2 ? 600u : 1200u) + out * 25u / 2;
 }
 
+/* The output code for mv, as camera_ldo_set_ldo_value computes it; -1 unless it is exact. */
+static inline int
+cam_ldo_code(uint32_t n, uint32_t mv)
+{
+	uint32_t base = n <= 2 ? 600u : 1200u;
+
+	if (n < 1 || n > 7 || mv < base || (mv - base) * 2 % 25 != 0 || (mv - base) * 2 / 25 > 0xff) {
+		return -1;
+	}
+	return (int)((mv - base) * 2 / 25);
+}
+
 static inline bool
 cam_ldo_jn1_on(uint8_t en)
 {
 	return (en & CAM_LDO_JN1_RAILS) == CAM_LDO_JN1_RAILS;
 }
+
+/*
+ * The JN1's power-up, realme's sensor_power_sequence_21690 (imgsensor_hwcfg_mt6781.c), each step followed by its
+ * delay; off in reverse, each with the same delay (imgsensor_hw_power_sequence): RST low, MCLK off, LDOs disabled.
+ */
+enum { CAM_SEQ_RST, CAM_SEQ_LDO, CAM_SEQ_MCLK };
+
+static const struct cam_seq {
+	uint8_t kind;
+	uint8_t n;              /* LDOn, or RST's level */
+	uint16_t mv;
+	uint8_t ms;
+} cam_jn1_seq[] = {
+	{ CAM_SEQ_RST, 0, 0, 1 },
+	{ CAM_SEQ_LDO, 7, 1800, 1 },
+	{ CAM_SEQ_LDO, 2, 1050, 1 },
+	{ CAM_SEQ_LDO, 3, 2900, 5 },
+	{ CAM_SEQ_LDO, 5, 2900, 0 },
+	{ CAM_SEQ_RST, 1, 0, 2 },
+	{ CAM_SEQ_MCLK, 0, 0, 2 },
+};
+
+#define CAM_JN1_SEQ_N           (sizeof(cam_jn1_seq) / sizeof(cam_jn1_seq[0]))
 #endif
