@@ -27,7 +27,7 @@
  *      the panel itself stays powered. spaced's panel is an LCD, so once
  *      black the backlight goes to level 0 too, and back to iOS's level
  *      at on (mp_fb_bloff, 1 default; 0 leaves the backlight alone).
- *      mp_fb_blmin=N: no lit level below N (0 default). mp_fb_blcal=1: the
+ *      mp_fb_blmin=N: iOS's levels 1..2047 sent as N..2047 (0 default). mp_fb_blcal=1: the
  *      panel's nits range for CoreBrightness (see mapple_fb_bl_calibration).
  *   18 IsMainDisplay,
  *   28 GetDotPitch, 72 Enable/DisableNotifications [func, refcon, type, 0]
@@ -309,13 +309,14 @@ public:
 	volatile uint32_t fBlWant;    /* panel level to send at the next tick, 0xffffffff = none */
 	uint32_t      fBlLevel;       /* last level sent; until fBlSent, LK's level, not known */
 	uint32_t      fBlOff;         /* mp_fb_bloff: backlight off while the display is */
-	uint32_t      fBlMin;         /* mp_fb_blmin: lowest level other than 0 */
+	uint32_t      fBlMin;         /* mp_fb_blmin: the panel level iOS's 1 is sent as */
 	uint32_t      fBlResume;      /* level for when the display is on again */
 	const char   *fBlFrom;        /* who asked for fBlWant */
 	uint32_t      fBlNits16;      /* CoreBrightness's request, nits << 16 */
 	uint64_t      fBlLogSec;      /* backlight log: at most 10 lines a second */
 	uint32_t      fBlLogN, fBlLogSkipped;
 	void blLog(uint32_t bl, const char *from, const char *note);
+	uint32_t blPanel(uint32_t bl) const;
 	uint64_t      fBlSent, fMatrixCalls, fMatrixApplied;
 	int32_t       fMatrix[16][9]; /* per matrix type (Night Shift = 9), fixed point 1.0 = 0x800 */
 	bool          fMatrixUsed[16];
@@ -580,7 +581,7 @@ AppleCLCD::start(IOService *provider)
 	fBlOff = 1;
 	PE_parse_boot_argn("mp_fb_bloff", &fBlOff, sizeof(fBlOff));
 	PE_parse_boot_argn("mp_fb_blmin", &fBlMin, sizeof(fBlMin));
-	fBlMin = MIN(fBlMin, 2047u);
+	fBlMin = MIN(fBlMin, 2047u);         /* PANEL_LEVEL_MAX */
 	fHzIdleMs = 500;
 	PE_parse_boot_argn_alias("mp_panel_idle", "vivapanelidle", &fHzIdleMs, sizeof(fHzIdleMs));
 	fHzIdleMs = MIN(MAX(fHzIdleMs, 100u), 60000u);
@@ -2293,6 +2294,13 @@ AppleCLCD::dsiSendDcs(const uint8_t *b, uint32_t n, bool vbp, bool wait)
 }
 
 /* Every backlight write (DCS 51 is the panel's own PWM duty, 0..2047), at most 10 lines a second, then a count. */
+/* iOS's level (0..2047) to the panel's: with mp_fb_blmin, 1..2047 spread over N..2047. */
+uint32_t
+AppleCLCD::blPanel(uint32_t bl) const
+{
+	return bl == 0 || fBlMin == 0 ? bl : fBlMin + (bl - 1) * (PANEL_LEVEL_MAX - fBlMin) / (PANEL_LEVEL_MAX - 1);
+}
+
 void
 AppleCLCD::blLog(uint32_t bl, const char *from, const char *note)
 {
@@ -2319,11 +2327,12 @@ AppleCLCD::blLog(uint32_t bl, const char *from, const char *note)
 		snprintf(was, sizeof(was), "%u", fBlLevel);
 	}
 	from = from != NULL ? from : "?";
+	uint32_t pl = blPanel(bl);
 	if (strcmp(from, "IOMFBBrightnessLevel") == 0) {
-		IOLog("FB: backlight %s -> %u (DCS 51 %02x %02x) from %s %u.%02u nits%s\n", was, bl, bl >> 8, bl & 0xff, from,
+		IOLog("FB: backlight %s -> %u (DCS 51 %02x %02x) from %s %u.%02u nits%s\n", was, bl, pl >> 8, pl & 0xff, from,
 		    fBlNits16 >> 16, ((fBlNits16 & 0xffff) * 100) >> 16, note);
 	} else {
-		IOLog("FB: backlight %s -> %u (DCS 51 %02x %02x) from %s%s\n", was, bl, bl >> 8, bl & 0xff, from, note);
+		IOLog("FB: backlight %s -> %u (DCS 51 %02x %02x) from %s%s\n", was, bl, pl >> 8, pl & 0xff, from, note);
 	}
 }
 
@@ -2350,15 +2359,14 @@ AppleCLCD::lightTick(void)
 		blLog(bl, fBlFrom, fBlSent == 0 ? ": ignored, before iOS's first level" : ": ignored");
 		fBlWant = 0xffffffffu;
 		bl = 0xffffffffu;
-	} else if (bl != 0xffffffffu && bl != 0 && bl < fBlMin) {
-		bl = fBlWant = fBlMin;
 	}
 	if (bl == 0xffffffffu && !matrix) {
 		return;
 	}
 	IOLockLock(fScanLock);
 	if (bl != 0xffffffffu) {
-		uint8_t cmd[3] = { 0x51, (uint8_t)(bl >> 8), (uint8_t)bl };
+		uint32_t pl = blPanel(bl);
+		uint8_t cmd[3] = { 0x51, (uint8_t)(pl >> 8), (uint8_t)pl };
 		if (bl == fBlLevel && fBlSent != 0) {
 			blLog(bl, dark ? "display off" : fBlFrom, ": already there");
 			fBlWant = 0xffffffffu;
