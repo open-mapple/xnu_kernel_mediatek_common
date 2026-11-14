@@ -24,6 +24,7 @@
  * (0 = off) turns proximity on and off. Orientation runs the accelerometer at 10 Hz while it is on (from the start).
  * mp_spu_off: a bit per service left out, in the order of the table below (accel 0, gyro 1, compass 2, prox 3,
  * als 4, orientation 5, cma 6, gesture 7, devmotion 8, devmotion6 9, devmotion3 10); mp_spu_prox=0 = bit 3.
+ * The default 0x7de keeps only accel and orientation; mp_spu_off=0 publishes everything.
  * Calibration knobs: mp_imu_axes, mp_mag_axes (default 0x123: a nibble per output axis x, y, z = the hub's axis 1-3,
  * +8 to flip it); mp_als_div (default 1: the hub's light value is lux; indoors it reads tens); mp_als_default (lux reported
  * before the first reading, default 100, 0 = none); mp_stride_cm
@@ -763,7 +764,7 @@ mapple_spu_start(uint32_t steps)
 			}
 		}
 	}
-	uint32_t prox = 1, off = 0;
+	uint32_t prox = 1, off = 0x7de;
 	PE_parse_boot_argn("mp_spu_prox", &prox, sizeof(prox));
 	PE_parse_boot_argn("mp_spu_off", &off, sizeof(off));
 	off |= prox ? 0 : 1u << SPU_PROX;

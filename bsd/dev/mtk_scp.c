@@ -7,7 +7,7 @@
  * One thread owns the SCP: it polls for messages every 2 ms, answers them, and applies what the HID services ask
  * for (mtk_scp_sensor_set only records it).
  *
- * Boot-arg mp_sensor_steps (default 0), each step with the ones before it:
+ * Boot-arg mp_sensor_steps (default 5; 0 = the SCP left alone), each step with the ones before it:
  * 1 status, read only: scp_sel's clock, cfg+0, the PC twice, LR, sleep, to host, the general registers, LK's region
  *   info in the SCP's SRAM.
  * 2 the IPI handshake: scp_sel to clk26m (only with mp_scp_clk26m=1, and only if it is not there), the start
@@ -59,7 +59,7 @@ void mtk_scp_sensor_rearm(uint8_t type);
 #define REGION_INFO     0x400           /* LK's: loader, firmware, DRAM (start, size each), ... */
 #define SAID_MAX        64
 
-static uint32_t steps;
+static uint32_t steps = 5;
 static volatile uint8_t *ring;          /* write-combined: what the hub writes is read as it lands */
 static uint64_t ring_pa;
 static uint32_t said;
