@@ -25,7 +25,8 @@
  * mp_spu_off: a bit per service left out, in the order of the table below (accel 0, gyro 1, compass 2, prox 3,
  * als 4, orientation 5, cma 6, gesture 7, devmotion 8, devmotion6 9, devmotion3 10); mp_spu_prox=0 = bit 3.
  * Calibration knobs: mp_imu_axes, mp_mag_axes (default 0x123: a nibble per output axis x, y, z = the hub's axis 1-3,
- * +8 to flip it); mp_als_div (default 1: the hub's light value is lux; indoors it reads tens); mp_stride_cm
+ * +8 to flip it); mp_als_div (default 1: the hub's light value is lux; indoors it reads tens); mp_als_default (lux reported
+ * before the first reading, default 100, 0 = none); mp_stride_cm
  * (default 70).
  */
 #include <IOKit/IOLib.h>
@@ -200,6 +201,7 @@ static IOLock *gSPULock;
 static uint32_t gSteps, gSamplesSaid;
 static int8_t gImuAxes[3] = { 1, 2, 3 }, gMagAxes[3] = { 1, 2, 3 };
 static uint32_t gAlsDiv = 1, gStrideCm = 70, gStep3AccelUs = 20000;
+static uint32_t gAlsDefault = 100;      /* lux until the first reading: CoreBrightness takes a silent ALS as dark */
 static uint64_t gWokeTicks;             /* raise to wake detected, not yet dismissed */
 
 /* the latest of each, iOS's units (Q16), for the fusion */
@@ -326,6 +328,9 @@ MappleSPUSensor::setProperties(OSObject *properties)
 		setProperty(kIOHIDReportIntervalKey, fReportUs, 32);
 		setProperty(kIOHIDBatchIntervalKey, fBatchUs, 32);
 		spu_update();
+		if (fKind == SPU_ALS && fReportUs && !fLastTicks && gAlsDefault) {
+			post(IOHIDEvent::ambientLightSensorEvent(mach_absolute_time(), gAlsDefault));
+		}
 	}
 	return kIOReturnSuccess;
 }
@@ -340,8 +345,10 @@ MappleSPUSensor::copyEvent(IOHIDEventType type, IOHIDEvent *matching __unused, I
 		}
 		return e;
 	}
-	if (fKind == SPU_ALS && type == kIOHIDEventTypeAmbientLightSensor && fLastTicks) {
-		return IOHIDEvent::ambientLightSensorEvent(fLastTicks, fLast);         /* the last lux the hub gave */
+	if (fKind == SPU_ALS && type == kIOHIDEventTypeAmbientLightSensor && (fLastTicks || gAlsDefault)) {
+		/* the last lux the hub gave, or the default before it gave any */
+		return IOHIDEvent::ambientLightSensorEvent(fLastTicks ? fLastTicks : mach_absolute_time(),
+		           fLastTicks ? fLast : gAlsDefault);
 	}
 	return NULL;
 }
@@ -683,6 +690,7 @@ mapple_spu_start(uint32_t steps)
 	axes_arg("mp_imu_axes", gImuAxes);
 	axes_arg("mp_mag_axes", gMagAxes);
 	PE_parse_boot_argn("mp_als_div", &gAlsDiv, sizeof(gAlsDiv));
+	PE_parse_boot_argn("mp_als_default", &gAlsDefault, sizeof(gAlsDefault));
 	PE_parse_boot_argn("mp_stride_cm", &gStrideCm, sizeof(gStrideCm));
 	PE_parse_boot_argn("mp_scp_accel_us", &gStep3AccelUs, sizeof(gStep3AccelUs));
 	gAlsDiv = gAlsDiv ? gAlsDiv : 1;
