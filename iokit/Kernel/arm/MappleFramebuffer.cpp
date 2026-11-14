@@ -27,6 +27,8 @@
  *      the panel itself stays powered. spaced's panel is an LCD, so once
  *      black the backlight goes to level 0 too, and back to iOS's level
  *      at on (mp_fb_bloff, 1 default; 0 leaves the backlight alone).
+ *      mp_fb_blmin=N: no lit level below N (0 default). mp_fb_blcal=1: the
+ *      panel's nits range for CoreBrightness (see mapple_fb_bl_calibration).
  *   18 IsMainDisplay,
  *   28 GetDotPitch, 72 Enable/DisableNotifications [func, refcon, type, 0]
  * Everything else is accepted and logged once.
@@ -307,6 +309,7 @@ public:
 	volatile uint32_t fBlWant;    /* panel level to send at the next tick, 0xffffffff = none */
 	uint32_t      fBlLevel;       /* last level sent; until fBlSent, LK's level, not known */
 	uint32_t      fBlOff;         /* mp_fb_bloff: backlight off while the display is */
+	uint32_t      fBlMin;         /* mp_fb_blmin: lowest level other than 0 */
 	uint32_t      fBlResume;      /* level for when the display is on again */
 	const char   *fBlFrom;        /* who asked for fBlWant */
 	uint32_t      fBlNits16;      /* CoreBrightness's request, nits << 16 */
@@ -576,6 +579,8 @@ AppleCLCD::start(IOService *provider)
 	fBlWant = 0xffffffffu;
 	fBlOff = 1;
 	PE_parse_boot_argn("mp_fb_bloff", &fBlOff, sizeof(fBlOff));
+	PE_parse_boot_argn("mp_fb_blmin", &fBlMin, sizeof(fBlMin));
+	fBlMin = MIN(fBlMin, 2047u);
 	fHzIdleMs = 500;
 	PE_parse_boot_argn_alias("mp_panel_idle", "vivapanelidle", &fHzIdleMs, sizeof(fHzIdleMs));
 	fHzIdleMs = MIN(MAX(fHzIdleMs, 100u), 60000u);
@@ -2337,11 +2342,16 @@ AppleCLCD::lightTick(void)
 			fBlWant = 0xffffffffu;
 		}
 		bl = fBlLevel != 0 || fBlSent == 0 ? 0 : 0xffffffffu;
-	} else if (bl == 0 && fBlSent == 0) {
-		/* iOS asks for 0 early in boot, long before its first real level: LK's level stays until then */
-		blLog(bl, fBlFrom, ": ignored, before iOS's first level");
+	} else if (bl == 0 && (fBlSent == 0 || strcmp(fBlFrom, "IOMFBBrightnessLevel") == 0)) {
+		/*
+		 * CoreBrightness sends 0 nits once as it starts, before or just after backboardd's first level; the
+		 * level stays. The display off and the nub's 0 are what darken.
+		 */
+		blLog(bl, fBlFrom, fBlSent == 0 ? ": ignored, before iOS's first level" : ": ignored");
 		fBlWant = 0xffffffffu;
 		bl = 0xffffffffu;
+	} else if (bl != 0xffffffffu && bl != 0 && bl < fBlMin) {
+		bl = fBlWant = fBlMin;
 	}
 	if (bl == 0xffffffffu && !matrix) {
 		return;
@@ -2431,6 +2441,41 @@ AppleCLCD::setMatrix(uint32_t type, const uint64_t bits[9])
 	fMatrixDirty = true;
 }
 
+/*
+ * CoreBrightness's panel range (DisplayCreateWithID, iOS 16.7), read from the nub: backlight-calibration-parameters,
+ * nine numbers in 16.16, all read without a check; and backlight-marketing-table, the slider's nits in 16.16 at
+ * equal steps. Without the dictionary it takes the panel as 0..1 nit, so auto-brightness never goes past 1 nit.
+ * Our own numbers for this LCD: 2 nits, 30% of mp_panel_nits, mp_panel_nits; slider s -> min + (max - min) s^2.
+ */
+static void
+mapple_fb_bl_calibration(IOService *b, uint32_t maxNits)
+{
+	static const char *const keys[] = {
+		"current-for-max-backlight", "current-for-mid-backlight", "hardware-max-current-limit",
+		"lMaxProduct", "lMidProduct", "lMinProduct", "lMaxPanel", "lMidPanel", "lMinPanel",
+	};
+	const uint32_t lo = 2, mid = maxNits * 3 / 10;
+	const uint32_t v[] = { 20, 6, 25, maxNits, mid, lo, maxNits, mid, lo };        /* mA x 3, then nits */
+	OSDictionary *d = OSDictionary::withCapacity(9);
+	for (unsigned i = 0; d != NULL && i < 9; i++) {
+		OSNumber *n = OSNumber::withNumber((unsigned long long)v[i] << 16, 32);
+		if (n != NULL) {
+			d->setObject(keys[i], n);
+		}
+		OSSafeReleaseNULL(n);
+	}
+	if (d != NULL && d->getCount() == 9) {
+		b->setProperty("backlight-calibration-parameters", d);
+	}
+	OSSafeReleaseNULL(d);
+
+	uint32_t t[101];
+	for (uint32_t i = 0; i <= 100; i++) {
+		t[i] = (lo << 16) + (uint32_t)(((uint64_t)(maxNits - lo) << 16) * (i * i) / 10000);
+	}
+	b->setProperty("backlight-marketing-table", t, sizeof(t));
+}
+
 /* 0191: the AppleARMBacklight nub (see its class). */
 void
 AppleCLCD::backlightStart(void)
@@ -2442,6 +2487,10 @@ AppleCLCD::backlightStart(void)
 	}
 	b->fFB = this;
 	b->setProperty("backlight-control", true);
+	uint32_t cal = 0;
+	if (PE_parse_boot_argn("mp_fb_blcal", &cal, sizeof(cal)) && cal != 0) {
+		mapple_fb_bl_calibration(b, fMaxNits);
+	}
 	b->publishLevel(0x219);         /* LK's level */
 	if (!b->attach(this)) {
 		b->release();
