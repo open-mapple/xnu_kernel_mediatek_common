@@ -192,7 +192,7 @@ static TUNABLE(bool, bootarg_execfailurereports, "execfailurecrashes", false);
 static TUNABLE(bool, bootarg_arm64e_preview_abi, "-arm64e_preview_abi", false);
 #endif /* __has_feature(ptrauth_calls) */
 
-#if DEBUG || DEVELOPMENT
+#if (DEBUG || DEVELOPMENT) && !defined(ARM64_BOARD_CONFIG_MT6781)
 static TUNABLE(bool, unentitled_ios_sim_launch, "unentitled_ios_sim_launch", false);
 #endif /* DEBUG || DEVELOPMENT */
 #endif /* XNU_TARGET_OS_OSX */
@@ -7392,7 +7392,10 @@ process_signature(proc_t p, struct image_params *imgp)
 		struct _posix_spawnattr *psa = (struct _posix_spawnattr *) imgp->ip_px_sa;
 		if (psa == NULL || psa->psa_platform == 0) {
 			boolean_t no_sandbox_entitled = FALSE;
-#if DEBUG || DEVELOPMENT
+#if defined(ARM64_BOARD_CONFIG_MT6781)
+			/* MT6781 runs iOS's user space on this macOS-platform kernel: every iOS binary, RELEASE kernels too. */
+			no_sandbox_entitled = TRUE;
+#elif DEBUG || DEVELOPMENT
 			/*
 			 * Allow iOS binaries to spawn on internal systems
 			 * if no-sandbox entitlement is present of unentitled_ios_sim_launch
