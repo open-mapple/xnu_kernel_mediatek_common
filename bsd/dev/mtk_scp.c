@@ -348,7 +348,6 @@ hub_power_up(void)
 			want[t].dirty = want[t].period_us != 0;
 		}
 		lck_spin_unlock(&want_lock);
-		mapple_spu_start(steps);
 	}
 }
 
@@ -431,6 +430,11 @@ worker(__unused void *arg, __unused wait_result_t w)
 		printf("scp: not started (%s)\n", !sane ? "LK's region info missing or outside the memory holes" :
 		    ring == NULL ? "no ring" : "already running");
 		goto out;
+	}
+	if (steps >= 3) {
+		/* the services before the hub: MobileGestalt caches "ambient-light-sensor" from whether one exists when it
+		 * first looks; what they ask for waits for the hub */
+		mapple_spu_start(steps);
 	}
 	(void)PE_parse_boot_argn("mp_scp_clk26m", &clk26m, sizeof(clk26m));
 	if (mt6781_scp_clock() & (1u << 15)) {
