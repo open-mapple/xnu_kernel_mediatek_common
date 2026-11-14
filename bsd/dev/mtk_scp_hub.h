@@ -332,7 +332,9 @@ sh_orientation(int32_t x, int32_t y, int32_t z, uint32_t last)
 {
 	int32_t ax = x < 0 ? -x : x, ay = y < 0 ? -y : y, az = z < 0 ? -z : z;
 
-	if (az > 52429) {                       /* 0.8 g */
+	bool face = last == SH_ORIENT_FACE_UP || last == SH_ORIENT_FACE_DOWN;
+
+	if (az > (face ? 42598 : 52429)) {      /* in at 0.8 g, out below 0.65 g */
 		return z < 0 ? SH_ORIENT_FACE_UP : SH_ORIENT_FACE_DOWN;
 	}
 	if (ay > ax + 16384) {                  /* 0.25 g */
@@ -344,27 +346,24 @@ sh_orientation(int32_t x, int32_t y, int32_t z, uint32_t last)
 	return last ? last : SH_ORIENT_AMBIGUOUS;
 }
 
-/* An orientation reaches iOS only once it has held for SH_ORIENT_HOLD samples in a row (300 ms at 10 Hz). */
-#define SH_ORIENT_HOLD          3
+/* An orientation reaches iOS only once it has held for SH_ORIENT_HOLD_US of sample time. */
+#define SH_ORIENT_HOLD_US       500000
 
 struct sh_orient {
 	uint32_t shown, candidate;
-	uint32_t held;
+	uint64_t since_us;
 };
 
 /* the orientation to report now, or 0 for no change */
 static inline uint32_t
-sh_orient_step(struct sh_orient *o, int32_t x, int32_t y, int32_t z)
+sh_orient_step(struct sh_orient *o, int32_t x, int32_t y, int32_t z, uint64_t now_us)
 {
 	uint32_t now = sh_orientation(x, y, z, o->candidate);
 
 	if (now != o->candidate) {
 		o->candidate = now;
-		o->held = 1;
-	} else if (o->held < SH_ORIENT_HOLD) {
-		o->held++;
-	}
-	if (o->held >= SH_ORIENT_HOLD && o->candidate != o->shown) {
+		o->since_us = now_us;
+	} else if (o->candidate != o->shown && (int64_t)(now_us - o->since_us) >= SH_ORIENT_HOLD_US) {
 		o->shown = o->candidate;
 		return o->shown;
 	}

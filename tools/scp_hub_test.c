@@ -222,13 +222,23 @@ test_orientation(void)
 	CHECK(sh_orientation(-46341, -46341, 0, SH_ORIENT_LANDSCAPE_L) == SH_ORIENT_LANDSCAPE_L);
 	/* debounced: a change counts after three samples in a row; a one-sample flick does not */
 	struct sh_orient d = { 0, 0, 0 };
-	CHECK(sh_orient_step(&d, 0, -g, 0) == 0 && sh_orient_step(&d, 0, -g, 0) == 0);
-	CHECK(sh_orient_step(&d, 0, -g, 0) == SH_ORIENT_PORTRAIT);
-	CHECK(sh_orient_step(&d, -g, 0, 0) == 0);                       /* one flick to landscape */
-	CHECK(sh_orient_step(&d, 0, -g, 0) == 0 && sh_orient_step(&d, 0, -g, 0) == 0 && d.shown == SH_ORIENT_PORTRAIT);
-	CHECK(sh_orient_step(&d, -g, 0, 0) == 0 && sh_orient_step(&d, -g, 0, 0) == 0);
-	CHECK(sh_orient_step(&d, -g, 0, 0) == SH_ORIENT_LANDSCAPE_L);
-	CHECK(sh_orient_step(&d, -g, 0, 0) == 0);                       /* no repeat */
+	uint64_t t = 0;
+	CHECK(sh_orient_step(&d, 0, -g, 0, t) == 0 && sh_orient_step(&d, 0, -g, 0, t += 490000) == 0);
+	CHECK(sh_orient_step(&d, 0, -g, 0, t += 10000) == SH_ORIENT_PORTRAIT);
+	CHECK(sh_orient_step(&d, -g, 0, 0, t += 10000) == 0);           /* a flick to landscape */
+	CHECK(sh_orient_step(&d, 0, -g, 0, t += 10000) == 0 && sh_orient_step(&d, 0, -g, 0, t += 600000) == 0);
+	CHECK(d.shown == SH_ORIENT_PORTRAIT);
+	CHECK(sh_orient_step(&d, -g, 0, 0, t += 10000) == 0 && sh_orient_step(&d, -g, 0, 0, t += 400000) == 0);
+	CHECK(sh_orient_step(&d, -g, 0, 0, t += 100000) == SH_ORIENT_LANDSCAPE_L);
+	CHECK(sh_orient_step(&d, -g, 0, 0, t += 10000) == 0);           /* no repeat */
+	/* landscape tilted back about 37 degrees, z jittering across 0.8 g at 100 Hz (run 43): no change reported */
+	int changes = 0;
+	for (int i = 0; i < 200; i++) {
+		changes += sh_orient_step(&d, -37450, 0, (i & 4) ? -53740 : -51118, t += 10000) != 0;
+	}
+	CHECK(changes == 1 && d.shown == SH_ORIENT_FACE_UP);            /* face up from the first crossing on, once */
+	CHECK(sh_orientation(-37450, 0, -45875, SH_ORIENT_FACE_UP) == SH_ORIENT_FACE_UP);      /* 0.7 g: still face up */
+	CHECK(sh_orientation(-g, 0, -39322, SH_ORIENT_FACE_UP) == SH_ORIENT_LANDSCAPE_L);      /* 0.6 g: out */
 	/* tilted 30 degrees back in portrait: still portrait */
 	CHECK(sh_orientation(0, -56756, -g / 2, SH_ORIENT_FACE_UP) == SH_ORIENT_PORTRAIT);
 }
