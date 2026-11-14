@@ -45,6 +45,7 @@ osfmk/arm64/mt6781_cpufreq.c	standard
 osfmk/arm64/mtk_gpu_probe.c	standard
 osfmk/arm64/mt6781_afe.c	standard
 osfmk/arm64/mt6781_scp.c	standard
+osfmk/arm64/mt6781_cam.c	standard
 osfmk/arm64/arm64_hypercall.c	standard
 osfmk/arm/io_map.c		standard
 osfmk/arm64/loose_ends.c	standard

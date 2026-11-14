@@ -258,6 +258,7 @@ extern void bq27z561_link(const char *args, char *out, size_t outLen);   /* ioki
 extern void mt6631_wifi_link(const char *args, char *out, size_t outLen);      /* bsd/dev/mt6631_wifi.c */
 extern void mtk_bt_link(const char *args, char *out, size_t outLen);           /* bsd/dev/mtk_bt.c */
 extern void mtk_torch_link(const char *args, char *out, size_t outLen);        /* bsd/dev/mtk_torch.c */
+extern void mtk_cam_link(const char *args, char *out, size_t outLen);          /* bsd/dev/mtk_cam.c */
 extern void mapple_gpu_link(const char *args, char *out, size_t outLen);       /* iokit/Kernel/arm/MappleGPU.cpp */
 extern void mt6781_cpufreq_link(const char *args, char *out, size_t outLen);   /* osfmk/arm64/mt6781_cpufreq.c */
 extern void mapple_disp_link(const char *args, char *out, size_t outLen);      /* iokit/Kernel/arm/MappleFramebuffer.cpp */
@@ -1730,6 +1731,10 @@ vl_command(void)
 		static char torch_reply[256];
 		mtk_torch_link(rest, torch_reply, sizeof(torch_reply));
 		vl_reply("%s", torch_reply);
+	} else if (IS("cam")) {
+		static char cam_reply[2048];
+		mtk_cam_link(rest, cam_reply, sizeof(cam_reply));
+		vl_reply("%s", cam_reply);
 	} else if (IS("bt")) {
 		static char bt_reply[256];
 		mtk_bt_link(rest, bt_reply, sizeof(bt_reply));
@@ -1794,7 +1799,7 @@ vl_command(void)
 			delay(5000);
 		}
 	} else if (IS("help")) {
-		vl_reply("ping | stat | peek PA [WORDS] | poke PA VALUE | pmic ADDR [N] | i2c DEV REG N | i2cw DEV REG B.. | i2c8[w] BUS DEV REG N|B.. | bat [poll|lpm on|off] | wifi [status|detect|on|wmt|fw|cap|off] | bt [status|on|up] | torch [status|on|off] | cpu [status|gov on|off|set|max ll|big|cci MHz|fast on|off] | gpu [status|mfg|on|off|regs|freq [MHz]|selftest [fault]|probe|publish] | disp [regs|scanout on|off] | push SIZE MODE FNV PATH | pull PATH | run ARGS.. | mappled ps|kill ID|tests | rewind [BYTES] | console [on|off] | panic [TEXT] | reboot\n");
+		vl_reply("ping | stat | peek PA [WORDS] | poke PA VALUE | pmic ADDR [N] | i2c DEV REG N | i2cw DEV REG B.. | i2c8[w] BUS DEV REG N|B.. | bat [poll|lpm on|off] | wifi [status|detect|on|wmt|fw|cap|off] | bt [status|on|up] | torch [status|on|off] | cam [status] | cpu [status|gov on|off|set|max ll|big|cci MHz|fast on|off] | gpu [status|mfg|on|off|regs|freq [MHz]|selftest [fault]|probe|publish] | disp [regs|scanout on|off] | push SIZE MODE FNV PATH | pull PATH | run ARGS.. | mappled ps|kill ID|tests | rewind [BYTES] | console [on|off] | panic [TEXT] | reboot\n");
 	} else {
 		vl_reply("unknown command: %s (try help)\n", c);
 	}

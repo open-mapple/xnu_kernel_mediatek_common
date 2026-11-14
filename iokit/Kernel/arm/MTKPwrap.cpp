@@ -58,6 +58,7 @@ extern "C" int mapple_rtc_read(uint64_t *secs);        /* MT6631WiFi.cpp: CONNSY
 extern "C" void mt6781_cpufreq_start(void);       /* osfmk/arm64/mt6781_cpufreq.c: CPU DVFS needs the PMIC */
 extern "C" void mtk_audio_start(void);            /* bsd/dev/mtk_audio.c: the codec and the motor are on the PMIC */
 extern "C" void mtk_scp_start(void);              /* bsd/dev/mtk_scp.c: the sensor hub (mp_sensor_steps) */
+extern "C" void mtk_cam_start(void);              /* bsd/dev/mtk_cam.c */
 
 static MTKPwrap *gMapplePwrap;
 
@@ -105,6 +106,7 @@ MTKPwrap::start(IOService *provider)
 	mt6781_cpufreq_start();
 	mtk_audio_start();
 	mtk_scp_start();
+	mtk_cam_start();
 	registerService();
 	{
 		/* the PMIC's RTC (kept by Android / LK, UTC): the calendar at boot (IOKitInitializeTime waits up to

@@ -117,6 +117,7 @@ bsd/dev/mapple_audio.c			standard
 bsd/dev/mtk_audio.c			standard
 bsd/dev/mtk_torch.c			standard
 bsd/dev/mtk_scp.c			standard
+bsd/dev/mtk_cam.c			standard
 bsd/dev/speaker_guard.c			standard
 bsd/dev/mapple_sysctl.c			standard
 bsd/dev/mem.c				standard
