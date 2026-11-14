@@ -27,8 +27,8 @@
  *      the panel itself stays powered. spaced's panel is an LCD, so once
  *      black the backlight goes to level 0 too, and back to iOS's level
  *      at on (mp_fb_bloff, 1 default; 0 leaves the backlight alone).
- *      mp_fb_blmin=N: iOS's levels 1..2047 sent as N..2047 (0 default). mp_fb_blcal=1: the
- *      panel's nits range for CoreBrightness (see mapple_fb_bl_calibration).
+ *      mp_fb_blmin=N: iOS's levels 1..2047 sent as N..2047 (0 default). mp_fb_blcal=0: no
+ *      nits range for CoreBrightness (see mapple_fb_bl_calibration).
  *   18 IsMainDisplay,
  *   28 GetDotPitch, 72 Enable/DisableNotifications [func, refcon, type, 0]
  * Everything else is accepted and logged once.
@@ -91,7 +91,7 @@
  * Brightness and Night Shift (0191). CoreBrightness sets IOMFBBrightnessLevel on this service (CFNumber, nits in 16.16
  * fixed point; SetIOMFBBrightness in CoreBrightness, iOS 16.7): the panel takes DCS 51 HH LL, 0..2047 for its
  * normal range (Xiaomi lcm_setbacklight_cmdq), sent through VM_CMD at the next vsync tick (fades coalesce);
- * mp_panel_nits (500) = the nits of level 2047; link "disp bl N". QuartzCore's color matrices arrive through
+ * mp_panel_nits (500) = the nits of level 2047; link "disp bl N", "disp blmin N". QuartzCore's color matrices arrive through
  * selector 55 (IOMobileFramebufferSetMatrix: scalar = which matrix, 9 x int64 signed 32.32, row-major); their product goes to the
  * display pipe's CCORR (0x1400b000, Xiaomi mtk_disp_ccorr.c: 3x3, 1.0 = 0x800 on MT6781, 13-bit signed, two per
  * register; CFG bit 0 relay / bit 1 engine). Identity = relay (bypass).
@@ -310,6 +310,7 @@ public:
 	uint32_t      fBlLevel;       /* last level sent; until fBlSent, LK's level, not known */
 	uint32_t      fBlOff;         /* mp_fb_bloff: backlight off while the display is */
 	uint32_t      fBlMin;         /* mp_fb_blmin: the panel level iOS's 1 is sent as */
+	bool          fBlResend;      /* "disp blmin": send fBlWant even if unchanged */
 	uint32_t      fBlResume;      /* level for when the display is on again */
 	const char   *fBlFrom;        /* who asked for fBlWant */
 	uint32_t      fBlNits16;      /* CoreBrightness's request, nits << 16 */
@@ -2367,7 +2368,7 @@ AppleCLCD::lightTick(void)
 	if (bl != 0xffffffffu) {
 		uint32_t pl = blPanel(bl);
 		uint8_t cmd[3] = { 0x51, (uint8_t)(pl >> 8), (uint8_t)pl };
-		if (bl == fBlLevel && fBlSent != 0) {
+		if (bl == fBlLevel && fBlSent != 0 && !fBlResend) {
 			blLog(bl, dark ? "display off" : fBlFrom, ": already there");
 			fBlWant = 0xffffffffu;
 		} else if (dsiSendDcs(cmd, 3, false, false)) {      /* non-blocking: a fade must not hold the frames */
@@ -2375,6 +2376,7 @@ AppleCLCD::lightTick(void)
 				fBlWant = 0xffffffffu;
 			}
 			blLog(bl, dark ? "display off" : fBlFrom, "");
+			fBlResend = false;
 			fBlLevel = bl;
 			fBlSent++;
 			if (fBacklight != NULL && !dark) {
@@ -2495,8 +2497,9 @@ AppleCLCD::backlightStart(void)
 	}
 	b->fFB = this;
 	b->setProperty("backlight-control", true);
-	uint32_t cal = 0;
-	if (PE_parse_boot_argn("mp_fb_blcal", &cal, sizeof(cal)) && cal != 0) {
+	uint32_t cal = 1;
+	PE_parse_boot_argn("mp_fb_blcal", &cal, sizeof(cal));
+	if (cal != 0) {
 		mapple_fb_bl_calibration(b, fMaxNits);
 	}
 	b->publishLevel(0x219);         /* LK's level */
@@ -3070,6 +3073,19 @@ AppleCLCD::dispCommand(const char *args, char *out, size_t len)
 		fTraceLines = 0;
 		bzero(fTraceRec, sizeof(fTraceRec));
 		disp_say(&p, end, "user client trace %s (log: \"FB: trace\", at most 400 lines)\n", fSelTrace ? "on" : "off");
+	} else if (strncmp(args, "blmin", 5) == 0) {
+		uint32_t v = 0;
+		for (const char *a = args + 5; *a != 0; a++) {
+			if (*a >= '0' && *a <= '9') {
+				v = v * 10 + (uint32_t)(*a - '0');
+			}
+		}
+		fBlMin = MIN(v, (uint32_t)PANEL_LEVEL_MAX);
+		if (fBlSent != 0 && fBlLevel != 0 && fBlWant == 0xffffffffu) {
+			fBlResend = true;       /* the current level again, through the new floor */
+			fBlWant = fBlLevel;
+		}
+		disp_say(&p, end, "iOS's levels 1..%u sent as %u..%u\n", PANEL_LEVEL_MAX, fBlMin, PANEL_LEVEL_MAX);
 	} else if (strncmp(args, "bl", 2) == 0) {
 		const char *a = args + 2;
 		while (*a == ' ') {
