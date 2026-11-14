@@ -964,7 +964,7 @@ MappleGPUAccelerator::start(IOService *provider)
 	flag = JOB_TIMEOUT_MS;
 	PE_parse_boot_argn("mp_gpu_jobms", &flag, sizeof(flag));
 	fJobTimeoutMs = flag < 1000 ? 1000 : flag > 30000 ? 30000 : flag;
-	flag = 0;
+	flag = 1;
 	PE_parse_boot_argn("mp_gpu_lostirq", &flag, sizeof(flag));
 	fRecoverIrq = flag != 0;
 	int64_t mib = GPU_MEMORY_LIMIT >> 20;
@@ -3285,8 +3285,8 @@ extern "C" int mapple_gic_describe(IOService *nub, int source, char *buf, size_t
 
 /*
  * Gated, from the job timer. Interrupt causes still set a whole tick later never reached their handlers (the job and
- * MMU lines can go silent, and then every job times out, through GPU resets). Logged with the lines' GIC state; with
- * mp_gpu_lostirq=1 handled here, then each line is switched off and on (a line left hard-disabled comes back).
+ * MMU lines can go silent, and then every job times out, through GPU resets). Logged with the lines' GIC state, then
+ * handled here and each line switched off and on (a line left hard-disabled comes back); mp_gpu_lostirq=0 only logs.
  */
 void
 MappleGPUAccelerator::lostInterrupts(void)

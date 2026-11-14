@@ -15,7 +15,7 @@
  * stopped, the chip ID checked, blocks AP, DATA and TUNING each checked
  * against the chip's DMA CRC and its last four bytes, code reset, ICE mode
  * left; then edge-palm rejection on (without it a hand holding the phone is a
- * finger at x = 0). With mp_ili_quiet=1, after QUIET_MS with the screen on
+ * finger at x = 0). Unless mp_ili_quiet=0, after QUIET_MS with the screen on
  * and no interrupt the firmware's version is asked for; with no interrupt
  * ANSWER_MS later (Android's wait for a command's INT pulse) the firmware is
  * sent again, starting with Android's reset pulse instead of the PLL wake.
@@ -24,7 +24,7 @@
  *
  * Boot-args: mp_ili_touch=0 leaves the chip alone; mp_ili_fw=<phys> is
  * mtkloader's firmware table (without it the firmware is never sent again);
- * mp_ili_quiet=1 checks a quiet chip as above; mp_touchlog=1 logs every
+ * mp_ili_quiet=0 leaves a quiet chip alone; mp_touchlog=1 logs every
  * landing and lifting.
  * ADT: spi-gpios <mosi miso clk cs>, reset-gpios <rst>, max-x, max-y (the chip's grid),
  * panel-size <w h>, interrupts/interrupt-parent (MTKEINT). GPIO registers
@@ -604,6 +604,7 @@ ILI7807S::start(IOService *provider)
 		return false;
 	}
 	PE_parse_boot_argn_alias("mp_touchlog", "touchlog", &fLog, sizeof(fLog));
+	fQuiet = 1;
 	PE_parse_boot_argn("mp_ili_quiet", &fQuiet, sizeof(fQuiet));
 	fMO = dtU32(provider, "spi-gpios", 0, 13);
 	fMI = dtU32(provider, "spi-gpios", 1, 14);
