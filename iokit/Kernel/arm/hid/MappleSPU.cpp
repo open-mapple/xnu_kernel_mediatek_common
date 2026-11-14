@@ -9,7 +9,7 @@
  *   compass        0xFF00/0x0A  uT
  *   proximity      0xFF00/0x08  detection mask, near = receiver | large body contact
  *   ambient light  0xFF00/0x04  lux, in Level
- *   orientation    0x20/0x8A    from gravity (mtk_scp_hub.h), held 500 ms, usages 0x64-0x6A, its time as a 0xFF15/2 child
+ *   orientation    0x20/0x8A    from gravity (mtk_scp_hub.h), held 300 ms, usages 0x64-0x6A, its time as a 0xFF15/2 child
  * and, with mp_sensor_steps=5, what locationd reads as vendor-defined reports (MappleSPU.h has the formats):
  *   CMA            0xFF0C/0x01  steps (StepCountUpdate) and activity (MotionStateUpdate) from the hub's step counter
  *   gesture        0xFF0C/0x03  raise to wake (detected) from the hub's pickup gesture; dismissed when it is laid

@@ -223,22 +223,35 @@ test_orientation(void)
 	/* debounced: a change counts after three samples in a row; a one-sample flick does not */
 	struct sh_orient d = { 0, 0, 0 };
 	uint64_t t = 0;
-	CHECK(sh_orient_step(&d, 0, -g, 0, t) == 0 && sh_orient_step(&d, 0, -g, 0, t += 490000) == 0);
+	CHECK(sh_orient_step(&d, 0, -g, 0, t) == 0 && sh_orient_step(&d, 0, -g, 0, t += 290000) == 0);
 	CHECK(sh_orient_step(&d, 0, -g, 0, t += 10000) == SH_ORIENT_PORTRAIT);
 	CHECK(sh_orient_step(&d, -g, 0, 0, t += 10000) == 0);           /* a flick to landscape */
 	CHECK(sh_orient_step(&d, 0, -g, 0, t += 10000) == 0 && sh_orient_step(&d, 0, -g, 0, t += 600000) == 0);
 	CHECK(d.shown == SH_ORIENT_PORTRAIT);
-	CHECK(sh_orient_step(&d, -g, 0, 0, t += 10000) == 0 && sh_orient_step(&d, -g, 0, 0, t += 400000) == 0);
+	CHECK(sh_orient_step(&d, -g, 0, 0, t += 10000) == 0 && sh_orient_step(&d, -g, 0, 0, t += 200000) == 0);
 	CHECK(sh_orient_step(&d, -g, 0, 0, t += 100000) == SH_ORIENT_LANDSCAPE_L);
 	CHECK(sh_orient_step(&d, -g, 0, 0, t += 10000) == 0);           /* no repeat */
-	/* landscape tilted back about 37 degrees, z jittering across 0.8 g at 100 Hz (run 43): no change reported */
+	/* landscape tilted back about 37 degrees, z jittering across 0.8 g at 100 Hz (run 43): stays landscape */
 	int changes = 0;
 	for (int i = 0; i < 200; i++) {
 		changes += sh_orient_step(&d, -37450, 0, (i & 4) ? -53740 : -51118, t += 10000) != 0;
 	}
-	CHECK(changes == 1 && d.shown == SH_ORIENT_FACE_UP);            /* face up from the first crossing on, once */
-	CHECK(sh_orientation(-37450, 0, -45875, SH_ORIENT_FACE_UP) == SH_ORIENT_FACE_UP);      /* 0.7 g: still face up */
-	CHECK(sh_orientation(-g, 0, -39322, SH_ORIENT_FACE_UP) == SH_ORIENT_LANDSCAPE_L);      /* 0.6 g: out */
+	CHECK(changes == 0 && d.shown == SH_ORIENT_LANDSCAPE_L);
+	/* turned from portrait to landscape held 32 degrees from flat (run 45): landscape 300 ms after, no face up */
+	struct sh_orient e = { 0, 0, 0 };
+	changes = 0;
+	for (int i = 0; i < 50; i++) {
+		changes += sh_orient_step(&e, 0, -34537, -55706, t += 10000) != 0;
+	}
+	CHECK(changes == 1 && e.shown == SH_ORIENT_PORTRAIT);
+	for (int i = 0; i < 30; i++) {
+		CHECK(sh_orient_step(&e, -34537, 0, -55706, t += 10000) == 0);
+	}
+	CHECK(sh_orient_step(&e, -34537, 0, -55706, t += 10000) == SH_ORIENT_LANDSCAPE_L);
+	CHECK(sh_orientation(0, 0, -62259, SH_ORIENT_PORTRAIT) == SH_ORIENT_FACE_UP);         /* 0.95 g: in */
+	CHECK(sh_orientation(0, -26214, -57672, SH_ORIENT_PORTRAIT) == SH_ORIENT_PORTRAIT);   /* 0.88 g: not yet */
+	CHECK(sh_orientation(-26214, 0, -55706, SH_ORIENT_FACE_UP) == SH_ORIENT_FACE_UP);     /* 0.85 g: still face up */
+	CHECK(sh_orientation(-43254, 0, -49152, SH_ORIENT_FACE_UP) == SH_ORIENT_LANDSCAPE_L); /* 0.75 g: out */
 	/* tilted 30 degrees back in portrait: still portrait */
 	CHECK(sh_orientation(0, -56756, -g / 2, SH_ORIENT_FACE_UP) == SH_ORIENT_PORTRAIT);
 }

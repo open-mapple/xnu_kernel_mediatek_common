@@ -334,7 +334,7 @@ sh_orientation(int32_t x, int32_t y, int32_t z, uint32_t last)
 
 	bool face = last == SH_ORIENT_FACE_UP || last == SH_ORIENT_FACE_DOWN;
 
-	if (az > (face ? 42598 : 52429)) {      /* in at 0.8 g, out below 0.65 g */
+	if (az > (face ? 52429 : 58982)) {      /* in at 0.9 g, out below 0.8 g */
 		return z < 0 ? SH_ORIENT_FACE_UP : SH_ORIENT_FACE_DOWN;
 	}
 	if (ay > ax + 16384) {                  /* 0.25 g */
@@ -347,7 +347,7 @@ sh_orientation(int32_t x, int32_t y, int32_t z, uint32_t last)
 }
 
 /* An orientation reaches iOS only once it has held for SH_ORIENT_HOLD_US of sample time. */
-#define SH_ORIENT_HOLD_US       500000
+#define SH_ORIENT_HOLD_US       300000
 
 struct sh_orient {
 	uint32_t shown, candidate;
