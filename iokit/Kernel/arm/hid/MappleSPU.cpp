@@ -202,6 +202,30 @@ static uint32_t gSteps, gSamplesSaid;
 static int8_t gImuAxes[3] = { 1, 2, 3 }, gMagAxes[3] = { 1, 2, 3 };
 static uint32_t gAlsDiv = 1, gStrideCm = 70, gStep3AccelUs = 20000;
 static uint32_t gAlsDefault = 100;      /* lux until the first reading: CoreBrightness takes a silent ALS as dark */
+static int32_t gAlsRaw;                 /* the hub's last light value */
+static uint32_t gAlsSaid;
+static uint64_t gAlsSaidTicks;
+
+/* What the ALS gave iOS and from what: the first 20, then one a second. */
+static void
+als_say(bool real, uint32_t lux, const char *how)
+{
+	uint64_t now = mach_absolute_time(), ns = 0;
+
+	if (gAlsSaid >= 20) {
+		absolutetime_to_nanoseconds(now - gAlsSaidTicks, &ns);
+		if (ns < 1000000000ull) {
+			return;
+		}
+	}
+	gAlsSaid++;
+	gAlsSaidTicks = now;
+	if (real) {
+		IOLog("SPU: light raw %d -> %u lux (real, %s)\n", gAlsRaw, lux, how);
+	} else {
+		IOLog("SPU: light raw none -> %u lux (default, %s)\n", lux, how);
+	}
+}
 static uint64_t gWokeTicks;             /* raise to wake detected, not yet dismissed */
 
 /* the latest of each, iOS's units (Q16), for the fusion */
@@ -330,6 +354,7 @@ MappleSPUSensor::setProperties(OSObject *properties)
 		spu_update();
 		if (fKind == SPU_ALS && fReportUs && !fLastTicks && gAlsDefault) {
 			post(IOHIDEvent::ambientLightSensorEvent(mach_absolute_time(), gAlsDefault));
+			als_say(false, gAlsDefault, "event");
 		}
 	}
 	return kIOReturnSuccess;
@@ -347,6 +372,7 @@ MappleSPUSensor::copyEvent(IOHIDEventType type, IOHIDEvent *matching __unused, I
 	}
 	if (fKind == SPU_ALS && type == kIOHIDEventTypeAmbientLightSensor && (fLastTicks || gAlsDefault)) {
 		/* the last lux the hub gave, or the default before it gave any */
+		als_say(fLastTicks != 0, fLastTicks ? fLast : gAlsDefault, "copyEvent");
 		return IOHIDEvent::ambientLightSensorEvent(fLastTicks ? fLastTicks : mach_absolute_time(),
 		           fLastTicks ? fLast : gAlsDefault);
 	}
@@ -617,12 +643,11 @@ mapple_spu_record(const struct sh_record *r, uint64_t ticks)
 		break;
 	case SH_LIGHT:
 		if ((s = gSPU[SPU_ALS]) && s->fReportUs) {
+			gAlsRaw = r->d[0];
 			s->fLast = r->d[0] < 0 ? 0 : (uint32_t)r->d[0] / gAlsDiv;
 			s->fLastTicks = ticks;
 			s->post(IOHIDEvent::ambientLightSensorEvent(ticks, s->fLast));
-			if (s->fSequence++ < 20) {
-				IOLog("SPU: light raw %d\n", r->d[0]);
-			}
+			als_say(true, s->fLast, "event");
 		}
 		break;
 	case SH_STEP_COUNTER:
