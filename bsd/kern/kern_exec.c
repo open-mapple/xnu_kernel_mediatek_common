@@ -5568,6 +5568,11 @@ bad:
  * Note:	The argument and environment vectors are user space pointers
  *		to arrays of user space pointers.
  */
+#if defined(ARM64_BOARD_CONFIG_MT6781)
+extern uint32_t mapple_inject;                  /* bsd/kern/amfi_stub.c */
+#define MAPPLE_INJECT_ENV       "DYLD_INSERT_LIBRARIES=/usr/lib/mapple/tweakloader.dylib"
+#endif
+
 __attribute__((noinline))
 static int
 exec_extract_strings(struct image_params *imgp)
@@ -5740,6 +5745,23 @@ exec_extract_strings(struct image_params *imgp)
 		imgp->ip_argspace -= new_ptr_size; /* to hold envv[] entry */
 		imgp->ip_envc++;
 	}
+
+#if defined(ARM64_BOARD_CONFIG_MT6781)
+	/* mp_inject=1, the Mapple app's jailbreak switch: the tweak loader for programs inside an .app (SpringBoard, the
+	 * apps), never daemons, after the caller's own variables; dyld takes it only where amfi_stub.c's policy allows */
+	if (mapple_inject && strnstr(imgp->ip_strings + strlen(EXECUTABLE_KEY), ".app/", MAXPATHLEN)) {
+		error = exec_add_user_string(imgp, CAST_USER_ADDR_T(MAPPLE_INJECT_ENV), UIO_SYSSPACE, TRUE);
+		if (error) {
+			goto bad;
+		}
+		if (imgp->ip_argspace < new_ptr_size) {
+			error = E2BIG;
+			goto bad;
+		}
+		imgp->ip_argspace -= new_ptr_size;
+		imgp->ip_envc++;
+	}
+#endif
 
 	/* Save space for envv[] NULL terminator */
 	if (imgp->ip_argspace < new_ptr_size) {
