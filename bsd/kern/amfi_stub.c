@@ -417,8 +417,8 @@ mapple_sandbox_syscall(struct proc *p, int call, user_addr_t arg)
 /*
  * __mac_syscall("AMFI", 90, {u64 input flags, user pointer to u64 output}): dyld's amfi_check_dyld_policy_self.
  * Without an answer dyld treats every process as restricted: no DYLD_ variables, no interposing (test tools'
- * tracing libraries). DEVELOPMENT/DEBUG kernels allow all of them but a custom shared cache; release kernels and
- * every other AMFI call answer as when no AMFI policy existed.
+ * tracing libraries). DEVELOPMENT/DEBUG kernels allow all of them but a custom shared cache, except to set-ID programs,
+ * which get none; release kernels and every other AMFI call answer as when no AMFI policy existed.
  */
 #define AMFI_SYSCALL_CHECK_DYLD_POLICY_SELF     90
 #define AMFI_DYLD_OUTPUT_ALLOW_AT_PATH                  (1ULL << 0)
@@ -430,12 +430,12 @@ mapple_sandbox_syscall(struct proc *p, int call, user_addr_t arg)
 #define AMFI_DYLD_OUTPUT_ALLOW_EMBEDDED_VARS            (1ULL << 7)
 
 static int
-amfi_stub_syscall(struct proc *p __unused, int call, user_addr_t arg)
+amfi_stub_syscall(struct proc *p, int call, user_addr_t arg)
 {
 #if DEVELOPMENT || DEBUG
 	if (call == AMFI_SYSCALL_CHECK_DYLD_POLICY_SELF) {
 		uint64_t args[2];
-		uint64_t out = AMFI_DYLD_OUTPUT_ALLOW_AT_PATH | AMFI_DYLD_OUTPUT_ALLOW_PATH_VARS |
+		uint64_t out = proc_issetugid(p) ? 0 : AMFI_DYLD_OUTPUT_ALLOW_AT_PATH | AMFI_DYLD_OUTPUT_ALLOW_PATH_VARS |
 		    AMFI_DYLD_OUTPUT_ALLOW_FALLBACK_PATHS | AMFI_DYLD_OUTPUT_ALLOW_PRINT_VARS |
 		    AMFI_DYLD_OUTPUT_ALLOW_FAILED_LIBRARY_INSERTION | AMFI_DYLD_OUTPUT_ALLOW_LIBRARY_INTERPOSING |
 		    AMFI_DYLD_OUTPUT_ALLOW_EMBEDDED_VARS;
@@ -446,6 +446,7 @@ amfi_stub_syscall(struct proc *p __unused, int call, user_addr_t arg)
 		return error;
 	}
 #else
+	(void)p;
 	(void)call;
 	(void)arg;
 #endif
