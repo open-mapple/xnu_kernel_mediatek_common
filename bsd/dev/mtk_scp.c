@@ -67,7 +67,7 @@ static int64_t offset;                  /* system counter - hub ticks (mtk_scp_h
 static int64_t mach_minus_counter;
 static uint32_t nh_seq;
 static uint32_t notifies, records, last_wp, bad_wp;      /* what the hub has pushed, for the status lines */
-static uint32_t by_type[SH_DEVICE_ORIENTATION + 1], overruns;
+static uint32_t by_type[SH_DEVICE_ORIENTATION + 1], stale;
 static uint8_t last_event;
 
 /* what the HID services want, per Android type; applied by the thread */
@@ -126,11 +126,10 @@ drain(uint32_t wp)
 		}
 		return;
 	}
-	if (sh_ring_overrun(n)) {
-		if (overruns++ < 4) {
-			printf("scp: ring overrun (rp %u, wp %u: %u records behind), skipped\n", rp, wp, n);
+	if (sh_ring_stale(n)) {
+		if (stale++ < 4) {
+			printf("scp: stale ring wp %u behind rp %u, ignored\n", wp, rp);
 		}
-		*(volatile uint32_t *)ring = wp == SH_RING_DATA ? 0 : wp;
 		return;
 	}
 	records += n;
@@ -540,8 +539,8 @@ worker(__unused void *arg, __unused wait_result_t w)
 			}
 			said_records = records;
 			printf("scp: %u s: ring rp %u wp %u size %u, %u notifications (last wp %u, event %u), %u records (by type%s), "
-			    "%u bad wp, %u overruns; to host %#x, PC %#x\n", secs, ring_word(0), ring_word(4), ring_word(8), notifies,
-			    last_wp, last_event, records, types, bad_wp, overruns, mt6781_scp_cfg(0x1c), mt6781_scp_cfg(0xb4));
+			    "%u bad wp, %u stale wp; to host %#x, PC %#x\n", secs, ring_word(0), ring_word(4), ring_word(8), notifies,
+			    last_wp, last_event, records, types, bad_wp, stale, mt6781_scp_cfg(0x1c), mt6781_scp_cfg(0xb4));
 			if (secs == 3 || secs == 6) {
 				get_data(SH_ACCEL);
 			}

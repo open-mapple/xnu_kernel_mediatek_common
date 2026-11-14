@@ -232,11 +232,11 @@ sh_ring_count(uint32_t rp, uint32_t wp)
 }
 
 /*
- * More than half the ring between rp and wp is the hub having lapped us (it writes faster than we read): those
- * records are partly overwritten, so they are skipped, not read.
+ * A wp behind rp (more than half the ring ahead, going forward) is a stale one: a notification older than records
+ * already read. We read continuously, so the hub cannot lap a 1 MiB ring; such a wp is ignored and rp stays.
  */
 static inline bool
-sh_ring_overrun(uint32_t count)
+sh_ring_stale(uint32_t count)
 {
 	return count > SH_RING_DATA / SH_REC / 2;
 }
@@ -342,6 +342,33 @@ sh_orientation(int32_t x, int32_t y, int32_t z, uint32_t last)
 		return x < 0 ? SH_ORIENT_LANDSCAPE_L : SH_ORIENT_LANDSCAPE_R;
 	}
 	return last ? last : SH_ORIENT_AMBIGUOUS;
+}
+
+/* An orientation reaches iOS only once it has held for SH_ORIENT_HOLD samples in a row (300 ms at 10 Hz). */
+#define SH_ORIENT_HOLD          3
+
+struct sh_orient {
+	uint32_t shown, candidate;
+	uint32_t held;
+};
+
+/* the orientation to report now, or 0 for no change */
+static inline uint32_t
+sh_orient_step(struct sh_orient *o, int32_t x, int32_t y, int32_t z)
+{
+	uint32_t now = sh_orientation(x, y, z, o->candidate);
+
+	if (now != o->candidate) {
+		o->candidate = now;
+		o->held = 1;
+	} else if (o->held < SH_ORIENT_HOLD) {
+		o->held++;
+	}
+	if (o->held >= SH_ORIENT_HOLD && o->candidate != o->shown) {
+		o->shown = o->candidate;
+		return o->shown;
+	}
+	return 0;
 }
 
 #endif /* _MTK_SCP_HUB_H_ */

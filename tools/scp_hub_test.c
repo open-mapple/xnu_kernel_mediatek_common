@@ -143,10 +143,12 @@ test_ring(void)
 	}
 	CHECK(seen == 5 && rp == wp);
 
-	/* the hub a little past us is fine; a wp just behind rp is a lap */
-	CHECK(!sh_ring_overrun(sh_ring_count(0, 44 * 100)));
-	CHECK(sh_ring_overrun(sh_ring_count(44 * 10, 44 * 9)));
-	CHECK(!sh_ring_overrun(sh_ring_count(44 * 10, 44 * 10)));
+	/* the hub a little past us is fine; a wp just behind rp is stale */
+	CHECK(!sh_ring_stale(sh_ring_count(0, 44 * 100)));
+	CHECK(sh_ring_stale(sh_ring_count(44 * 10, 44 * 9)));
+	CHECK(sh_ring_stale(sh_ring_count(275704, 275660)));    /* run 42's: rp one record ahead */
+	CHECK(!sh_ring_stale(sh_ring_count(44 * 10, 44 * 10)));
+	CHECK(!sh_ring_stale(sh_ring_count(SH_RING_DATA - 44, 88)));  /* across the end, ahead */
 }
 
 static void
@@ -218,6 +220,15 @@ test_orientation(void)
 	/* 45 degrees between portrait and landscape keeps the last answer */
 	CHECK(sh_orientation(-46341, -46341, 0, SH_ORIENT_PORTRAIT) == SH_ORIENT_PORTRAIT);
 	CHECK(sh_orientation(-46341, -46341, 0, SH_ORIENT_LANDSCAPE_L) == SH_ORIENT_LANDSCAPE_L);
+	/* debounced: a change counts after three samples in a row; a one-sample flick does not */
+	struct sh_orient d = { 0, 0, 0 };
+	CHECK(sh_orient_step(&d, 0, -g, 0) == 0 && sh_orient_step(&d, 0, -g, 0) == 0);
+	CHECK(sh_orient_step(&d, 0, -g, 0) == SH_ORIENT_PORTRAIT);
+	CHECK(sh_orient_step(&d, -g, 0, 0) == 0);                       /* one flick to landscape */
+	CHECK(sh_orient_step(&d, 0, -g, 0) == 0 && sh_orient_step(&d, 0, -g, 0) == 0 && d.shown == SH_ORIENT_PORTRAIT);
+	CHECK(sh_orient_step(&d, -g, 0, 0) == 0 && sh_orient_step(&d, -g, 0, 0) == 0);
+	CHECK(sh_orient_step(&d, -g, 0, 0) == SH_ORIENT_LANDSCAPE_L);
+	CHECK(sh_orient_step(&d, -g, 0, 0) == 0);                       /* no repeat */
 	/* tilted 30 degrees back in portrait: still portrait */
 	CHECK(sh_orientation(0, -56756, -g / 2, SH_ORIENT_FACE_UP) == SH_ORIENT_PORTRAIT);
 }

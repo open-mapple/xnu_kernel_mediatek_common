@@ -9,7 +9,7 @@
  *   compass        0xFF00/0x0A  uT
  *   proximity      0xFF00/0x08  detection mask, near = receiver | large body contact
  *   ambient light  0xFF00/0x04  lux, in Level
- *   orientation    0x20/0x8A    from gravity (mtk_scp_hub.h), usages 0x64-0x6A, its time as a 0xFF15/2 child
+ *   orientation    0x20/0x8A    from gravity (mtk_scp_hub.h), held 300 ms, usages 0x64-0x6A, its time as a 0xFF15/2 child
  * and, with mp_sensor_steps=5, what locationd reads as vendor-defined reports (MappleSPU.h has the formats):
  *   CMA            0xFF0C/0x01  steps (StepCountUpdate) and activity (MotionStateUpdate) from the hub's step counter
  *   gesture        0xFF0C/0x03  raise to wake (detected) from the hub's pickup gesture; dismissed when it is laid
@@ -589,8 +589,9 @@ mapple_spu_record(const struct sh_record *r, uint64_t ticks)
 			}
 		}
 		if ((s = gSPU[SPU_ORIENT]) && s->fReportUs) {
-			uint32_t o = sh_orientation(v[0], v[1], v[2], s->fLast);
-			if (o != s->fLast) {
+			static struct sh_orient debounce;
+			uint32_t o = sh_orient_step(&debounce, v[0], v[1], v[2]);
+			if (o) {
 				s->fLast = o;
 				s->fLastTicks = ticks;
 				IOHIDEvent *e = IOHIDEvent::orientationEvent(ticks, kIOHIDOrientationTypeCMUsage);
