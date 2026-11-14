@@ -63,10 +63,35 @@ static const struct {
 #define say(...) do { if (o < len) o += (size_t)snprintf(out + o, len - o, __VA_ARGS__); } while (0)
 
 /* Step 0. Under cam_lock. */
+/*
+ * The JN1's chip ID as realme reads it (return_sensor_id: 0x0000 and 0x0001 a byte each, the first the high byte),
+ * and the same two registers in one 2-byte read beside it.
+ */
+static int
+jn1_id(const char *step, char *out, size_t len, size_t *op)
+{
+	static const uint8_t r0[2] = { 0x00, 0x00 }, r1[2] = { 0x00, 0x01 };
+	uint8_t hi, lo, both[2];
+	size_t o = *op;
+	int err;
+
+	if ((err = mapple_i2c_xfer_bus(JN1_BUS, JN1_ADDR, r0, 2, &hi, 1)) != 0 ||
+	    (err = mapple_i2c_xfer_bus(JN1_BUS, JN1_ADDR, r1, 2, &lo, 1)) != 0 ||
+	    (err = mapple_i2c_xfer_bus(JN1_BUS, JN1_ADDR, r0, 2, both, 2)) != 0) {
+		say("cam: %s: JN1 (I2C%u 0x%02x): %s\n", step, JN1_BUS, JN1_ADDR, err == -1 ? "no bus" : "no answer");
+	} else {
+		say("cam: %s: JN1 chip ID %#x (%s): 0x0000 = %02x, 0x0001 = %02x; one 2-byte read gives %02x %02x\n", step,
+		    (uint32_t)hi << 8 | lo, ((uint32_t)hi << 8 | lo) == JN1_CHIP_ID ? "S5K JN1" : "not the JN1", hi, lo,
+		    both[0], both[1]);
+	}
+	*op = o;
+	return err;
+}
+
 static size_t
 status(char *out, size_t len)
 {
-	uint8_t ldo[CAM_LDO_REGS] = { 0 }, reg, id[2], idreg[2] = { 0, 0 };
+	uint8_t ldo[CAM_LDO_REGS] = { 0 }, reg;
 	size_t o = 0;
 	uint32_t n;
 	int err = 0;
@@ -102,12 +127,8 @@ status(char *out, size_t len)
 	}
 	if (n < CAM_LDO_REGS || !cam_ldo_jn1_on(ldo[CAM_LDO_EN])) {
 		say("cam: step 0: JN1 chip ID not read: its rails are not known to be on\n");
-	} else if ((err = mapple_i2c_xfer_bus(JN1_BUS, JN1_ADDR, idreg, 2, id, 2)) != 0) {
-		say("cam: step 0: JN1 (I2C%u 0x%02x): %s\n", JN1_BUS, JN1_ADDR, err == -1 ? "no bus (the device tree's i2c4)" :
-		    "no answer");
 	} else {
-		say("cam: step 0: JN1 chip ID %#x (%s)\n", (uint32_t)id[0] << 8 | id[1],
-		    ((uint32_t)id[0] << 8 | id[1]) == JN1_CHIP_ID ? "S5K JN1" : "not the JN1");
+		(void)jn1_id("step 0", out, len, &o);
 	}
 	if (o < len) {
 		o += mt6781_cam_status(out + o, len - o);
@@ -159,12 +180,12 @@ static size_t
 power(char *out, size_t len)
 {
 	const struct cam_seq *q;
-	uint8_t en0, en, now, id[2], idreg[2] = { 0, 0 };
+	uint8_t en0, en, now;
 	uint64_t t0;
 	size_t o = 0;
 	uint32_t k;
 	bool ok = false;
-	int level = -1, err;
+	int level = -1;
 
 	if (!ldo_rd(CAM_LDO_EN, &en0)) {
 		say("cam: step 1: the LDO chip (I2C%u 0x%02x) does not answer: nothing done\n", CAM_LDO_BUS, CAM_LDO_ADDR);
@@ -217,12 +238,7 @@ power(char *out, size_t len)
 	if (ok && ms_since(t0) > UP_MS) {
 		say("cam: step 1: power-up past %u ms: chip ID not read\n", UP_MS);
 	} else if (ok) {
-		if ((err = mapple_i2c_xfer_bus(JN1_BUS, JN1_ADDR, idreg, 2, id, 2)) != 0) {
-			say("cam: step 1: JN1 (I2C%u 0x%02x): %s\n", JN1_BUS, JN1_ADDR, err == -1 ? "no bus" : "no answer");
-		} else {
-			say("cam: step 1: JN1 chip ID %#x (%s)\n", (uint32_t)id[0] << 8 | id[1],
-			    ((uint32_t)id[0] << 8 | id[1]) == JN1_CHIP_ID ? "S5K JN1" : "not the JN1");
-		}
+		(void)jn1_id("step 1", out, len, &o);
 	}
 
 	/* Off: every step undone in reverse, whether it ran or not; an enable bit is only ever cleared. */
