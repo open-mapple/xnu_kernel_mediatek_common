@@ -3069,7 +3069,45 @@ spawn_coalitions_release_all(coalition_t coal[COALITION_NUM_TYPES])
 }
 #endif
 
+#if defined(ARM64_BOARD_CONFIG_MT6781)
+extern uint32_t mapple_inject;                  /* bsd/kern/amfi_stub.c */
+#endif
+
 #if CONFIG_PERSONAS
+#if defined(ARM64_BOARD_CONFIG_MT6781)
+/*
+ * Nothing creates personas here. Sileo becomes root by spawning apt, mv and the rest into persona 99 with OVERRIDE
+ * and uid 0 (RootWrapper.swift, APTWrapper.swift). With the jailbreak on (mp_inject=1), such a spawn from a caller
+ * holding the persona entitlement gets the credential it asks for, without the persona.
+ */
+static bool
+mapple_persona_missing_ok(const struct _posix_spawn_persona_info *px_persona)
+{
+	return mapple_inject && (px_persona->pspi_flags & POSIX_SPAWN_PERSONA_FLAGS_OVERRIDE) &&
+	       (px_persona->pspi_flags & POSIX_SPAWN_PERSONA_UID);
+}
+
+static void
+mapple_persona_cred_adopt(proc_t p, kauth_cred_t cred)
+{
+	__block uid_t old_ruid;
+	uid_t new_ruid = kauth_cred_getruid(cred);
+
+	proc_update_label(p, true, ^kauth_cred_t (kauth_cred_t cur_cred) {
+		old_ruid = kauth_cred_getruid(cur_cred);
+		if (cred != cur_cred) {
+		        kauth_cred_ref(cred);
+		        kauth_cred_unref(&cur_cred);
+		}
+		return cred;
+	});
+	if (new_ruid != old_ruid) {
+		(void)chgproccnt(old_ruid, -1);
+		(void)chgproccnt(new_ruid, 1);
+	}
+}
+#endif
+
 static int
 spawn_validate_persona(struct _posix_spawn_persona_info *px_persona)
 {
@@ -3088,6 +3126,11 @@ spawn_validate_persona(struct _posix_spawn_persona_info *px_persona)
 
 	persona = persona_lookup(px_persona->pspi_id);
 	if (!persona) {
+#if defined(ARM64_BOARD_CONFIG_MT6781)
+		if (mapple_persona_missing_ok(px_persona)) {
+			goto out;
+		}
+#endif
 		error = ESRCH;
 		goto out;
 	}
@@ -3112,7 +3155,11 @@ spawn_persona_adopt(proc_t p, struct _posix_spawn_persona_info *px_persona)
 	 * the kauth with a different UID/GID combo
 	 */
 	persona = persona_lookup(px_persona->pspi_id);
+#if defined(ARM64_BOARD_CONFIG_MT6781)
+	if (!persona && !mapple_persona_missing_ok(px_persona)) {
+#else
 	if (!persona) {
+#endif
 		return ESRCH;
 	}
 
@@ -3140,6 +3187,13 @@ spawn_persona_adopt(proc_t p, struct _posix_spawn_persona_info *px_persona)
 		    px_persona->pspi_gmuid);
 	}
 
+#if defined(ARM64_BOARD_CONFIG_MT6781)
+	if (!persona) {
+		mapple_persona_cred_adopt(p, cred);
+		kauth_cred_unref(&cred);
+		return 0;
+	}
+#endif
 	ret = persona_proc_adopt(p, persona, cred);
 
 	kauth_cred_unref(&cred);
@@ -5569,7 +5623,6 @@ bad:
  *		to arrays of user space pointers.
  */
 #if defined(ARM64_BOARD_CONFIG_MT6781)
-extern uint32_t mapple_inject;                  /* bsd/kern/amfi_stub.c */
 #define MAPPLE_INJECT_ENV       "DYLD_INSERT_LIBRARIES=/usr/lib/mapple/tweakloader.dylib"
 #endif
 
