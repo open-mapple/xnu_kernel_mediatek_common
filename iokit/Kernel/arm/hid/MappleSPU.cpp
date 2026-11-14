@@ -22,7 +22,7 @@
  *
  * ReportInterval (us, 0 = off) and BatchInterval (us) from iOS become the hub's rate and latency; DetectionMode
  * (0 = off) turns proximity on and off. Orientation runs the accelerometer at 10 Hz while it is on (from the start).
- * Calibration knobs: mp_imu_axes, mp_mag_axes (default 0x123: a nibble per output axis x, y, z = the hub's axis 1-3,
+ * mp_spu_prox=0 leaves the proximity service out. Calibration knobs: mp_imu_axes, mp_mag_axes (default 0x123: a nibble per output axis x, y, z = the hub's axis 1-3,
  * +8 to flip it); mp_als_div (default 100: the hub's light value per lux, alsps's vender_div); mp_stride_cm
  * (default 70).
  */
@@ -276,6 +276,10 @@ MappleSPUSensor::start(IOService *provider)
 	}
 	OSSafeReleaseNULL(plugin);
 	OSSafeReleaseNULL(path);
+	if (fKind == SPU_PROX) {
+		/* backboardd wraps only a proximity service at the top (Placement 1); any other leaves NSNull in its list */
+		setProperty("Placement", 1ull, 32);
+	}
 	registerService();
 	IOLog("SPU: %s published (0x%x/0x%x)\n", kinds[fKind].name, (unsigned)kinds[fKind].page, (unsigned)kinds[fKind].usage);
 	return true;
@@ -697,7 +701,12 @@ mapple_spu_start(uint32_t steps)
 			}
 		}
 	}
+	uint32_t prox = 1;
+	PE_parse_boot_argn("mp_spu_prox", &prox, sizeof(prox));
 	for (unsigned k = 0; k < count; k++) {
+		if (k == SPU_PROX && prox == 0) {
+			continue;
+		}
 		MappleSPUSensor *s = OSTypeAlloc(MappleSPUSensor);
 		IOService *provider = (k == SPU_ORIENT && iface) ? iface : res;
 		if (!s) {
