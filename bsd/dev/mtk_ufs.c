@@ -554,7 +554,7 @@ bootrec_volume_clear(uint64_t lba)
 	uint64_t bsize = (uint64_t)vh[40] << 24 | vh[41] << 16 | vh[42] << 8 | vh[43];
 	uint64_t total = (uint64_t)vh[44] << 24 | vh[45] << 16 | vh[46] << 8 | vh[47];
 	if ((sig != 0x482b && sig != 0x4858) || bsize == 0 || bsize * total > (lba - su.first_block) * UFS_BLOCK) {
-		printf("UFS: MAPPLEBR: volume 0x%x of %llu bytes reaches the record's block\n", sig, bsize * total);
+		printf("UFS: volume 0x%x of %llu bytes reaches block 0x%llx\n", sig, bsize * total, lba);
 		return ENOSPC;
 	}
 	return 0;
@@ -1096,9 +1096,11 @@ mtk_ufs_init(void)
  * other way to see the console, so every character that reaches the
  * console (kernel printf and /dev/console writes of daemons, both through
  * _cnputs) is also kept in a 4 MiB ring, and once the partition is known
- * and writable a thread copies new ring blocks to the LAST 4 MiB + 4 KiB of
- * the partition every mp_ufslogsecs seconds (default 10), far behind the HFS
- * image at its start. Device block 0 of that area is a header:
+ * and writable a thread copies new ring blocks to the 4 MiB + 4 KiB just
+ * before the boot-args record's last MiB every mp_ufslogsecs seconds (default
+ * 10): the end of the installer's log region, behind the HFS volume, which
+ * must end before it (checked once; else no log). Device block 0 of that
+ * area is a header:
  *   "MAPPLECL" | u32 version 1 | u32 ring size | u64 total bytes written
  *   | u64 flush sequence
  * ring offset of byte n = n % ring size. Read it from a recovery with
@@ -1167,11 +1169,18 @@ struct mapple_log_header {
 static void
 mapple_log_thread(__unused void *arg, __unused wait_result_t wr)
 {
-	uint64_t base = su.first_block + su.nblocks - MAPPLE_LOG_BLOCKS;
+	uint64_t base = su.first_block + su.nblocks - BOOTREC_TAIL_BLOCKS - MAPPLE_LOG_BLOCKS;
 	uint64_t flushed = 0, seq = 0;
 	void *bounce = (void *)(su.dma + DMA_BOUNCE);
 
-	printf("LOG: console log to the last %u KiB of the partition (block 0x%llx)\n",
+	lck_mtx_lock(&mtk_ufs_lock);
+	int clear = bootrec_volume_clear(base);
+	lck_mtx_unlock(&mtk_ufs_lock);
+	if (clear != 0) {
+		printf("LOG: no console log: block 0x%llx is not clear of the volume (%d)\n", base, clear);
+		return;
+	}
+	printf("LOG: console log to the %u KiB before the boot-args record (block 0x%llx)\n",
 	    MAPPLE_LOG_BLOCKS * UFS_BLOCK >> 10, base);
 	for (;;) {
 		(void)tsleep(&mapple_log_chan, PZERO, "mp_conlog", hz * (int)mapple_log_secs);
@@ -1221,7 +1230,7 @@ mapple_log_start(void)
 	thread_t thread;
 
 	PE_parse_boot_argn_alias("mp_conlog", "sweetlog", &on, sizeof(on));
-	if (!on || !su.writable || su.nblocks < 2 * MAPPLE_LOG_BLOCKS) {
+	if (!on || !su.writable || su.nblocks < 2 * MAPPLE_LOG_BLOCKS + BOOTREC_TAIL_BLOCKS) {
 		return;
 	}
 	PE_parse_boot_argn_alias("mp_ufslogsecs", "ufslogsecs", &mapple_log_secs, sizeof(mapple_log_secs));
