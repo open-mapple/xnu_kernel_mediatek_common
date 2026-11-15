@@ -38,6 +38,7 @@ extern "C" {
 processor_t cpu_to_processor(int cpu);
 processor_t thread_bind(processor_t processor);
 int mapple_gic_describe(IOService *nub, int source, char *buf, size_t len);
+int mapple_gic_reenable(IOService *nub, int source);
 }
 
 #define GICD_CTLR               0x0000
@@ -79,6 +80,7 @@ public:
 	virtual void enableVector(IOInterruptVectorNumber vectorNumber, IOInterruptVector *vector) APPLE_KEXT_OVERRIDE;
 
 	int describe(IOService *nub, int source, char *buf, size_t len);
+	bool reenable(IOService *nub, int source);
 
 private:
 	bool spec(IOService *nub, int source, uint32_t *intid, uint32_t *flags);
@@ -256,6 +258,7 @@ MappleGIC::handleInterrupt(void *refCon __unused, IOService *nub __unused, int s
 		vector->interruptDisabledHard = 1;
 		disableVectorHard(source, vector);
 	}
+	OSMemoryBarrier();
 	vector->interruptActive = 0;
 	return kIOReturnSuccess;
 }
@@ -282,6 +285,30 @@ mapple_gic_describe(IOService *nub, int source, char *buf, size_t len)
 	return gMappleGIC != NULL ? gMappleGIC->describe(nub, source, buf, len) : snprintf(buf, len, "no GIC");
 }
 
+/* A line IOKit thinks enabled (neither soft- nor hard-off) but the distributor has off: on again. True if it was. */
+bool
+MappleGIC::reenable(IOService *nub, int source)
+{
+	uint32_t intid, flags;
+
+	if (!spec(nub, source, &intid, &flags)) {
+		return false;
+	}
+	uint32_t bit = 1u << (intid % 32);
+	IOInterruptVector *v = &vectors[intid];
+	if (v->interruptDisabledSoft || v->interruptDisabledHard || (rd32(GICD_ISENABLER(intid)) & bit) != 0) {
+		return false;
+	}
+	wr32(GICD_ISENABLER(intid), bit);
+	return true;
+}
+
+extern "C" int
+mapple_gic_reenable(IOService *nub, int source)
+{
+	return gMappleGIC != NULL && gMappleGIC->reenable(nub, source);
+}
+
 bool
 MappleGIC::vectorCanBeShared(IOInterruptVectorNumber vectorNumber __unused, IOInterruptVector *vector __unused)
 {
@@ -294,10 +321,16 @@ MappleGIC::getVectorType(IOInterruptVectorNumber vectorNumber, IOInterruptVector
 	return fType[vectorNumber];
 }
 
+/*
+ * The disable must have reached the distributor before handleInterrupt clears interruptActive: enableInterrupt on
+ * another CPU waits only for that, and its ISENABLER write overtaking our ICENABLER left the line off at the GIC
+ * while IOKit had it on (the GPU's job line went silent).
+ */
 void
 MappleGIC::disableVectorHard(IOInterruptVectorNumber vectorNumber, IOInterruptVector *vector __unused)
 {
 	wr32(GICD_ICENABLER(vectorNumber), 1u << (vectorNumber % 32));
+	wait_rwp();
 }
 
 void

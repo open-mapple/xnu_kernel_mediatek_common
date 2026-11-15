@@ -442,6 +442,7 @@ public:
 	bool        fRecoverIrq;        /* mp_gpu_lostirq: interrupts that never came handled from the job timer */
 	uint32_t    fPrevJobStat, fPrevMmuStat;
 	uint64_t    fLostIrqs;
+	uint32_t    fReenabled;         /* job/MMU/GPU lines found off at the GIC and enabled again */
 	MappleGPUVM *firstVM(void) const { return fVMs; }  /* gated */
 	/* A BO gets a CPU mapping (user mmap): from now on it is maintained around jobs. Gated. */
 	void boMapped(MappleGPUBO *bo);

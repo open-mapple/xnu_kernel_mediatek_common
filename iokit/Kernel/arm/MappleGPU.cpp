@@ -3282,6 +3282,7 @@ MappleGPUAccelerator::logStuckJob(uint32_t slot, const char *when)
 }
 
 extern "C" int mapple_gic_describe(IOService *nub, int source, char *buf, size_t len);   /* MappleGIC.cpp */
+extern "C" int mapple_gic_reenable(IOService *nub, int source);
 
 /*
  * Gated, from the job timer. Interrupt causes still set a whole tick later never reached their handlers (the job and
@@ -3326,6 +3327,12 @@ MappleGPUAccelerator::lostInterrupts(void)
 	for (int i = 0; fPowered && i < 3; i++) {
 		fIrq[i]->disable();
 		fIrq[i]->enable();
+		/* off at the GIC with IOKit's flags on: the toggle above does not write the distributor */
+		if (mapple_gic_reenable(const_cast<IOService *>(fIrq[i]->getProvider()), fIrq[i]->getIntIndex()) &&
+		    ++fReenabled <= 8) {
+			IOLog("GPU: %s line was off at the GIC with IOKit's flags on: enabled again\n",
+			    i == 0 ? "GPU" : i == 1 ? "MMU" : "job");
+		}
 	}
 	fPrevJobStat = fPrevMmuStat = 0;
 }
