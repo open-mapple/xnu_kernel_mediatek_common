@@ -59,8 +59,7 @@ my $BUILD_DATE = `date`;
 $BUILD_DATE =~ s/[\n\t]//g;
 my $BUILD_CONFIG = "unknown";
 $BUILD_CONFIG = $ENV{'CURRENT_KERNEL_CONFIG_LC'} if defined($ENV{'CURRENT_KERNEL_CONFIG_LC'});
-my $BUILDER=`whoami`;
-$BUILDER =~ s/[\n\t]//g;
+my $BUILDER="openmapple";
 my $RC_STRING = $ENV{'RC_ProjectNameAndSourceVersion'} . "~" . $ENV{'RC_ProjectBuildVersion'} if defined($ENV{'RC_XBS'});
 
 # Handle four scenarios:
