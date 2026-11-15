@@ -27,8 +27,9 @@
  *      the panel itself stays powered. spaced's panel is an LCD, so once
  *      black the backlight goes to level 0 too, and back to iOS's level
  *      at on (mp_fb_bloff, 1 default; 0 leaves the backlight alone).
- *      mp_fb_blmin=N: iOS's levels 1..2047 sent as N..2047 (0 default). mp_fb_blcal=0: no
- *      nits range for CoreBrightness (see mapple_fb_bl_calibration).
+ *      mp_fb_blmin=N: iOS's levels 1..2047 sent as N..2047 (0 default). mp_fb_blcal=1: the
+ *      panel's nits range for CoreBrightness (see mapple_fb_bl_calibration), only with the
+ *      light sensor published.
  *   18 IsMainDisplay,
  *   28 GetDotPitch, 72 Enable/DisableNotifications [func, refcon, type, 0]
  * Everything else is accepted and logged once.
@@ -2456,6 +2457,8 @@ AppleCLCD::setMatrix(uint32_t type, const uint64_t bits[9])
  * nine numbers in 16.16, all read without a check; and backlight-marketing-table, the slider's nits in 16.16 at
  * equal steps. Without the dictionary it takes the panel as 0..1 nit, so auto-brightness never goes past 1 nit.
  * Our own numbers for this LCD: 2 nits, 30% of mp_panel_nits, mp_panel_nits; slider s -> min + (max - min) s^2.
+ * Without a light sensor, the first slider commit then aborts backboardd: CoreBrightness's slider telemetry reads
+ * its DisplayBrightness as a dictionary (NitsPhysical) while it is still the number it started as.
  */
 static void
 mapple_fb_bl_calibration(IOService *b, uint32_t maxNits)
@@ -2497,9 +2500,8 @@ AppleCLCD::backlightStart(void)
 	}
 	b->fFB = this;
 	b->setProperty("backlight-control", true);
-	uint32_t cal = 1;
-	PE_parse_boot_argn("mp_fb_blcal", &cal, sizeof(cal));
-	if (cal != 0) {
+	uint32_t cal = 0;
+	if (PE_parse_boot_argn("mp_fb_blcal", &cal, sizeof(cal)) && cal != 0) {
 		mapple_fb_bl_calibration(b, fMaxNits);
 	}
 	b->publishLevel(0x219);         /* LK's level */
