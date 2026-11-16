@@ -613,7 +613,6 @@ AppleCLCD::start(IOService *provider)
 
 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
 	setProperty("external", false);
-	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
 	setProperty("IOMFBBrightnessLevel", (unsigned long long)(200u << 16), 32);     /* 0191: 200 nits until set */
 	if (fHzMode != 60) {
 		/*
