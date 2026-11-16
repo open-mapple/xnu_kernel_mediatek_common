@@ -1386,10 +1386,21 @@ host_set_atm_diagnostic_flag(host_t host, uint32_t diagnostic_flag)
 kern_return_t
 host_set_multiuser_config_flags(host_priv_t host_priv, uint32_t multiuser_config)
 {
-#if !defined(XNU_TARGET_OS_OSX)
+	/*
+	 * MT6781 builds as macOS but runs iOS: usermanagerd puts the foreground user here, and without it UserManagement
+	 * lists no personas, so fileproviderd keeps the persona-bound Local Storage disabled. mp_multiuser=0: refused.
+	 */
+#if !defined(XNU_TARGET_OS_OSX) || defined(ARM64_BOARD_CONFIG_MT6781)
 	if (host_priv == HOST_PRIV_NULL) {
 		return KERN_INVALID_ARGUMENT;
 	}
+#if defined(ARM64_BOARD_CONFIG_MT6781)
+	int on = 1;
+	PE_parse_boot_argn("mp_multiuser", &on, sizeof(on));
+	if (!on) {
+		return KERN_NOT_SUPPORTED;
+	}
+#endif
 
 	/*
 	 * multiuser bit is extensively used for sharedIpad mode.
