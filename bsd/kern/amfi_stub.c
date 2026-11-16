@@ -499,8 +499,12 @@ static const struct mac_policy_ops amfi_stub_mac_ops = {
  * -> mac_priv_grant); on iOS Sandbox/AMFI grant them. Without a grant UIKit
  * apps die in CoreAnimation setup: work_interval_create(CA_CLIENT) needs
  * PRIV_WORK_INTERVAL ("Failed to create work interval", SpringBoard).
- * Grant that one; log the first denial of each other privilege per process.
+ * Grant that one, and a Skywalk user pipe to bluetoothd when it is entitled to
+ * register one (its A2DP audio pipe; mp_sbx_upipe=0: refused). Log the first
+ * denial of each other privilege per process.
  */
+static TUNABLE(uint32_t, mapple_sbx_upipe, "mp_sbx_upipe", 1);
+
 #define MAPPLE_PRIV_LOG_MAX      64
 static struct {
 	int  priv;
@@ -516,6 +520,14 @@ mapple_sandbox_priv_grant(kauth_cred_t cred __unused, int priv)
 	}
 	char name[20];
 	proc_selfname(name, sizeof(name));
+	if (priv == PRIV_SKYWALK_REGISTER_USER_PIPE && mapple_sbx_upipe && strcmp(name, "bluetoothd") == 0 &&
+	    mapple_entitlements_bool(mapple_proc_entitlements(current_proc()), "com.apple.private.skywalk.register-user-pipe")) {
+		static int granted;
+		if (!granted++) {
+			printf("Sandbox: %s privilege %d granted\n", name, priv);
+		}
+		return 0;
+	}
 	for (int i = 0; i < mapple_priv_logged_count; i++) {
 		if (mapple_priv_logged[i].priv == priv &&
 		    strncmp(mapple_priv_logged[i].name, name, sizeof(name)) == 0) {
