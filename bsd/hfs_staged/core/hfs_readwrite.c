@@ -73,6 +73,7 @@
 #include	"BTreesInternal.h"
 #include	"hfs_cnode.h"
 #include	"hfs_dbg.h"
+#include	"hfs_fpfs.h"
 
 #if HFS_CONFIG_KEY_ROLL
 #include	"hfs_key_roll.h"
@@ -1650,6 +1651,96 @@ out_unlock:
 	return 0;
 }
 
+static int
+hfs_fpfs_marked(void *arg, uint32_t id, int *is)
+{
+	size_t size = 0;
+	struct vnop_getxattr_args args = {
+		.a_name = HFS_SYNC_ROOT_XATTR,
+		.a_size = &size,
+	};
+	int error = hfs_getxattr_internal(NULL, &args, arg, id);
+
+	*is = (error == 0);
+	return (error == ENOATTR) ? 0 : error;
+}
+
+static int
+hfs_fpfs_parent(void *arg, uint32_t id, uint32_t *parent)
+{
+	struct hfsmount *hfsmp = arg;
+	struct cat_desc desc;
+	int lockflags, error;
+
+	lockflags = hfs_systemfile_lock(hfsmp, SFL_CATALOG, HFS_SHARED_LOCK);
+	error = cat_idlookup(hfsmp, id, 0, 0, &desc, NULL, NULL);
+	hfs_systemfile_unlock(hfsmp, lockflags);
+	if (error == 0) {
+		*parent = desc.cd_parentcnid;
+		cat_releasedesc(&desc);
+	}
+	return error;
+}
+
+static int
+hfs_fpfs_sync_root(struct hfsmount *hfsmp, struct vnode *vp, struct vnop_ioctl_args *ap)
+{
+	static const uint8_t mark = 1;
+	struct cnode *cp = VTOC(vp);
+	cnid_t parent;
+	uint64_t found;
+	uint32_t v;
+	int is, error;
+
+	if (VNODE_IS_RSRC(vp)) {
+		return EPERM;
+	}
+	if (ap->a_command == FPFS_NEAREST_SYNC_ROOT) {
+		if ((error = hfs_lock(cp, HFS_SHARED_LOCK, HFS_LOCK_DEFAULT))) {
+			return error;
+		}
+		parent = cp->c_parentcnid;
+		hfs_unlock(cp);
+		error = hfs_fpfs_nearest_sync_root(parent, hfsmp, hfs_fpfs_marked, hfs_fpfs_parent, &found);
+		bcopy(&found, ap->a_data, sizeof(found));
+		return error;
+	}
+	if ((error = hfs_fpfs_marked(hfsmp, cp->c_fileid, &is))) {
+		return error;
+	}
+	if (ap->a_command == FPFS_GET_SYNC_ROOT) {
+		v = (uint32_t)is;
+		bcopy(&v, ap->a_data, sizeof(v));
+		return 0;
+	}
+	bcopy(ap->a_data, &v, sizeof(v));
+	if ((v != 0) == is) {
+		return 0;
+	}
+	if (hfsmp->hfs_flags & HFS_READ_ONLY) {
+		return EROFS;
+	}
+	if ((error = vnode_authorize(vp, NULL, KAUTH_VNODE_WRITE_EXTATTRIBUTES, ap->a_context))) {
+		return error;
+	}
+	if (v != 0) {
+		if ((error = hfs_lock(cp, HFS_EXCLUSIVE_LOCK, HFS_LOCK_DEFAULT))) {
+			return error;
+		}
+		error = hfs_xattr_write(vp, HFS_SYNC_ROOT_XATTR, &mark, sizeof(mark));
+		hfs_unlock(cp);
+	} else {
+		struct vnop_removexattr_args args = {
+			.a_vp = vp,
+			.a_name = HFS_SYNC_ROOT_XATTR,
+			.a_context = ap->a_context,
+		};
+		error = hfs_vnop_removexattr(&args);
+	}
+	printf("hfs: sync root %s on file ID %u: %d\n", v ? "marked" : "cleared", cp->c_fileid, error);
+	return error;
+}
+
 /*
  * Control filesystem operating characteristics.
  */
@@ -3071,6 +3162,38 @@ fail_change_next_allocation:
 
 	case FSIOC_CAS_BSDFLAGS:
 		return hfs_cas_bsdflags(hfsmp, vp, ap);
+
+	case FPFS_SET_SYNC_ROOT:
+	case FPFS_GET_SYNC_ROOT:
+	case FPFS_NEAREST_SYNC_ROOT:
+		if (!(hfs_mp_fsfp & MP_FSFP_SYNC_ROOT)) {
+			return ENOTTY;
+		}
+		return hfs_fpfs_sync_root(hfsmp, vp, ap);
+
+	case APFSIOC_MAINTAIN_DIR_STATS:
+		/* APFS's answers: a folder 0, anything else EINVAL (FileProvider takes EINVAL as "no stats here") */
+		if (!(hfs_mp_fsfp & MP_FSFP_DIR_STATS)) {
+			return ENOTTY;
+		}
+		return vnode_isdir(vp) ? 0 : EINVAL;
+
+	case FPFS_GET_PURGEABLE_FLAGS:
+	case FPFS_MARK_PURGEABLE: {
+		/* HFS+ has no purgeable files: no flags to report, and unmarking is all there is to answer */
+		uint64_t flags;
+
+		if (!(hfs_mp_fsfp & MP_FSFP_PURGEABLE)) {
+			return ENOTTY;
+		}
+		bcopy(ap->a_data, &flags, sizeof(flags));
+		if (ap->a_command == FPFS_MARK_PURGEABLE) {
+			return (flags == 0) ? 0 : ENOTTY;
+		}
+		flags = 0;
+		bcopy(&flags, ap->a_data, sizeof(flags));
+		return 0;
+	}
 
 	default:
 		return (ENOTTY);

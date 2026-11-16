@@ -21,6 +21,7 @@
 #include "hfs.h"
 #include "hfs_cnode.h"
 #include "hfs_dbg.h"
+#include "hfs_fpfs.h"
 #include "hfs_iokit.h"
 #include "hfs_encodings/hfs_encodings_internal.h"
 
@@ -31,6 +32,8 @@ bool panic_on_assert;
 #if DEBUG
 bool hfs_corruption_panics = true;
 #endif
+
+uint32_t hfs_mp_fsfp;
 
 extern struct vnodeopv_desc hfs_vnodeop_opv_desc;
 extern struct vnodeopv_desc hfs_specop_opv_desc;
@@ -51,6 +54,8 @@ hfs_staged_register(void)
 #if DEBUG
 	PE_parse_boot_argn("hfs_corruption_panics", &hfs_corruption_panics, sizeof(hfs_corruption_panics));
 #endif
+
+	PE_parse_boot_argn("mp_fsfp", &hfs_mp_fsfp, sizeof(hfs_mp_fsfp));
 
 	/* The HFSEncodings kext's start(): its converters must exist before any mount. */
 	hfs_converterinit();
