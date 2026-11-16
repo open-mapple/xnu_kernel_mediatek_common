@@ -19,8 +19,10 @@
  * mp_audio_below (default 160 = 20 dB, at most 90 dB) how far under Android's level the speaker stays (Darwin's volume
  * is under that); mp_audio_gain (default 0, at most 12 dB) the guard's gain; mp_audio_secs (default 5) for steps 1-3.
  *
- * Boot-arg mp_audio_rcv=1 (default 0): first, the tone 5 s on the earpiece (the codec's handset driver from DAC L, no
- * amplifier) at RCV_FIRST, 10 dB under Android's handset gain; the speaker's steps after it.
+ * Boot-arg mp_audio_rcv (default 0), bits: 1 first, the tone 5 s on the earpiece (the codec's handset driver from DAC L,
+ * no amplifier) at RCV_FIRST, 10 dB under Android's handset gain; the speaker's steps after it. 2 with step 4, iOS's
+ * earpiece route: what the plug-in says plays on the earpiece (MAPPLE_AUDIO_SET_ROUTE) does, at RCV_FIRST, Darwin's
+ * volume in the samples; without it, it plays on the speaker.
  *
  * Boot-arg mp_vib_steps (default 2; 0 on a safe boot): 0 status; 1 one 100 ms buzz at Android's VIBR voltage;
  * 2 /dev/mapple-haptic runs the motor while iOS's haptic waveform is loud enough: at least 30 ms (Android's vib_timer),
@@ -594,6 +596,7 @@ take(int16_t *frames, uint32_t n, bool tone)
 }
 
 static uint32_t lol_now = LOL_QUIETEST;
+static bool on_receiver;        /* iOS plays on the earpiece: the line-out and the amplifier are down */
 
 /* One round: DL1's ring topped up to AHEAD bytes; the volume set where it changed. */
 static void
@@ -622,14 +625,14 @@ feed(bool tone)
 	}
 	(void)mapple_audio_volume(&darwin, &muted, &gen);
 	uint32_t below = below_base + (tone ? 0 : darwin), code = mtk_audio_lol_code(below);
-	if (code != lol_now) {
+	if (code != lol_now && !on_receiver) {
 		if (mtk_pwrap_write_audio(0x248a, 0x001f, code) == 0) {      /* LOL: the speaker's */
 			lol_now = code;
 		}
 		(void)mtk_pwrap_write_audio(0x248a, 0x0f80, code << 7);
 	}
 	digital = (int32_t)below - (int32_t)(lol_now - LOL_ANDROID) * 8;   /* (the line-out as it is, if a change failed) */
-	factor = speaker_guard_amplitude(digital > 0 ? (uint32_t)digital : 0);
+	factor = on_receiver ? (uint64_t)1 << 30 : speaker_guard_amplitude(digital > 0 ? (uint32_t)digital : 0);
 	if (pa_on) {
 		speaker_guard_attenuation((lol_now - LOL_ANDROID) * 8);
 	}
@@ -642,7 +645,9 @@ feed(bool tone)
 		for (uint32_t i = 0; i < 2 * n; i++) {
 			frames[i] = muted ? 0 : (int16_t)((int64_t)frames[i] * (int64_t)factor >> 30);
 		}
-		speaker_guard_process(frames, n);
+		if (!on_receiver) {
+			speaker_guard_process(frames, n);
+		}
 		for (uint32_t i = 0; i < n; i++) {
 			dl[dl_write / 4] = (uint16_t)frames[2 * i] | (uint32_t)(uint16_t)frames[2 * i + 1] << 16;
 			dl_write = (dl_write + 4) % dl_bytes;
@@ -834,12 +839,58 @@ pa_wait(uint32_t n)
 
 /* ---- the steps ---- */
 
+/*
+ * iOS's earpiece route: speaker and earpiece are exclusive (Android's LOL and RCV muxes), so the amplifier and the
+ * line-out go down before the earpiece comes up, and the earpiece before the line-out (the amplifier then follows the
+ * sound as before). An earpiece that does not come up leaves the speaker for the rest of the boot.
+ */
+static void
+route_poll(void)
+{
+	static bool failed_rcv, said_off;
+	bool want = mapple_audio_route() == MAPPLE_AUDIO_ROUTE_RECEIVER;
+
+	if (want && !(rcv & 2)) {
+		if (!said_off) {
+			said_off = true;
+			printf("audio: iOS asks for the earpiece; mp_audio_rcv has no 2: the speaker plays it\n");
+		}
+		return;
+	}
+	if (want == on_receiver || (want && failed_rcv)) {
+		return;
+	}
+	if (want) {
+		if (pa_on) {
+			pa_off();
+		}
+		lineout_down();
+		if (receiver_up(RCV_FIRST)) {
+			on_receiver = true;
+			printf("audio: iOS plays on the earpiece: pmic 0x2414 %04x 0x248e %04x 0x2408 %04x 0x2416 %04x (Android: 009b, "
+			    "0001, xxx9, 0010)\n", pmic(0x2414), pmic(0x248e), pmic(0x2408), pmic(0x2416));
+			return;
+		}
+		failed_rcv = true;
+		printf("audio: the earpiece did not come up: the speaker for the rest of this boot\n");
+	}
+	receiver_down();
+	on_receiver = false;
+	(void)lineout_up(lol_now);
+	printf("audio: iOS plays on the speaker\n");
+}
+
 /* mp_audio_rcv: the tone on the earpiece, everything else down, then all down again for the speaker's steps. */
 static void
 receiver_test(void)
 {
 	uint64_t second, end;
-	bool afe = mt6781_afe_up(), codec = afe && codec_up(), up = codec && receiver_up(RCV_FIRST);
+	bool afe = mt6781_afe_up(), codec = afe && codec_up(), up;
+
+	if (codec) {
+		lineout_down();         /* the line-out can be found on from before: the earpiece wants its mux closed */
+	}
+	up = codec && receiver_up(RCV_FIRST);
 	bool dl1 = up && mt6781_afe_dl1_start(&dl, &dl_bytes);
 
 	nanoseconds_to_absolutetime(NSEC_PER_SEC, &second);
@@ -873,7 +924,7 @@ audio_thread(__unused void *arg, __unused wait_result_t w)
 		goto out;
 	}
 	speaker_guard_configure(true, gain);
-	if (rcv && steps >= 2) {
+	if ((rcv & 1) && steps >= 2) {
 		receiver_test();
 	}
 	afe = mt6781_afe_up();
@@ -900,9 +951,10 @@ audio_thread(__unused void *arg, __unused wait_result_t w)
 		/* iOS: for good. The amplifier on with the first sound, off after 3 s without. */
 		mapple_audio_set_sink("the speaker", sink);
 		for (;;) {
+			route_poll();
 			feed(false);
 			if (!pa_on && last_sound != 0 && mach_absolute_time() - last_sound < second && mach_absolute_time() >= retry &&
-			    pa_failures < 3) {
+			    pa_failures < 3 && !on_receiver) {
 				speaker_guard_attenuation((lol_now - LOL_ANDROID) * 8);
 				if (pa_start()) {
 					printf("audio: playing\n");

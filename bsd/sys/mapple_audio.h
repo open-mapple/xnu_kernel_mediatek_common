@@ -37,6 +37,11 @@ struct mapple_audio_volume {
 };
 #define MAPPLE_AUDIO_SET_VOLUME _IOW('r', 1, struct mapple_audio_volume)
 
+/* ioctl(MAPPLE_AUDIO_SET_ROUTE): where what is written plays, the speaker or the earpiece (the port Darwin has chosen). */
+#define MAPPLE_AUDIO_ROUTE_SPEAKER      0
+#define MAPPLE_AUDIO_ROUTE_RECEIVER     1
+#define MAPPLE_AUDIO_SET_ROUTE  _IOW('r', 2, uint32_t)
+
 #ifdef KERNEL
 #include <stdbool.h>
 
@@ -51,6 +56,7 @@ typedef uint32_t (*mapple_audio_sink_t)(const int16_t *frames, uint32_t count);
 void mapple_audio_set_sink(const char *name, mapple_audio_sink_t sink);
 /* The volume Darwin has set last (MAPPLE_AUDIO_SET_VOLUME): false if it has set none; *generation counts the settings. */
 bool mapple_audio_volume(uint32_t *below, bool *muted, uint32_t *generation);
+uint32_t mapple_audio_route(void);     /* MAPPLE_AUDIO_SET_ROUTE's last, MAPPLE_AUDIO_ROUTE_SPEAKER until one */
 /* /dev/mapple-mic: a source gives up to `count' samples (48 kHz, one channel) and says how many; it must not wait. */
 typedef uint32_t (*mapple_audio_source_t)(int16_t *samples, uint32_t count);
 void mapple_audio_set_source(const char *name, mapple_audio_source_t source);

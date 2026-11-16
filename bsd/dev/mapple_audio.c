@@ -36,6 +36,7 @@ static mapple_audio_source_t source;
 static const char *source_name = "silence";
 static uint32_t volume_below, volume_generation;
 static bool volume_muted, volume_set;
+static uint32_t route;                  /* MAPPLE_AUDIO_ROUTE_*: the plug-in's real-time thread sets it, so no lock */
 static uint64_t frames_in, frames_taken, haptic_writes, mic_frames, mic_heard;
 static unsigned haptic_said, sound_said;
 static uint32_t second_peak;
@@ -279,13 +280,27 @@ audio_read(dev_t dev, struct uio *uio, __unused int ioflag)
 	return 0;
 }
 
+uint32_t
+mapple_audio_route(void)
+{
+	return __atomic_load_n(&route, __ATOMIC_RELAXED);
+}
+
 static int
 audio_ioctl(dev_t dev, u_long cmd, caddr_t data, __unused int flag, __unused struct proc *p)
 {
 	struct mapple_audio_volume v;
-	uint32_t below;
+	uint32_t below, to;
 	bool muted, changed;
 
+	if (minor(dev) == NODE_AUDIO && cmd == MAPPLE_AUDIO_SET_ROUTE) {
+		bcopy(data, &to, sizeof(to));
+		if (to != MAPPLE_AUDIO_ROUTE_SPEAKER && to != MAPPLE_AUDIO_ROUTE_RECEIVER) {
+			return EINVAL;
+		}
+		__atomic_store_n(&route, to, __ATOMIC_RELAXED);
+		return 0;
+	}
 	if (minor(dev) != NODE_AUDIO || cmd != MAPPLE_AUDIO_SET_VOLUME) {
 		return ENOTTY;
 	}
