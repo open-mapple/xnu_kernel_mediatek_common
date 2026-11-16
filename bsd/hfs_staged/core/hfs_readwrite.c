@@ -3178,6 +3178,16 @@ fail_change_next_allocation:
 		}
 		return vnode_isdir(vp) ? 0 : EINVAL;
 
+	case APFSIOC_DIR_STATS_OP:
+		/*
+		 * APFS's answers for a folder without statistics and for a file. FileProvider's folder handles
+		 * (fpfs_fgethandle, under every open by ID) take only ENOTSUP and then use the folder's own gen count.
+		 */
+		if (!(hfs_mp_fsfp & MP_FSFP_DIR_STATS_OP)) {
+			return ENOTTY;
+		}
+		return vnode_isdir(vp) ? ENOTSUP : EINVAL;
+
 	case FPFS_GET_PURGEABLE_FLAGS:
 	case FPFS_MARK_PURGEABLE: {
 		/* HFS+ has no purgeable files: no flags to report, and unmarking is all there is to answer */

@@ -18,10 +18,21 @@
 #define FPFS_MARK_PURGEABLE         _IOWR('J', 68, uint64_t)    /* 0 unmarks */
 #define FPFS_GET_PURGEABLE_FLAGS    _IOR('J', 71, uint64_t)
 
+/* 'J' 32 as APFS on the Mac fills it for a folder that keeps statistics ('J' 2): op 1 in, the rest out */
+struct fpfs_dir_stats_op {
+	uint64_t op;
+	uint64_t unknown;           /* 0 */
+	uint64_t num_children;      /* files and folders below, at any depth */
+	uint64_t total_size;        /* their allocated bytes */
+	uint64_t gen_count;         /* bumped by any write, create, rename or delete below; starts at 1 */
+};
+#define APFSIOC_DIR_STATS_OP        _IOWR('J', 32, struct fpfs_dir_stats_op)
+
 #define MP_FSFP_SYNC_ROOT   0x1     /* 'J' 72 and 74, the mark kept in HFS_SYNC_ROOT_XATTR */
 #define MP_FSFP_DIR_STATS   0x2     /* 'J' 2 answers 0 for a folder, EINVAL for anything else */
 #define MP_FSFP_PURGEABLE   0x4     /* 'J' 71 answers "not purgeable", 'J' 68 unmarking answers 0 */
 #define MP_FSFP_RENAME_SWAP 0x8     /* RENAME_SWAP as three renames (hfs_vnop_renamex) */
+#define MP_FSFP_DIR_STATS_OP 0x20   /* 'J' 32 answers ENOTSUP for a folder (no statistics kept), EINVAL for anything else */
 
 /* Hidden from listxattr and refused to setxattr/removexattr by the kernel's com.apple.system. rule. */
 #define HFS_SYNC_ROOT_XATTR "com.apple.system.mapple.syncroot"
