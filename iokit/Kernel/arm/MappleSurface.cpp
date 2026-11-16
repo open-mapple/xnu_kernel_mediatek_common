@@ -789,6 +789,12 @@ mapple_surface_fill_result(MappleSurface *s, MappleSurfaceRef *ref, uint8_t *out
 	put32(out, 0x44, s->cacheMode);
 	put32(out, 0x50, s->parentID);
 	put32(out, 0x54, 1);
+	static int planeRowOn = -1;
+	if (planeRowOn < 0) {
+		int v = 1;
+		PE_parse_boot_argn("mp_surface_bpr", &v, sizeof(v));
+		planeRowOn = v != 0;
+	}
 	for (uint32_t i = 0; i < s->planeCount; i++) {
 		uint8_t *p = out + 0x68 + i * 0x80;
 		const struct mapple_surface_plane *pl = &s->planes[i];
@@ -796,6 +802,11 @@ mapple_surface_fill_result(MappleSurface *s, MappleSurfaceRef *ref, uint8_t *out
 		put32(p, 0x04, pl->height);
 		put32(p, 0x08, pl->bytesPerRow);
 		put32(p, 0x0c, pl->offset);
+		/* IOSurfaceGetBytesPerRowOfPlane reads +0x10 (0 left there broke every planar surface);
+		 * mp_surface_bpr=0: only +0x08, as before */
+		if (planeRowOn) {
+			put32(p, 0x10, pl->bytesPerRow);
+		}
 		put32(p, 0x14, pl->size);
 		memcpy(p + 0x18, &pl->bytesPerElement, 2);
 		p[0x1a] = pl->elementWidth;
