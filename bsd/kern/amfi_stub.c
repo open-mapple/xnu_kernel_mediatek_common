@@ -446,10 +446,11 @@ mapple_in_app(proc_t p)
 }
 
 /*
- * mp_fpd=1, Mapple's Files test: fileproviderd alone gets the release answer below, so dyld takes the library
- * kern_exec.c puts into it (it shows FileProvider the /private/var volume as APFS). Nothing else changes.
+ * The Files volume library, on unless mp_fpd=0: fileproviderd alone gets the release answer below, so dyld takes the
+ * library kern_exec.c puts into it (it shows FileProvider the /private/var volume as APFS). It is the one library the
+ * release puts into a process. Nothing else changes.
  */
-TUNABLE(uint32_t, mapple_fpd, "mp_fpd", 0);
+TUNABLE(uint32_t, mapple_fpd, "mp_fpd", 1);
 const char mapple_fpd_path[] = "/System/Library/Frameworks/FileProvider.framework/Support/fileproviderd";
 
 #if !(DEVELOPMENT || DEBUG)

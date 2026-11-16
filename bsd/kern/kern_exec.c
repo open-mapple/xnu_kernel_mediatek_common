@@ -5809,7 +5809,8 @@ exec_extract_strings(struct image_params *imgp)
 #if defined(ARM64_BOARD_CONFIG_MT6781)
 	/* mp_inject=1, the Mapple app's jailbreak switch: the tweak loader for programs inside an .app (SpringBoard, the
 	 * apps), never daemons, after the caller's own variables; dyld takes it only where amfi_stub.c's policy allows.
-	 * mp_fpd=1, Mapple's Files test: the volume library for fileproviderd alone. */
+	 * The Files volume library, on unless mp_fpd=0: into fileproviderd alone, the one library the release puts into a
+	 * process. */
 	if (mapple_inject && strnstr(mapple_exec, ".app/", MAXPATHLEN)) {
 		mapple_env = MAPPLE_INJECT_ENV;
 	} else if (mapple_fpd && strncmp(mapple_exec, mapple_fpd_path, MAXPATHLEN) == 0) {
