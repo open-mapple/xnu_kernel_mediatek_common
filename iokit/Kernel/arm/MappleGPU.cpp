@@ -2727,8 +2727,9 @@ MappleGPUAccelerator::completeJob(uint32_t slot, IOReturn error, uint32_t status
 			bytes += bo->cacheOp(0, 0, kMappleCacheFlush);
 		} else if (bo->lazySurface && mapple_gpu_surf_maint != 2) {
 			mapple_surface_device_wrote(bo->surface);                /* dropped at the next IOSurfaceLock */
-			if (mapple_gpu_surf_maint == 1) {
-				bytes += mapple_surface_before_cpu_access(bo->surface);    /* or at once */
+			if (mapple_gpu_surf_maint == 1 || bo->surface->client) {
+				/* or at once; the creator of a client surface reads its pages without IOSurfaceLock */
+				bytes += mapple_surface_before_cpu_access(bo->surface);
 			}
 		}
 	}

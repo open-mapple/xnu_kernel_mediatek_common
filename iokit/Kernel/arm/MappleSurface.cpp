@@ -43,6 +43,7 @@
  * (logged once per selector).
  */
 #include "MappleSurface.h"
+#include "MappleSurfaceAddress.h"
 
 #if defined(MT6781)
 #include <IOKit/IOService.h>
@@ -154,6 +155,9 @@ MappleSurface::free()
 		OSAddAtomic64(-(SInt64)allocSize, (volatile SInt64 *)&mapple_surface_contig);
 	}
 	OSSafeReleaseNULL(kernelMap);
+	if (client && memory != NULL) {
+		memory->complete();
+	}
 	OSSafeReleaseNULL(memory);
 	if (poolSlot >= 0) {
 		/* the pool keeps its own reference: the buffer is free again once the surface's is gone */
@@ -175,21 +179,30 @@ MappleSurface::kernelAddress()
 	}
 	IOLockLock(mapple_surface_lock);
 	if (kernelMap == NULL && memory != NULL) {
-		kernelMap = memory->map(kIOMapWriteCombineCache);
+		kernelMap = memory->map(client ? kIOMapDefaultCache : kIOMapWriteCombineCache);
 	}
 	IOLockUnlock(mapple_surface_lock);
 	return kernelMap != NULL ? (uintptr_t)kernelMap->getVirtualAddress() : 0;
+}
+
+/* Buffer surfaces and the creator's pages are cacheable; physical (panel) memory is write-combined. */
+static bool
+mapple_surface_cacheable(MappleSurface *s)
+{
+	return s->client || OSDynamicCast(IOBufferMemoryDescriptor, s->memory) != NULL;
 }
 
 /* Clean + invalidate (dc civac: never loses a CPU write) the whole surface, through the kernel mapping. */
 static uint64_t
 mapple_surface_clean(MappleSurface *s)
 {
-	IOBufferMemoryDescriptor *buffer = OSDynamicCast(IOBufferMemoryDescriptor, s->memory);
-	if (buffer == NULL) {
-		return 0;               /* physical (panel) memory: write-combined, nothing cached */
+	if (!mapple_surface_cacheable(s)) {
+		return 0;
 	}
-	uintptr_t p = (uintptr_t)buffer->getBytesNoCopy(), end = p + buffer->getLength();
+	uintptr_t p = s->kernelAddress(), end = p + s->memory->getLength();
+	if (p == 0) {
+		return 0;
+	}
 	for (uintptr_t line = p & ~(uintptr_t)63; line < end; line += 64) {
 		__asm__ volatile ("dc civac, %0" : : "r"(line) : "memory");
 	}
@@ -200,7 +213,8 @@ mapple_surface_clean(MappleSurface *s)
 uint64_t
 mapple_surface_before_device_read(MappleSurface *s)
 {
-	return OSCompareAndSwap(1, 0, &s->cpuDirty) ? mapple_surface_clean(s) : 0;
+	/* the creator writes its own pages without IOSurfaceLock: always cleaned */
+	return OSCompareAndSwap(1, 0, &s->cpuDirty) || s->client ? mapple_surface_clean(s) : 0;
 }
 
 /* New contents for whoever compares seeds (the Metal driver copies a surface in again only when it moved). */
@@ -216,7 +230,7 @@ mapple_surface_seed_bump(MappleSurface *s)
 void
 mapple_surface_cpu_wrote(MappleSurface *s)
 {
-	if (OSDynamicCast(IOBufferMemoryDescriptor, s->memory) != NULL) {
+	if (mapple_surface_cacheable(s)) {
 		OSCompareAndSwap(0, 1, &s->cpuDirty);
 	}
 	mapple_surface_seed_bump(s);
@@ -231,7 +245,7 @@ mapple_surface_before_cpu_access(MappleSurface *s)
 void
 mapple_surface_device_wrote(MappleSurface *s)
 {
-	if (OSDynamicCast(IOBufferMemoryDescriptor, s->memory) != NULL) {
+	if (mapple_surface_cacheable(s)) {
 		OSCompareAndSwap(0, 1, &s->gpuDirty);
 	}
 }
@@ -409,9 +423,9 @@ mapple_row_bytes(uint32_t width, uint32_t ew, uint32_t bpe)
 	return (uint32_t)((row + MAPPLE_SURFACE_ROW_ALIGN - 1) & ~(uint64_t)(MAPPLE_SURFACE_ROW_ALIGN - 1));
 }
 
-/* Geometry from the creation properties (IOSurface.h keys). */
+/* Geometry from the creation properties (IOSurface.h keys); *needed: the bytes the layout covers. */
 static IOReturn
-mapple_surface_layout(MappleSurface *s, OSDictionary *props)
+mapple_surface_layout(MappleSurface *s, OSDictionary *props, uint64_t *needed)
 {
 	uint64_t end;
 
@@ -487,6 +501,7 @@ mapple_surface_layout(MappleSurface *s, OSDictionary *props)
 		mapple_surface_pitch64 = on;
 	}
 	if (mapple_surface_pitch64 && planes == NULL && s->offset == 0 && s->parentID == 0 &&
+	    props->getObject("IOSurfaceAddress") == NULL &&
 	    (s->bytesPerRow & (MAPPLE_SURFACE_ROW_ALIGN - 1)) != 0 && props->getObject("IOSurfaceBytesPerRow") != NULL) {
 		uint64_t row = ((uint64_t)s->bytesPerRow + MAPPLE_SURFACE_ROW_ALIGN - 1) & ~(uint64_t)(MAPPLE_SURFACE_ROW_ALIGN - 1);
 		uint64_t rend = row * mapple_div_up(s->height, s->elementHeight);
@@ -502,6 +517,7 @@ mapple_surface_layout(MappleSurface *s, OSDictionary *props)
 			OSIncrementAtomic64((volatile SInt64 *)&mapple_surface_pitch_rounds);
 		}
 	}
+	*needed = end;
 	if (alloc < end) {
 		alloc = end;
 	}
@@ -591,8 +607,8 @@ class IOSurfaceRootUserClient : public IOUserClient {
 	OSArray *fRefs;
 
 	MappleSurfaceRef *findRef(uint32_t id, unsigned int *index);
-	IOReturn addRef(MappleSurface *s, MappleSurfaceRef **refOut, bool *existing);
-	IOReturn returnSurface(MappleSurface *s, IOExternalMethodArguments *args);
+	IOReturn addRef(MappleSurface *s, MappleSurfaceRef **refOut, bool *existing, bool own = false);
+	IOReturn returnSurface(MappleSurface *s, IOExternalMethodArguments *args, bool own = false);
 	IOReturn create(IOExternalMethodArguments *args);
 	IOReturn values(uint32_t selector, IOExternalMethodArguments *args);
 
@@ -691,7 +707,7 @@ IOSurfaceRootUserClient::findRef(uint32_t id, unsigned int *index)
  * snapshot crash in CGDataProviderCreateWithData).
  */
 IOReturn
-IOSurfaceRootUserClient::addRef(MappleSurface *s, MappleSurfaceRef **refOut, bool *existing)
+IOSurfaceRootUserClient::addRef(MappleSurface *s, MappleSurfaceRef **refOut, bool *existing, bool own)
 {
 	*existing = false;
 	IOLockLock(fLock);
@@ -714,9 +730,10 @@ IOSurfaceRootUserClient::addRef(MappleSurface *s, MappleSurfaceRef **refOut, boo
 	s->retain();
 	ref->surface = s;
 	ref->count = 1;
-	ref->data = s->memory->createMappingInTask(fTask, 0, kIOMapAnywhere | s->mapCache);
+	/* own: the creator of a client surface (IOSurfaceAddress) uses its own address, nothing mapped */
+	ref->data = own ? NULL : s->memory->createMappingInTask(fTask, 0, kIOMapAnywhere | s->mapCache);
 	ref->state = s->state->createMappingInTask(fTask, 0, kIOMapAnywhere | kIOMapReadOnly);
-	if (ref->data == NULL || ref->state == NULL) {
+	if ((ref->data == NULL && !own) || ref->state == NULL) {
 		ref->release();
 		return kIOReturnVMError;
 	}
@@ -754,7 +771,7 @@ static void
 mapple_surface_fill_result(MappleSurface *s, MappleSurfaceRef *ref, uint8_t *out)
 {
 	bzero(out, MAPPLE_SURFACE_RESULT_SIZE);
-	put64(out, 0x00, ref->data->getAddress());
+	put64(out, 0x00, ref->data != NULL ? ref->data->getAddress() : s->clientAddr);
 	put64(out, 0x08, ref->state->getAddress());
 	put64(out, 0x10, ref->state->getAddress() + MAPPLE_SURFACE_TIMESTAMPS);
 	put32(out, 0x18, s->id);
@@ -807,11 +824,11 @@ mapple_struct_out(IOExternalMethodArguments *args, const void *buf, uint32_t len
 
 /* Map s for this client and answer with its lock result. Takes s's user count. */
 IOReturn
-IOSurfaceRootUserClient::returnSurface(MappleSurface *s, IOExternalMethodArguments *args)
+IOSurfaceRootUserClient::returnSurface(MappleSurface *s, IOExternalMethodArguments *args, bool own)
 {
 	MappleSurfaceRef *ref = NULL;
 	bool existing = false;
-	IOReturn ret = addRef(s, &ref, &existing);
+	IOReturn ret = addRef(s, &ref, &existing, own);
 	if (ret != kIOReturnSuccess) {
 		return ret;
 	}
@@ -921,6 +938,41 @@ mapple_surface_pool_take(uint32_t size, int8_t *slot)
 	return NULL;
 }
 
+/*
+ * IOSurfaceAddress: the pixels stay in the creator's own memory. Its pages are wired for the surface's life and mapped
+ * as they are into every other client and the GPU; the creator keeps using its address. A range that is not page
+ * aligned, or shorter than the layout, is refused (CoreImage then renders into memory of its own).
+ */
+static IOReturn
+mapple_surface_wrap(MappleSurface *s, task_t task, uint64_t addr, uint64_t given, uint64_t needed)
+{
+	uint64_t len = mapple_surface_address_length(addr, given, needed, page_size, MAPPLE_SURFACE_MAX_ALLOC);
+	if (len == 0) {
+		IOLog("SURF: IOSurfaceAddress 0x%llx refused: %llu bytes given, %llu needed (page-aligned range)\n",
+		    addr, given, needed);
+		return kIOReturnBadArgument;
+	}
+	IOMemoryDescriptor *md = IOMemoryDescriptor::withAddressRange(addr, len, kIODirectionInOut, task);
+	if (md == NULL) {
+		return kIOReturnNoMemory;
+	}
+	if (md->prepare(kIODirectionInOut) != kIOReturnSuccess) {
+		IOLog("SURF: IOSurfaceAddress 0x%llx: %llu bytes not wired (not all mapped)\n", addr, len);
+		md->release();
+		return kIOReturnVMError;
+	}
+	s->memory = md;
+	s->client = true;
+	s->clientAddr = addr;
+	s->allocSize = (uint32_t)len;
+	s->mapCache = kIOMapDefaultCache;
+	s->cpuDirty = 1;
+	if (s->kernelAddress() == 0) {          /* made now, not under the GPU's gate at the first clean */
+		return kIOReturnVMError;
+	}
+	return mapple_surface_publish(s) ? kIOReturnSuccess : kIOReturnNoResources;
+}
+
 IOReturn
 IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
 {
@@ -958,8 +1010,20 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
 		return kIOReturnNoMemory;
 	}
 	s->parentID = args->scalarInputCount > 0 ? (uint32_t)args->scalarInput[0] : 0;
-	ret = mapple_surface_layout(s, props);
-	if (ret == kIOReturnSuccess) {
+	uint64_t needed = 0;
+	ret = mapple_surface_layout(s, props, &needed);
+	static int clientOn = -1;
+	if (clientOn < 0) {
+		int v = 1;
+		PE_parse_boot_argn("mp_surface_client", &v, sizeof(v));
+		clientOn = v != 0;
+	}
+	/* mp_surface_client=0: IOSurfaceAddress ignored, as before (the surface gets memory of its own) */
+	OSNumber *address = clientOn ? OSDynamicCast(OSNumber, props->getObject("IOSurfaceAddress")) : NULL;
+	if (ret == kIOReturnSuccess && address != NULL) {
+		ret = mapple_surface_wrap(s, fTask, address->unsigned64BitValue(),
+		    mapple_dict_u32(props, "IOSurfaceAllocSize", 0), needed);
+	} else if (ret == kIOReturnSuccess) {
 		IOBufferMemoryDescriptor *mem = NULL;
 		if ((uint64_t)OSAddAtomic64(s->allocSize, (volatile SInt64 *)&mapple_surface_wired) +
 		    s->allocSize <= MAPPLE_SURFACE_WIRED_MAX) {
@@ -1026,7 +1090,7 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
 		s->release();
 		return ret;
 	}
-	ret = returnSurface(s, args);   /* takes the creator's user count */
+	ret = returnSurface(s, args, s->client);   /* takes the creator's user count */
 	s->release();
 	return ret;
 }
@@ -1370,7 +1434,7 @@ IOSurfaceRootUserClient::trapLock(void *id, void *options, void *seedOut,
 		mapple_gpu_surface_wait(s, MAPPLE_SURFACE_LOCK_WAIT_MS);
 	}
 	mapple_surface_before_cpu_access(s);
-	if (!((uintptr_t)options & kIOSurfaceLockReadOnly) && OSDynamicCast(IOBufferMemoryDescriptor, s->memory)) {
+	if (!((uintptr_t)options & kIOSurfaceLockReadOnly) && mapple_surface_cacheable(s)) {
 		OSCompareAndSwap(0, 1, &s->cpuDirty);
 	}
 	IOReturn ret = mapple_surface_seed_out(s, seedOut, false);
@@ -1386,7 +1450,7 @@ IOSurfaceRootUserClient::trapUnlock(void *id, void *options, void *seedOut,
 	if (s == NULL) {
 		return kIOReturnNotFound;
 	}
-	if (!((uintptr_t)options & kIOSurfaceLockReadOnly) && OSDynamicCast(IOBufferMemoryDescriptor, s->memory)) {
+	if (!((uintptr_t)options & kIOSurfaceLockReadOnly) && mapple_surface_cacheable(s)) {
 		OSCompareAndSwap(0, 1, &s->cpuDirty);   /* the writes made while locked */
 	}
 	IOReturn ret = mapple_surface_seed_out(s, seedOut,

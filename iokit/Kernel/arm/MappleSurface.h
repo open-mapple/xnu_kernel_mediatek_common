@@ -50,6 +50,8 @@ public:
 
 	OSDictionary             *values;       /* IOSurfaceSetValue (non-bulk), under the surface table lock */
 	bool                      contig;       /* physically contiguous below 4 GiB (scanout candidate) */
+	bool                      client;       /* IOSurfaceAddress: the creator's own pages (wired), cacheable */
+	uint64_t                  clientAddr;   /* their address in the creator */
 	int8_t                    poolSlot;     /* 0184: buffer of the display page pool, -1 = none */
 
 	/*

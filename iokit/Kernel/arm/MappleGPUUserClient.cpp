@@ -923,7 +923,7 @@ MappleGPUUserClient::importSurface(struct vgpu_import_iosurface *a)
 		b->memOffset = mapStart;
 		b->size = b->vaSize = mapSize;
 		fVM->imported += (int64_t)mapSize;
-		b->cacheable = OSDynamicCast(IOBufferMemoryDescriptor, s->memory) != NULL &&
+		b->cacheable = (s->client || OSDynamicCast(IOBufferMemoryDescriptor, s->memory) != NULL) &&
 		    s->mapCache != kIOMapWriteCombineCache && s->mapCache != kIOMapInhibitCache;
 		b->cacheMaint = b->cacheable && fGPU->cacheMode() == 0;
 		b->lazySurface = b->cacheable && !b->cacheMaint;
