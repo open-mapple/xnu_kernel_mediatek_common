@@ -33,7 +33,7 @@ bool panic_on_assert;
 bool hfs_corruption_panics = true;
 #endif
 
-uint32_t hfs_mp_fsfp;
+uint32_t hfs_mp_fsfp = MP_FSFP_DEFAULT;
 
 extern struct vnodeopv_desc hfs_vnodeop_opv_desc;
 extern struct vnodeopv_desc hfs_specop_opv_desc;

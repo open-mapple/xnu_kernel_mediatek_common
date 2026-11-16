@@ -1,8 +1,9 @@
 /*
  * The APFS fsctls FileProvider's local storage (FileProvider.framework's fpfs_* calls, LocalStorageFileProvider)
  * issues on its volume, answered on HFS+. Numbers as iOS 16.7.16's FileProvider passes them to ffsctl/fsctl; the
- * names are ours where Apple's are not public. Each answer is behind a bit of the mp_fsfp boot-arg (default 0: ENOTTY,
- * as before). No kernel headers here: tools/hfs_fpfs_test.c checks it on the host.
+ * names are ours where Apple's are not public. Each answer is behind a bit of the mp_fsfp boot-arg (default
+ * MP_FSFP_DEFAULT, all of them; a clear bit answers ENOTTY). No kernel headers here: tools/hfs_fpfs_test.c checks it on
+ * the host.
  */
 #ifndef _HFS_FPFS_H_
 #define _HFS_FPFS_H_
@@ -33,6 +34,8 @@ struct fpfs_dir_stats_op {
 #define MP_FSFP_PURGEABLE   0x4     /* 'J' 71 answers "not purgeable", 'J' 68 unmarking answers 0 */
 #define MP_FSFP_RENAME_SWAP 0x8     /* RENAME_SWAP as three renames (hfs_vnop_renamex) */
 #define MP_FSFP_DIR_STATS_OP 0x20   /* 'J' 32 answers ENOTSUP for a folder (no statistics kept), EINVAL for anything else */
+#define MP_FSFP_DEFAULT     (MP_FSFP_SYNC_ROOT | MP_FSFP_DIR_STATS | MP_FSFP_PURGEABLE | MP_FSFP_RENAME_SWAP | \
+	                     MP_FSFP_DIR_STATS_OP)
 
 /* Hidden from listxattr and refused to setxattr/removexattr by the kernel's com.apple.system. rule. */
 #define HFS_SYNC_ROOT_XATTR "com.apple.system.mapple.syncroot"

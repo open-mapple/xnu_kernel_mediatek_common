@@ -19,7 +19,7 @@
  * mp_audio_below (default 160 = 20 dB, at most 90 dB) how far under Android's level the speaker stays (Darwin's volume
  * is under that); mp_audio_gain (default 0, at most 12 dB) the guard's gain; mp_audio_secs (default 5) for steps 1-3.
  *
- * Boot-arg mp_audio_rcv (default 0), bits: 1 first, the tone 5 s on the earpiece (the codec's handset driver from DAC L,
+ * Boot-arg mp_audio_rcv (default 2), bits: 1 first, the tone 5 s on the earpiece (the codec's handset driver from DAC L,
  * no amplifier) at RCV_FIRST, 10 dB under Android's handset gain; the speaker's steps after it. 2 with step 4, iOS's
  * earpiece route: what the plug-in says plays on the earpiece (MAPPLE_AUDIO_SET_ROUTE) does, at RCV_FIRST, Darwin's
  * volume in the samples; without it, it plays on the speaker.
@@ -66,7 +66,7 @@ extern void mt6781_afe_down(void);
 #define VIBR_VOSEL      9               /* 2.8 V: Android's VIBR_ANA_CON0 [11:8] at full strength (its vmax_max), as in
                                          * MTKPwrap.cpp's whitelist */
 
-static uint32_t steps, vib_steps, below_base = 160, gain, secs = 5, rcv;
+static uint32_t steps, vib_steps, below_base = 160, gain, secs = 5, rcv = 2;
 
 static void
 ms(uint32_t n)
