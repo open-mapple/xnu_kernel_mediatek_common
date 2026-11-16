@@ -361,6 +361,7 @@ private:
 	void latencyReset(void);
 	static void jobTimer(OSObject *owner, IOTimerEventSource *src);
 	static void dvfsTimer(OSObject *owner, IOTimerEventSource *src);
+	static void perfTimer(OSObject *owner, IOTimerEventSource *src);
 	void dvfsSample(void);
 	void selftest(bool fault, uint32_t count, char **out, char *end);
 	void objectCounts(char **out, char *end, const char *when);
@@ -373,6 +374,8 @@ private:
 	IOInterruptEventSource *fIrq[3];        /* GPU, MMU, JOB */
 	IOTimerEventSource     *fTimer;
 	IOTimerEventSource     *fDvfsTimer;
+	IOTimerEventSource     *fPerfTimer;     /* PerformanceStatistics, once a second */
+	uint64_t                fPerfBusy, fPerfAt;
 	IOMemoryMap            *fMaps[6];       /* mali, mfgcfg, spm, topckgen, apmixed, infracfg_ao */
 	vm_offset_t             fMali, fMfgcfg, fSpm, fTopck, fApmixed, fInfra;
 	MTKPwrap              *fPwrap;

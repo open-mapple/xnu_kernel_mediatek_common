@@ -1006,11 +1006,13 @@ MappleGPUAccelerator::start(IOService *provider)
 	fGate = IOCommandGate::commandGate(this);
 	fTimer = IOTimerEventSource::timerEventSource(this, &MappleGPUAccelerator::jobTimer);
 	fDvfsTimer = IOTimerEventSource::timerEventSource(this, &MappleGPUAccelerator::dvfsTimer);
+	fPerfTimer = IOTimerEventSource::timerEventSource(this, &MappleGPUAccelerator::perfTimer);
 	IOInterruptEventSource::Action actions[3] = {
 		&MappleGPUAccelerator::gpuInterrupt, &MappleGPUAccelerator::mmuInterrupt, &MappleGPUAccelerator::jobInterrupt,
 	};
-	if (fGate == NULL || fTimer == NULL || fDvfsTimer == NULL || fWorkLoop->addEventSource(fGate) != kIOReturnSuccess ||
-	    fWorkLoop->addEventSource(fTimer) != kIOReturnSuccess || fWorkLoop->addEventSource(fDvfsTimer) != kIOReturnSuccess) {
+	if (fGate == NULL || fTimer == NULL || fDvfsTimer == NULL || fPerfTimer == NULL ||
+	    fWorkLoop->addEventSource(fGate) != kIOReturnSuccess || fWorkLoop->addEventSource(fTimer) != kIOReturnSuccess ||
+	    fWorkLoop->addEventSource(fDvfsTimer) != kIOReturnSuccess || fWorkLoop->addEventSource(fPerfTimer) != kIOReturnSuccess) {
 		return false;
 	}
 	for (int i = 0; i < 3; i++) {
@@ -1028,6 +1030,8 @@ MappleGPUAccelerator::start(IOService *provider)
 	}
 	setProperty("MetalPluginName", "MappleMTLDriver");
 	setProperty("MetalPluginClassName", "VMDevice");
+	fPerfAt = mach_absolute_time();
+	fPerfTimer->setTimeoutMS(1000);
 	gMappleGPU = this;
 	IOLog("GPU: driver started (mp_gpu=%d)\n", fMode);
 
@@ -1068,6 +1072,11 @@ MappleGPUAccelerator::free(void)
 		fDvfsTimer->cancelTimeout();
 		fWorkLoop->removeEventSource(fDvfsTimer);
 		fDvfsTimer->release();
+	}
+	if (fPerfTimer != NULL) {
+		fPerfTimer->cancelTimeout();
+		fWorkLoop->removeEventSource(fPerfTimer);
+		fPerfTimer->release();
 	}
 	if (fGate != NULL) {
 		fWorkLoop->removeEventSource(fGate);
@@ -3411,6 +3420,34 @@ MappleGPUAccelerator::dvfsTimer(OSObject *owner, IOTimerEventSource *src __unuse
 		return;
 	}
 	self->dvfsSample();
+}
+
+/*
+ * PerformanceStatistics as Apple's GPU drivers publish it (Mapple's Home reads it): "Device Utilization %", the share
+ * of the last second a job chain was on the hardware (fBusyTotal, the governor's busy time), read only.
+ */
+void
+MappleGPUAccelerator::perfTimer(OSObject *owner, IOTimerEventSource *src __unused)
+{
+	MappleGPUAccelerator *self = OSDynamicCast(MappleGPUAccelerator, owner);
+	if (self == NULL) {
+		return;
+	}
+	uint64_t now = mach_absolute_time();
+	uint64_t busy = self->fBusyTotal + (self->fBusyStart != 0 && now > self->fBusyStart ? now - self->fBusyStart : 0);
+	uint64_t window = now - self->fPerfAt;
+	uint32_t pct = window != 0 && busy > self->fPerfBusy ? (uint32_t)MIN((busy - self->fPerfBusy) * 100 / window, 100ull) : 0;
+	self->fPerfBusy = busy;
+	self->fPerfAt = now;
+	OSDictionary *stats = OSDictionary::withCapacity(1);
+	OSNumber *n = OSNumber::withNumber(pct, 32);
+	if (stats != NULL && n != NULL) {
+		stats->setObject("Device Utilization %", n);
+		self->setProperty("PerformanceStatistics", stats);
+	}
+	OSSafeReleaseNULL(n);
+	OSSafeReleaseNULL(stats);
+	self->fPerfTimer->setTimeoutMS(1000);
 }
 
 void
