@@ -19,6 +19,9 @@
  * mp_audio_below (default 160 = 20 dB, at most 90 dB) how far under Android's level the speaker stays (Darwin's volume
  * is under that); mp_audio_gain (default 0, at most 12 dB) the guard's gain; mp_audio_secs (default 5) for steps 1-3.
  *
+ * Boot-arg mp_audio_rcv=1 (default 0): first, the tone 5 s on the earpiece (the codec's handset driver from DAC L, no
+ * amplifier) at RCV_FIRST, 10 dB under Android's handset gain; the speaker's steps after it.
+ *
  * Boot-arg mp_vib_steps (default 2; 0 on a safe boot): 0 status; 1 one 100 ms buzz at Android's VIBR voltage;
  * 2 /dev/mapple-haptic runs the motor while iOS's haptic waveform is loud enough: at least 30 ms (Android's vib_timer),
  * at most 1 s at a time, then 1 s off. Only Android's full-strength VIBR code (VIBR_VOSEL, MTKPwrap's whitelist).
@@ -61,7 +64,7 @@ extern void mt6781_afe_down(void);
 #define VIBR_VOSEL      9               /* 2.8 V: Android's VIBR_ANA_CON0 [11:8] at full strength (its vmax_max), as in
                                          * MTKPwrap.cpp's whitelist */
 
-static uint32_t steps, vib_steps, below_base = 160, gain, secs = 5;
+static uint32_t steps, vib_steps, below_base = 160, gain, secs = 5, rcv;
 
 static void
 ms(uint32_t n)
@@ -237,6 +240,66 @@ lineout_down(void)
 	cwd(0x2424, 0x1055, 0);
 	cwd(0x2240, 0x0001, 0x0001);
 	printf("audio: codec: line-out down\n");
+}
+
+/* The earpiece (mt_rcv_event): the line-out's supplies, the handset driver from DAC L, at gain `code'. */
+#define RCV_ANDROID     0x01            /* ZCD_CON3: Android's handset gain at full call volume (+7 dB) */
+#define RCV_FIRST       0x0b            /* -3 dB: 10 dB under it */
+
+static bool
+receiver_up(uint32_t code)
+{
+	failed = false;
+	cw(0x2296, 0xffff, 0xcfa1);
+	cw(0x240c, 0xffff, 0x4000);
+	cw(0x223c, 0x0001, 0x0001);
+	cw(0x223e, 0x003f, 0x002c);
+	cw(0x223a, 0x0001, 0x0001);
+	cw(0x2242, 0x0003, 0x0003);
+	cw(0x2240, 0x0001, 0);
+	delay_for_interval(250, NSEC_PER_USEC);
+	cw(0x2424, 0x1055, 0x1055);
+	cw(0x2426, 0x0001, 0x0001);
+	delay_for_interval(100, NSEC_PER_USEC);
+	cw(0x241e, 0x0007, 0x0002);
+	cw(0x2488, 0x07ff, 0x000b);
+	cw(0x2414, 0x00ff, 0x0010);
+	cw(0x2420, 0xffff, 0x0055);
+	cw(0x241e, 0xff80, 0x4900);
+	cw(0x2414, 0x00ff, 0x0090);
+	cw(0x241a, 0xff01, 0);
+	cw(0x241c, 0xffff, 0);
+	cw(0x2414, 0x00ff, 0x0092);
+	cw(0x2414, 0x00ff, 0x0093);
+	cw(0x248e, 0x001f, code);
+	cw(0x2422, 0x0001, 0x0001);
+	cw(0x2408, 0x0009, 0x0009);
+	cw(0x241a, 0xff01, 0x0001);
+	cw(0x2414, 0x00ff, 0x009b);
+	printf("audio: codec: earpiece %s, gain code %u (%d dB; Android %d dB)\n", failed ? "FAILED" : "up", code,
+	    8 - (int)code, 8 - RCV_ANDROID);
+	return !failed;
+}
+
+static void
+receiver_down(void)
+{
+	cwd(0x2414, 0x000c, 0);
+	cwd(0x2408, 0x0009, 0);
+	cwd(0x2422, 0x0001, 0);
+	cwd(0x248e, 0x001f, 0x1f);
+	cwd(0x2414, 0x0001, 0);
+	cwd(0x2414, 0x0002, 0);
+	cwd(0x241a, 0xff00, 0);
+	cwd(0x241a, 0xff00, 0x0200);
+	cwd(0x2420, 0x0100, 0x0100);
+	cwd(0x241e, 0x0007, 0x0004);
+	cwd(0x2488, 0x07ff, 0);
+	cwd(0x2426, 0x0001, 0);
+	cwd(0x2424, 0x1055, 0);
+	cwd(0x2240, 0x0001, 0x0001);
+	cwd(0x2296, 0xffff, 0xcba1);
+	printf("audio: codec: earpiece down\n");
 }
 
 /* ---- the amplifier ---- */
@@ -771,6 +834,33 @@ pa_wait(uint32_t n)
 
 /* ---- the steps ---- */
 
+/* mp_audio_rcv: the tone on the earpiece, everything else down, then all down again for the speaker's steps. */
+static void
+receiver_test(void)
+{
+	uint64_t second, end;
+	bool afe = mt6781_afe_up(), codec = afe && codec_up(), up = codec && receiver_up(RCV_FIRST);
+	bool dl1 = up && mt6781_afe_dl1_start(&dl, &dl_bytes);
+
+	nanoseconds_to_absolutetime(NSEC_PER_SEC, &second);
+	dl_write = 0;
+	printf("audio: earpiece: pmic 0x2414 %04x 0x248e %04x 0x2408 %04x 0x2416 %04x (Android: 009b, 0001, xxx9, 0010)\n",
+	    pmic(0x2414), pmic(0x248e), pmic(0x2408), pmic(0x2416));
+	for (end = mach_absolute_time() + 5 * second; dl1 && mach_absolute_time() < end; ms(5)) {
+		feed(true);
+	}
+	printf("audio: earpiece: %s\n", dl1 ? "5 s of the tone played" : "not started");
+	if (up) {
+		receiver_down();
+	}
+	if (codec) {
+		codec_down();
+	}
+	if (afe) {
+		mt6781_afe_down();
+	}
+}
+
 static void
 audio_thread(__unused void *arg, __unused wait_result_t w)
 {
@@ -783,6 +873,9 @@ audio_thread(__unused void *arg, __unused wait_result_t w)
 		goto out;
 	}
 	speaker_guard_configure(true, gain);
+	if (rcv && steps >= 2) {
+		receiver_test();
+	}
 	afe = mt6781_afe_up();
 	codec = afe && codec_up();
 	if (codec && steps >= 3 && !pa_detect()) {
@@ -941,6 +1034,7 @@ mtk_audio_start(void)
 	(void)PE_parse_boot_argn("mp_audio_gain", &gain, sizeof(gain));
 	(void)PE_parse_boot_argn("mp_audio_secs", &secs, sizeof(secs));
 	(void)PE_parse_boot_argn("mp_vib_steps", &vib_steps, sizeof(vib_steps));
+	(void)PE_parse_boot_argn("mp_audio_rcv", &rcv, sizeof(rcv));
 	steps = steps > 5 ? 5 : steps;
 	if (steps >= 3 && (PA_FITTED == PA_NONE || (PA_FITTED == PA_AW87319 && !AW_ANDROID))) {
 		printf("audio: mp_audio_steps=%u refused: the amplifier (and an AW87319's registers) not known from Android yet; "

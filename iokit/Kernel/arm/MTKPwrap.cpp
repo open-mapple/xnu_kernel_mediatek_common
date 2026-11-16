@@ -351,8 +351,9 @@ static const struct {
 	{ 0x239a, 0x0001, 0, 0xffff },  /* AUDENC_ANA_CON9: mic bias 0 on */
 	{ 0x239a, 0x0070, 2, 2 },       /* AUDENC_ANA_CON9 [6:4]: its voltage, Android's 1.9 V only */
 	{ 0x239a, 0xff00, 0, 0 },
-	{ 0x2408, 0x0006, 0, 0xffff },  /* AUDDEC_ANA_CON0: DAC R, DAC VA28 */
+	{ 0x2408, 0x000f, 0, 0xffff },  /* AUDDEC_ANA_CON0: DAC L and R, their VA28 */
 	{ 0x240c, 0xffff, 0, 0xffff },  /* AUDDEC_ANA_CON2 */
+	{ 0x2414, 0x00ff, 0, 0xffff },  /* AUDDEC_ANA_CON6: handset (earpiece) power, bias, mux, short-circuit, stability */
 	{ 0x2416, 0x011f, 0, 0xffff },  /* AUDDEC_ANA_CON7: line-out power, bias, mux, short-circuit, stability */
 	{ 0x241a, 0xff01, 0, 0xffff },  /* AUDDEC_ANA_CON9 */
 	{ 0x241c, 0xffff, 0, 0xffff },  /* AUDDEC_ANA_CON10 */
@@ -364,6 +365,7 @@ static const struct {
 	{ 0x2488, 0x07ff, 0, 0xffff },  /* ZCD_CON0: zero-cross detector */
 	{ 0x248a, 0x001f, 8, 0x1f },    /* ZCD_CON1 [4:0]: LOL gain, 8 (0 dB) .. 18 (-10 dB), 0x1f mute */
 	{ 0x248a, 0x0f80, 8, 0x1f },    /* ZCD_CON1 [11:7]: LOR gain, the same */
+	{ 0x248e, 0x001f, 1, 0x1f },    /* ZCD_CON3 [4:0]: handset gain, 1 (+7 dB, Android's at full call volume) .. 0x1f */
 	{ 0x1d08, 0x0001, 0, 0xffff },  /* LDO_VIBR_CON0: RG_LDO_VIBR_EN */
 	{ 0x1d0a, 0x0001, 0, 0xffff },  /* LDO_VIBR_OP_EN: SW_OP_EN */
 	{ 0x1e44, 0x0f00, 9, 9 },       /* VIBR_ANA_CON0: RG_VIBR_VOSEL, Android's full-strength code only (2.8 V) */
