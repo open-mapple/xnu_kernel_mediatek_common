@@ -42,6 +42,7 @@
 
 #include <libkern/libkern.h>
 #include <IOKit/IOBSD.h>
+#include <pexpert/pexpert.h>
 
 #define PERSONA_INFO_V1_SIZE offsetof(struct kpersona_info, persona_uid)
 #define PERSONA_INFO_V2_SIZE sizeof(struct kpersona_info)
@@ -503,6 +504,33 @@ persona(__unused proc_t p, struct persona_args *pargs, __unused int32_t *retval)
 	default:
 		error = ENOSYS;
 		break;
+	}
+
+	/* mp_persona_log=1: every call, its persona id, type and name (after the call: what info and find returned) */
+	static int log = -1;
+	if (log < 0) {
+		int v = 0;
+		PE_parse_boot_argn("mp_persona_log", &v, sizeof(v));
+		log = v;
+	}
+	if (log > 0) {
+		struct kpersona_info ki = {};
+		uid_t id = 0;
+		size_t n = 0;
+		char name[32];
+		if (infop != USER_ADDR_NULL) {
+			(void)copyin(infop, &ki, sizeof(ki));
+		}
+		if (idp != USER_ADDR_NULL) {
+			(void)copyin(idp, &id, sizeof(id));
+		}
+		if (op == PERSONA_OP_FIND || op == PERSONA_OP_FIND_BY_TYPE) {
+			(void)copyin(pargs->idlen, &n, sizeof(n));
+		}
+		proc_selfname(name, sizeof(name));
+		ki.persona_name[sizeof(ki.persona_name) - 1] = 0;
+		printf("persona: %s op %u: id %u type %d name '%.48s' -> %d (found %zu)\n", name, op, id, ki.persona_type,
+		    ki.persona_name, error, n);
 	}
 
 	return error;
