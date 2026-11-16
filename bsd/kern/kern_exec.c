@@ -3071,6 +3071,8 @@ spawn_coalitions_release_all(coalition_t coal[COALITION_NUM_TYPES])
 
 #if defined(ARM64_BOARD_CONFIG_MT6781)
 extern uint32_t mapple_inject;                  /* bsd/kern/amfi_stub.c */
+extern uint32_t mapple_fpd;                     /* bsd/kern/amfi_stub.c */
+extern const char mapple_fpd_path[];
 #endif
 
 #if CONFIG_PERSONAS
@@ -5624,6 +5626,7 @@ bad:
  */
 #if defined(ARM64_BOARD_CONFIG_MT6781)
 #define MAPPLE_INJECT_ENV       "DYLD_INSERT_LIBRARIES=/usr/lib/mapple/tweakloader.dylib"
+#define MAPPLE_FPD_ENV          "DYLD_INSERT_LIBRARIES=/usr/lib/mapple/fpdvolume.dylib"
 #endif
 
 __attribute__((noinline))
@@ -5635,6 +5638,10 @@ exec_extract_strings(struct image_params *imgp)
 	int new_ptr_size = (imgp->ip_flags & IMGPF_IS_64BIT_ADDR) ? 8 : 4;
 	user_addr_t     argv = imgp->ip_user_argv;
 	user_addr_t     envv = imgp->ip_user_envv;
+#if defined(ARM64_BOARD_CONFIG_MT6781)
+	const char *mapple_exec = imgp->ip_strings + strlen(EXECUTABLE_KEY);
+	const char *mapple_env = NULL;
+#endif
 
 	/*
 	 * Adjust space reserved for the path name by however much padding it
@@ -5801,9 +5808,15 @@ exec_extract_strings(struct image_params *imgp)
 
 #if defined(ARM64_BOARD_CONFIG_MT6781)
 	/* mp_inject=1, the Mapple app's jailbreak switch: the tweak loader for programs inside an .app (SpringBoard, the
-	 * apps), never daemons, after the caller's own variables; dyld takes it only where amfi_stub.c's policy allows */
-	if (mapple_inject && strnstr(imgp->ip_strings + strlen(EXECUTABLE_KEY), ".app/", MAXPATHLEN)) {
-		error = exec_add_user_string(imgp, CAST_USER_ADDR_T(MAPPLE_INJECT_ENV), UIO_SYSSPACE, TRUE);
+	 * apps), never daemons, after the caller's own variables; dyld takes it only where amfi_stub.c's policy allows.
+	 * mp_fpd=1, Mapple's Files test: the volume library for fileproviderd alone. */
+	if (mapple_inject && strnstr(mapple_exec, ".app/", MAXPATHLEN)) {
+		mapple_env = MAPPLE_INJECT_ENV;
+	} else if (mapple_fpd && strncmp(mapple_exec, mapple_fpd_path, MAXPATHLEN) == 0) {
+		mapple_env = MAPPLE_FPD_ENV;
+	}
+	if (mapple_env != NULL) {
+		error = exec_add_user_string(imgp, CAST_USER_ADDR_T(mapple_env), UIO_SYSSPACE, TRUE);
 		if (error) {
 			goto bad;
 		}

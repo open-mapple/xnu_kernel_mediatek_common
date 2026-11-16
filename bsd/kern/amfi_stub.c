@@ -444,6 +444,31 @@ mapple_in_app(proc_t p)
 	vnode_put(vp);
 	return in;
 }
+
+/*
+ * mp_fpd=1, Mapple's Files test: fileproviderd alone gets the release answer below, so dyld takes the library
+ * kern_exec.c puts into it (it shows FileProvider the /private/var volume as APFS). Nothing else changes.
+ */
+TUNABLE(uint32_t, mapple_fpd, "mp_fpd", 0);
+const char mapple_fpd_path[] = "/System/Library/Frameworks/FileProvider.framework/Support/fileproviderd";
+
+#if !(DEVELOPMENT || DEBUG)
+static bool
+mapple_is_fpd(proc_t p)
+{
+	char path[MAXPATHLEN];
+	int len = sizeof(path);
+	vnode_t vp = proc_getexecutablevnode(p);
+	bool is;
+
+	if (vp == NULLVP) {
+		return false;
+	}
+	is = vn_getpath(vp, path, &len) == 0 && strncmp(path, mapple_fpd_path, sizeof(path)) == 0;
+	vnode_put(vp);
+	return is;
+}
+#endif
 #define AMFI_SYSCALL_CHECK_DYLD_POLICY_SELF     90
 #define AMFI_DYLD_OUTPUT_ALLOW_AT_PATH                  (1ULL << 0)
 #define AMFI_DYLD_OUTPUT_ALLOW_PATH_VARS                (1ULL << 1)
@@ -467,7 +492,7 @@ amfi_stub_syscall(struct proc *p, int call, user_addr_t arg)
 	    AMFI_DYLD_OUTPUT_ALLOW_FAILED_LIBRARY_INSERTION | AMFI_DYLD_OUTPUT_ALLOW_LIBRARY_INTERPOSING |
 	    AMFI_DYLD_OUTPUT_ALLOW_EMBEDDED_VARS;
 #else
-	if (!mapple_inject) {
+	if (!mapple_inject && !(mapple_fpd && mapple_is_fpd(p))) {
 		return ENOPOLICY;
 	}
 	uint64_t allow = AMFI_DYLD_OUTPUT_ALLOW_PATH_VARS | AMFI_DYLD_OUTPUT_ALLOW_LIBRARY_INTERPOSING |
