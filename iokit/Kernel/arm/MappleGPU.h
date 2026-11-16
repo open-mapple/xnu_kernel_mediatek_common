@@ -109,7 +109,7 @@ public:
 	bool map(uint64_t va, IOMemoryDescriptor *md, uint64_t offset, uint64_t size, uint64_t pte);
 	void unmap(uint64_t va, uint64_t size);
 	/* Leaf attributes for ordinary GPU memory (read/write, GPU-cacheable), executable or not. */
-	static uint64_t leafAttrs(bool exec);
+	static uint64_t leafAttrs(bool exec, bool readOnly = false);
 	/* MMU fault report: what `addr` is (live BO and its PTE, VA freed lately, outside the range). Gated. */
 	void describe(uint64_t addr, char *buf, size_t len);
 	/* The physical address the GPU's page table gives for `va`, 0 if unmapped. Gated. */

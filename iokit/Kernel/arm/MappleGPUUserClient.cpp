@@ -22,6 +22,7 @@
  * busy at the deadline, what Panfrost expects.
  */
 #include <pexpert/arm64/board_config.h>
+#include <pexpert/pexpert.h>
 
 #if defined(MT6781)
 #include <IOKit/IOLib.h>
@@ -956,17 +957,31 @@ MappleGPUUserClient::importSurface(struct vgpu_import_iosurface *a)
 IOReturn
 MappleGPUUserClient::importUser(struct vgpu_import_userptr *a)
 {
+	static int on = -1;
+	if (on < 0) {
+		int v = 1;
+		PE_parse_boot_argn("mp_gpu_userptr", &v, sizeof(v));
+		on = v != 0;
+	}
+	if (!on) {
+		return kIOReturnUnsupported;    /* mp_gpu_userptr=0: the driver copies, as before */
+	}
 	if (a->addr == 0 || a->size == 0 || a->size > MAX_BO_SIZE || (a->addr & (page_size - 1)) ||
 	    (a->size & (page_size - 1))) {
 		return kIOReturnBadArgument;
 	}
+	/* the caller's own pages, wired until the BO's last job is done; memory it cannot write: the GPU reads only */
+	bool readOnly = false;
 	IOMemoryDescriptor *md = IOMemoryDescriptor::withAddressRange(a->addr, a->size, kIODirectionInOut, fTask);
-	if (md == NULL) {
-		return kIOReturnNoMemory;
-	}
-	IOReturn ret = md->prepare();           /* wires the pages */
+	IOReturn ret = md != NULL ? md->prepare() : kIOReturnNoMemory;
 	if (ret != kIOReturnSuccess) {
-		md->release();
+		OSSafeReleaseNULL(md);
+		md = IOMemoryDescriptor::withAddressRange(a->addr, a->size, kIODirectionOut, fTask);
+		ret = md != NULL ? md->prepare(kIODirectionOut) : kIOReturnNoMemory;
+		readOnly = true;
+	}
+	if (ret != kIOReturnSuccess) {
+		OSSafeReleaseNULL(md);
 		return ret;
 	}
 	ret = gated(VGPU_SEL_IMPORT_USERPTR, ^IOReturn {
@@ -991,7 +1006,8 @@ MappleGPUUserClient::importUser(struct vgpu_import_userptr *a)
 		b->cacheMaint = true;
 		b->va = fVM->allocVA(a->size, a->size >= HEAP_ALIGN ? HEAP_ALIGN : page_size);
 		uint32_t h = 0;
-		if (b->va == 0 || !fVM->map(b->va, md, 0, a->size, MappleGPUVM::leafAttrs(false)) || (h = addBO(b)) == 0) {
+		if (b->va == 0 || !fVM->map(b->va, md, 0, a->size, MappleGPUVM::leafAttrs(false, readOnly)) ||
+		    (h = addBO(b)) == 0) {
 			b->prepared = false;    /* completed below */
 			b->release();
 			return kIOReturnNoMemory;

@@ -182,6 +182,7 @@ extern "C" void mt6781_cpufreq_boost_stats(int *on, uint64_t *starts, uint64_t *
 #define PTE_TABLE               3ull
 #define PTE_PAGE                3ull
 #define PTE_AP_UNPRIV           (1ull << 6)
+#define PTE_AP_RDONLY           (1ull << 7)
 #define PTE_SH_IS               (3ull << 8)
 #define PTE_AF                  (1ull << 10)
 #define PTE_NG                  (1ull << 11)
@@ -701,9 +702,9 @@ MappleGPUVM::unmap(uint64_t va, uint64_t size)
 }
 
 uint64_t
-MappleGPUVM::leafAttrs(bool exec)
+MappleGPUVM::leafAttrs(bool exec, bool readOnly)
 {
-	return PTE_AP_UNPRIV | PTE_SH_IS | PTE_AF | PTE_NG | (exec ? 0 : PTE_XN);
+	return PTE_AP_UNPRIV | PTE_SH_IS | PTE_AF | PTE_NG | (exec ? 0 : PTE_XN) | (readOnly ? PTE_AP_RDONLY : 0);
 }
 
 uint64_t
@@ -2713,7 +2714,8 @@ MappleGPUAccelerator::completeJob(uint32_t slot, IOReturn error, uint32_t status
 			 * K0b: the fence signals now; the CPU lines are dropped when userspace waits for the GPU (WAIT_BO,
 			 * syncobj wait), once per BO however many jobs used it. Without room in the list: at once.
 			 */
-			if (fLazy && bo->vm != NULL) {
+			/* the caller's own memory (newBufferWithBytesNoCopy) is read through its pointer, with no wait here */
+			if (fLazy && bo->vm != NULL && bo->kind != kMappleBOUser) {
 				if (!bo->invPending) {
 					bo->vm->invAdd(bo);
 					fLazyListed++;
