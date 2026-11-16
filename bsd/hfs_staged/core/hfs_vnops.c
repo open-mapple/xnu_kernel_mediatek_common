@@ -69,6 +69,7 @@
 #include "hfs_endian.h"
 #include "hfs_kdebug.h"
 #include "hfs_cprotect.h"
+#include "hfs_fpfs.h"
 
 #if HFS_CONFIG_KEY_ROLL
 #include "hfs_key_roll.h"
@@ -4549,6 +4550,50 @@ hfs_vnop_renamex(struct vnop_renamex_args *ap)
 	
 	/* Check the flags first, so we can avoid grabbing locks if necessary */
 	if (ap->a_flags) {
+#if defined(ARM64_BOARD_CONFIG_MT6781)
+		/*
+		 * RENAME_SWAP (LocalStorage, Foundation's replaceItemAtURL) as three renames: the target to a name of its own,
+		 * the source to the target's name, the target to the source's name. Not atomic, but the VFS's rename lock keeps
+		 * other renames of the volume out, and a failed step puts the names back.
+		 */
+		if ((hfs_mp_fsfp & MP_FSFP_RENAME_SWAP) && ap->a_flags == VFS_RENAME_SWAP && tvp != NULL && tvp != fvp) {
+			struct vnop_renamex_args step = *ap;
+			struct componentname tmpcn = *tcnp;
+			char tmpname[48];
+
+			tmpcn.cn_namelen = snprintf(tmpname, sizeof(tmpname), ".mapple-swap-%u-%u", VTOC(tvp)->c_fileid,
+			    VTOC(fvp)->c_fileid);
+			tmpcn.cn_nameptr = tmpname;
+			tmpcn.cn_hash = 0;
+			step.a_flags = 0;
+			step.a_vap = NULL;
+			step.a_tvp = NULL;
+
+			step.a_fdvp = tdvp; step.a_fvp = tvp; step.a_fcnp = tcnp;
+			step.a_tdvp = tdvp; step.a_tcnp = &tmpcn;
+			if ((error = hfs_vnop_renamex(&step)) != 0) {
+				return error;
+			}
+			step.a_fdvp = fdvp; step.a_fvp = fvp; step.a_fcnp = fcnp;
+			step.a_tdvp = tdvp; step.a_tcnp = tcnp;
+			if ((error = hfs_vnop_renamex(&step)) != 0) {
+				goto swap_back_target;
+			}
+			step.a_fdvp = tdvp; step.a_fvp = tvp; step.a_fcnp = &tmpcn;
+			step.a_tdvp = fdvp; step.a_tcnp = fcnp;
+			if ((error = hfs_vnop_renamex(&step)) == 0) {
+				return 0;
+			}
+			step.a_fdvp = tdvp; step.a_fvp = fvp; step.a_fcnp = tcnp;
+			step.a_tdvp = fdvp; step.a_tcnp = fcnp;
+			(void)hfs_vnop_renamex(&step);
+swap_back_target:
+			step.a_fdvp = tdvp; step.a_fvp = tvp; step.a_fcnp = &tmpcn;
+			step.a_tdvp = tdvp; step.a_tcnp = tcnp;
+			(void)hfs_vnop_renamex(&step);
+			return error;
+		}
+#endif
 		/* These are the only flags we support for now */
 		if ((ap->a_flags & (VFS_RENAME_EXCL)) == 0) {
 			return ENOTSUP;	

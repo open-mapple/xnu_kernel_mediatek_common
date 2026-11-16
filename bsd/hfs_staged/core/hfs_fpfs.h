@@ -21,6 +21,7 @@
 #define MP_FSFP_SYNC_ROOT   0x1     /* 'J' 72 and 74, the mark kept in HFS_SYNC_ROOT_XATTR */
 #define MP_FSFP_DIR_STATS   0x2     /* 'J' 2 answers 0 for a folder, EINVAL for anything else */
 #define MP_FSFP_PURGEABLE   0x4     /* 'J' 71 answers "not purgeable", 'J' 68 unmarking answers 0 */
+#define MP_FSFP_RENAME_SWAP 0x8     /* RENAME_SWAP as three renames (hfs_vnop_renamex) */
 
 /* Hidden from listxattr and refused to setxattr/removexattr by the kernel's com.apple.system. rule. */
 #define HFS_SYNC_ROOT_XATTR "com.apple.system.mapple.syncroot"
