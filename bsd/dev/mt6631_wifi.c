@@ -406,19 +406,148 @@ static struct {
 } vw;
 
 /*
+ * A firmware file: WIFI_FW_DIR/name on the root, else connsys/name in the firmware region of the root partition's
+ * tail (end - 63 MiB, 15 MiB: the ustar archive the installer fills from vendor, and from nvdata for WIFI). The tail is
+ * looked at only when the HFS+ volume ends before the partition's last 128 MiB, as on the installed layouts.
+ */
+#define TAIL_ROOM               (128ULL << 20)
+#define TAIL_FW_FROM_END        (63ULL << 20)
+#define TAIL_FW_SIZE            (15ULL << 20)
+
+extern int mtk_ufs_read_root(uint64_t off, void *buf, uint32_t len, uint64_t *sizep);
+
+struct fw_file {
+	vnode_t  vp;            /* the root's file, or NULLVP for the tail's member */
+	uint64_t at;            /* the member's data in the partition */
+	uint32_t size;
+};
+
+static int64_t
+tar_octal(const uint8_t *p, int n)
+{
+	int64_t v = 0;
+	int i = 0;
+
+	while (i < n && p[i] == ' ') {
+		i++;
+	}
+	for (; i < n && p[i] >= '0' && p[i] <= '7'; i++) {
+		v = v * 8 + (p[i] - '0');
+	}
+	return i < n && p[i] != 0 && p[i] != ' ' ? -1 : v;
+}
+
+static int
+tail_find(const char *name, uint64_t *at, uint32_t *size)
+{
+	uint8_t h[512];
+	char want[128], have[260];
+	uint64_t part = 0;
+
+	if (mtk_ufs_read_root(1024, h, 512, &part) != 0 || part < TAIL_ROOM) {
+		return ENOENT;
+	}
+	uint16_t sig = (uint16_t)(h[0] << 8 | h[1]);
+	uint64_t bsize = (uint64_t)h[40] << 24 | h[41] << 16 | h[42] << 8 | h[43];
+	uint64_t total = (uint64_t)h[44] << 24 | h[45] << 16 | h[46] << 8 | h[47];
+	if ((sig != 0x482b && sig != 0x4858) || bsize * total > part - TAIL_ROOM) {
+		return ENOENT;          /* no tail: the volume fills the partition */
+	}
+	snprintf(want, sizeof(want), "connsys/%s", name);
+	uint64_t base = part - TAIL_FW_FROM_END;
+	for (uint64_t o = 0; o + 512 <= TAIL_FW_SIZE;) {
+		uint32_t sum = 0;
+		bool zero = true;
+
+		if (mtk_ufs_read_root(base + o, h, 512, NULL) != 0) {
+			return EIO;
+		}
+		for (int i = 0; i < 512; i++) {
+			sum += i >= 148 && i < 156 ? ' ' : h[i];
+			zero &= h[i] == 0;
+		}
+		if (zero) {
+			break;
+		}
+		int64_t len = tar_octal(h + 124, 12);
+		if ((int64_t)sum != tar_octal(h + 148, 8) || len < 0 || (uint64_t)len > TAIL_FW_SIZE - o - 512) {
+			return EINVAL;
+		}
+		if (memcmp(h + 257, "ustar", 6) == 0 && h[345] != 0) {        /* POSIX ustar: a prefix before the name */
+			snprintf(have, sizeof(have), "%.155s/%.100s", (const char *)h + 345, (const char *)h);
+		} else {
+			snprintf(have, sizeof(have), "%.100s", (const char *)h);
+		}
+		if ((h[156] == '0' || h[156] == 0) && strcmp(have, want) == 0) {
+			*at = base + o + 512;
+			*size = (uint32_t)len;
+			return 0;
+		}
+		o += 512 + (((uint64_t)len + 511) & ~511ULL);
+	}
+	return ENOENT;
+}
+
+static int
+fw_open(const char *name, struct fw_file *f)
+{
+	char path[160];
+	vfs_context_t ctx = vfs_context_kernel();
+	off_t size = 0;
+
+	f->vp = NULLVP;
+	if (rootvnode == NULLVP) {
+		return ENXIO;
+	}
+	snprintf(path, sizeof(path), "%s%s", WIFI_FW_DIR, name);
+	int err = vnode_open(path, FREAD, 0, 0, &f->vp, ctx);
+	if (err == 0) {
+		(void)vnode_size(f->vp, &size, ctx);
+		f->size = size > UINT32_MAX ? UINT32_MAX : (uint32_t)size;
+		return 0;
+	}
+	f->vp = NULLVP;
+	return tail_find(name, &f->at, &f->size) == 0 ? 0 : err;
+}
+
+static int
+fw_read(struct fw_file *f, void *buf, uint32_t len, uint64_t off)
+{
+	if (off > f->size || len > f->size - off) {
+		return EIO;
+	}
+	if (f->vp == NULLVP) {
+		return mtk_ufs_read_root(f->at + off, buf, len, NULL);
+	}
+	vfs_context_t ctx = vfs_context_kernel();
+	int resid = 0;
+	int err = vn_rdwr(UIO_READ, f->vp, (caddr_t)buf, (int)len, (off_t)off, UIO_SYSSPACE, IO_NOAUTH | IO_UNIT,
+	    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
+	return err ? err : resid ? EIO : 0;
+}
+
+static void
+fw_close(struct fw_file *f)
+{
+	if (f->vp != NULLVP) {
+		vnode_close(f->vp, FREAD, vfs_context_kernel());
+		f->vp = NULLVP;
+	}
+}
+
+/*
  * True once WIFI_FW_DIR's MCU patch opens: Bluetooth's boot waits for it. Never before the root is mounted (rootvnode): a lookup
  * that early takes a lock the VFS has not made yet (panic in lck_rw_lock_shared under namei).
  */
 bool
 mt6631_wifi_firmware_present(void)
 {
-	vfs_context_t ctx = vfs_context_kernel();
-	vnode_t vp = NULLVP;
+	struct fw_file f;
 
-	if (rootvnode == NULLVP || vnode_open(WIFI_FW_DIR "soc2_2_ram_mcu_2_1_hdr.bin", FREAD, 0, 0, &vp, ctx) != 0) {
+	if (fw_open("soc2_2_ram_mcu_2_1_hdr.bin", &f) != 0) {
 		return false;
 	}
-	vnode_close(vp, FREAD, ctx);
+	fw_close(&f);
 	return true;
 }
 
@@ -427,48 +556,38 @@ static int
 load_patch(const char *name, uint32_t wantOff, uint32_t dateOff, char *out, size_t len, size_t *po)
 {
 	size_t o = *po;
-	char path[160];
-	snprintf(path, sizeof(path), "%s%s", WIFI_FW_DIR, name);
-	vfs_context_t ctx = vfs_context_kernel();
-	vnode_t vp = NULLVP;
-	int err = vnode_open(path, FREAD, 0, 0, &vp, ctx);
+	struct fw_file f;
+	int err = fw_open(name, &f);
 	if (err != 0) {
-		say("on: %s: open error %d (push it with tools/mapple-link.py push)\n", path, err);
+		say("on: %s%s: open error %d, and not in the root partition's tail\n", WIFI_FW_DIR, name, err);
 		*po = o;
 		return err;
 	}
-	off_t size = 0;
 	struct wmt_rom_patch h;
-	int resid = 0;
-	err = vnode_size(vp, &size, ctx);
-	if (err == 0 && size <= (off_t)sizeof(h)) {
+	if (f.size <= sizeof(h)) {
 		err = EINVAL;
 	}
 	if (err == 0) {
-		err = vn_rdwr(UIO_READ, vp, (caddr_t)&h, sizeof(h), 0, UIO_SYSSPACE, IO_NOAUTH | IO_UNIT,
-		    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
+		err = fw_read(&f, &h, sizeof(h), 0);
 	}
 	uint32_t off = h.patchAddr & 0x00ffff00u;     /* 0xF02A0011: 0x11 = flag (zeroed), 0xF0000000 + offset */
-	uint32_t body = (uint32_t)(size - (off_t)sizeof(h));
-	if (err == 0 && (resid != 0 || off != wantOff || (uint64_t)off + body > EMI_SIZE || dateOff + 16 > EMI_SIZE)) {
+	uint32_t body = f.size - (uint32_t)sizeof(h);
+	if (err == 0 && (off != wantOff || (uint64_t)off + body > EMI_SIZE || dateOff + 16 > EMI_SIZE)) {
 		say("on: %s: unexpected header (patch addr 0x%08x -> offset 0x%x, want 0x%x, %u bytes)\n", name,
 		    h.patchAddr, off, wantOff, body);
 		err = EINVAL;
 	}
 	if (err == 0) {
-		err = vn_rdwr(UIO_READ, vp, (caddr_t)vw.emi + off, (int)body, sizeof(h), UIO_SYSSPACE, IO_NOAUTH | IO_UNIT,
-		    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
-		if (err == 0 && resid != 0) {
-			err = EIO;
-		}
+		err = fw_read(&f, (char *)vw.emi + off, body, sizeof(h));
 	}
-	vnode_close(vp, FREAD, ctx);
+	bool tail = f.vp == NULLVP;
+	fw_close(&f);
 	if (err == 0) {
 		memcpy((char *)vw.emi + dateOff, h.date, 16);
 		mt6631_wifi_emi_flush(off, body);
 		mt6631_wifi_emi_flush(dateOff & ~63u, 64);
-		say("on: %s: %u bytes at EMI +0x%06x (MCU 0x%08x), type %u, date %.16s\n", name, body, off,
-		    EMI_CONN_BASE + off, __builtin_bswap32(h.patchType), h.date);
+		say("on: %s%s: %u bytes at EMI +0x%06x (MCU 0x%08x), type %u, date %.16s\n", name, tail ? " (tail)" : "",
+		    body, off, EMI_CONN_BASE + off, __builtin_bswap32(h.patchType), h.date);
 	} else {
 		say("on: %s: error %d\n", name, err);
 	}
@@ -1370,21 +1489,18 @@ wifi_fw(char *out, size_t len, size_t o)
 	wfdma_setup();
 	say("fw: driver own, WFDMA at PA 0x%llx, GLO_CFG 0x%08x, ready bits 0x%08x\n", wd.pa, rd(WF_GLO_CFG), rd(WF_READY));
 
-	char path[160];
-	snprintf(path, sizeof(path), "%s%s", WIFI_FW_DIR, WIFI_RAM_CODE);
-	vfs_context_t ctx = vfs_context_kernel();
-	vnode_t vp = NULLVP;
-	int err = vnode_open(path, FREAD, 0, 0, &vp, ctx);
+	struct fw_file f;
+	int err = fw_open(WIFI_RAM_CODE, &f);
 	if (err != 0) {
-		say("fw: %s: open error %d (push it)\n", path, err);
+		say("fw: %s%s: open error %d, and not in the root partition's tail\n", WIFI_FW_DIR, WIFI_RAM_CODE, err);
 		return o;
 	}
-	off_t size = 0;
+	if (f.vp == NULLVP) {
+		say("fw: %s from the root partition's tail\n", WIFI_RAM_CODE);
+	}
+	uint32_t size = f.size;
 	uint8_t tail[36], reg[40], pkt[64 + PDA_CHUNK];
-	int resid = 0;
-	(void)vnode_size(vp, &size, ctx);
-#define RD(buf, n, at) (vn_rdwr(UIO_READ, vp, (caddr_t)(buf), (int)(n), (off_t)(at), UIO_SYSSPACE, IO_NOAUTH | IO_UNIT, \
-	vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx)) == 0 && resid == 0)
+#define RD(buf, n, at) (fw_read(&f, (buf), (uint32_t)(n), (uint64_t)(at)) == 0)
 	if (size < 36 + 40 || !RD(tail, 36, size - 36) || tail[2] == 0 || tail[2] > 8) {
 		say("fw: bad tailer\n");
 		goto close;
@@ -1456,7 +1572,7 @@ wifi_fw(char *out, size_t len, size_t o)
 	}
 #undef RD
 close:
-	vnode_close(vp, FREAD, ctx);
+	fw_close(&f);
 	return o;
 }
 
@@ -1723,24 +1839,21 @@ wifi_cap(char *out, size_t len, size_t o)
 #define EID_SCAN_DONE           0x0d
 #define EID_BSS_BEACON_TIMEOUT  0x13
 #define NVRAM_SIZE              2048
-#define NVRAM_FILE              "WIFI"                          /* nvdata APCFG/APRDEB/WIFI, copied by hand */
+#define NVRAM_FILE              "WIFI"                          /* nvdata APCFG/APRDEB/WIFI (the installer: connsys/WIFI) */
 #define NVRAM_DEFAULT           "stWifiCfgDefault_6631.bin"     /* vendor default (MAC zero) */
 
 static int
 read_file(const char *name, uint8_t *buf, uint32_t max)
 {
-	char path[160];
-	snprintf(path, sizeof(path), "%s%s", WIFI_FW_DIR, name);
-	vfs_context_t ctx = vfs_context_kernel();
-	vnode_t vp = NULLVP;
-	int resid = 0, err = vnode_open(path, FREAD, 0, 0, &vp, ctx);
+	struct fw_file f;
+	int err = fw_open(name, &f);
 	if (err != 0) {
 		return -err;
 	}
-	err = vn_rdwr(UIO_READ, vp, (caddr_t)buf, (int)max, 0, UIO_SYSSPACE, IO_NOAUTH, vfs_context_ucred(ctx), &resid,
-	    vfs_context_proc(ctx));
-	vnode_close(vp, FREAD, ctx);
-	return err ? -err : (int)(max - (uint32_t)resid);
+	uint32_t n = MIN(max, f.size);
+	err = fw_read(&f, buf, n, 0);
+	fw_close(&f);
+	return err ? -err : (int)n;
 }
 
 static bool

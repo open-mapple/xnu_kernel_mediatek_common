@@ -371,6 +371,33 @@ ufs_find_partition(const char *want)
 	return ufs_lookup_partition(want, &su.first_block, &su.nblocks);
 }
 
+/* mtk_ufs_lock held. len bytes at off of the partition [first, first + blocks) into buf; *sizep its size in bytes. */
+static int
+ufs_read_range(uint64_t first, uint64_t blocks, uint64_t off, void *buf, uint32_t len, uint64_t *sizep)
+{
+	uint64_t bytes = blocks * UFS_BLOCK;
+	int error = 0;
+
+	if (sizep) {
+		*sizep = bytes;
+	}
+	if (off > bytes || len > bytes - off) {
+		return EINVAL;
+	}
+	for (uint32_t done = 0; !error && done < len;) {
+		uint64_t pos = off + done;
+		uint32_t skip = (uint32_t)(pos % UFS_BLOCK);
+		uint32_t want = MIN(len - done, BOUNCE_SIZE - skip);
+		uint32_t n = (skip + want + UFS_BLOCK - 1) / UFS_BLOCK;
+		error = ufs_read_blocks(first + pos / UFS_BLOCK, n);
+		if (!error) {
+			memcpy((char *)buf + done, (const char *)(su.dma + DMA_BOUNCE) + skip, want);
+			done += want;
+		}
+	}
+	return error;
+}
+
 /*
  * Read-only access to another GPT partition of the root's LUN (USB link "pull part:NAME", e.g. nvdata for the WiFi
  * calibration/MAC file). Reads only: there is no write path here, and ufs_write_blocks() still checks the root
@@ -396,24 +423,24 @@ mtk_ufs_read_part(const char *name, uint64_t off, void *buf, uint32_t len, uint6
 			strlcpy(cached, name, sizeof(cached));
 		}
 	}
-	uint64_t bytes = cblocks * UFS_BLOCK;
-	if (!error && sizep) {
-		*sizep = bytes;
+	if (!error) {
+		error = ufs_read_range(cfirst, cblocks, off, buf, len, sizep);
 	}
-	if (!error && (off > bytes || len > bytes - off)) {
-		error = EINVAL;
+	lck_mtx_unlock(&mtk_ufs_lock);
+	return error;
+}
+
+/* The same for the root partition itself (the Wi-Fi firmware in its tail). */
+int mtk_ufs_read_root(uint64_t off, void *buf, uint32_t len, uint64_t *sizep);
+
+int
+mtk_ufs_read_root(uint64_t off, void *buf, uint32_t len, uint64_t *sizep)
+{
+	if (!su.ready) {
+		return ENXIO;
 	}
-	for (uint32_t done = 0; !error && done < len;) {
-		uint64_t pos = off + done;
-		uint32_t skip = (uint32_t)(pos % UFS_BLOCK);
-		uint32_t want = MIN(len - done, BOUNCE_SIZE - skip);
-		uint32_t blocks = (skip + want + UFS_BLOCK - 1) / UFS_BLOCK;
-		error = ufs_read_blocks(cfirst + pos / UFS_BLOCK, blocks);
-		if (!error) {
-			memcpy((char *)buf + done, (const char *)(su.dma + DMA_BOUNCE) + skip, want);
-			done += want;
-		}
-	}
+	lck_mtx_lock(&mtk_ufs_lock);
+	int error = ufs_read_range(su.first_block, su.nblocks, off, buf, len, sizep);
 	lck_mtx_unlock(&mtk_ufs_lock);
 	return error;
 }
